@@ -101,6 +101,8 @@ replaces one.
 | [45](#45-speedscope-values-are-truncated-before-they-are-scaled) | profiles reference | ingest | A, C | A speedscope weight of `0.5` s stores 0, a parent's self time is 100 times too small, and a `nanoseconds` file stores nothing. |
 | [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
 | [47](#47-a-diff-answers-every-failure-of-either-side-as-an-invalid-argument) | profiles reference | queries | A | A diff that reaches a resource limit is told its request is invalid, where the same selection on its own is told the limit was reached. |
+| [48](#48-a-jfr-lock-delay-is-stored-as-its-clock-ticks) | profiles reference | ingest | C | A JFR lock or park delay is stored as its clock-tick count labelled nanoseconds: 2.3 times too large in the library's own test recording. |
+| [49](#49-a-jfr-wall-clock-samples-count-is-carried-into-every-later-event) | profiles reference | ingest | C | In a JFR recording holding wall-clock samples, every later CPU, allocation or lock event counts as the last wall-clock sample's count. |
 
 ---
 
@@ -2522,6 +2524,67 @@ side is `resource_exhausted` (`429`), `query_too_broad: <setting>` (`docs/api.md
 Ledger row `diff-side-failure-keeps-its-code` (the profiles differential's ledger, issue #822). Pinned by
 case V7 of `the_diff_answers_both_sides_in_one_statement` in
 `crates/pulsus-read/tests/profileql_diff_live.rs`.
+
+---
+
+## 48. A JFR lock delay is stored as its clock ticks
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+A JFR `jdk.JavaMonitorEnter` or `jdk.ThreadPark` event's `duration` is a timespan in the recording's
+clock ticks. The JFR library the reference pins adds it to the `delay` sample type, unit
+`nanoseconds`, as it is (`pprof/parser.go:121,131` of that library at `v0.19.0`); the chunk header's
+ticks per second is read and never used (`parser/header.go:25`).
+
+### Why that is wrong rather than different
+
+The value stored is not the value its unit names (**C**). The library's own test recording runs at
+2,303,974,730 ticks per second, so its 13 contentions store 18,443,760,794 "nanoseconds" for
+8,005,192,311; the reference's own agent captures run at 2.8 × 10⁹ ticks per second.
+
+### What PulsusDB does
+
+Each event's duration is converted with its chunk's rate, `ticks × 10⁹ / ticks per second`,
+truncated, before it is added; a chunk naming no rate keeps the tick count (`docs/api.md` §1.3).
+Owner decision, 2026-11-18: "Convert to ns".
+
+### Evidence
+
+Ledger row `ingest-jfr-delay-in-nanoseconds` (the profiles differential's ledger, issue #822).
+Pinned by `j5_lock_and_park_delays_are_nanoseconds` and `j1_example_becomes_the_references_four_profiles`
+in `crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
+
+---
+
+## 49. A JFR wall-clock sample's count is carried into every later event
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+One two-value array serves every event of a recording. A `profiler.WallClockSample` sets its first
+value to the sample's `samples` count, and nothing resets it, so every later CPU sample, allocation,
+lock and live-object event adds that count where it means one event (`pprof/parser.go:57,78,84` of the
+JFR library at `v0.19.0`).
+
+### Why that is wrong rather than different
+
+An allocation counted 5 times, or a CPU sample weighted 5 periods, is a value nobody sent (**C**). It
+meets recordings holding wall-clock and other events together: the library's `wall.jfr` has 195 wall
+samples with a count above 1.
+
+### What PulsusDB does
+
+Every event other than a wall-clock sample counts once; a wall-clock sample counts its `samples`
+(`docs/api.md` §1.3). Owner decision, 2026-11-18: "Count 1".
+
+### Evidence
+
+Ledger row `ingest-jfr-event-count-not-carried` (the profiles differential's ledger, issue #822).
+Pinned by `j6_an_allocation_counts_once_after_a_wall_sample` in
+`crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
 
 ---
 

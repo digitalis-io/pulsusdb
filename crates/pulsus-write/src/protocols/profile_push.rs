@@ -199,7 +199,7 @@ pub fn parse_legacy_query(raw: Option<&str>, now_ns: i64) -> Result<LegacyQuery,
     Ok(LegacyQuery {
         name,
         from_ns: get("from").map(|f| parse_at_time(f, now_ns)),
-        until_ns: None,
+        until_ns: get("until").map(|u| parse_at_time(u, now_ns)),
         spy_name: get("spyName").unwrap_or("unknown").to_string(),
         format: get("format").map(str::to_string),
         sample_rate: get("sampleRate")
@@ -471,7 +471,7 @@ pub struct Multipart {
 }
 
 /// The `boundary` parameter of a `Content-Type`, quoted or not.
-fn boundary_of(content_type: &str) -> Option<String> {
+pub(crate) fn boundary_of(content_type: &str) -> Option<String> {
     content_type.split(';').skip(1).find_map(|param| {
         let (k, v) = param.split_once('=')?;
         if !k.trim().eq_ignore_ascii_case("boundary") {
@@ -509,7 +509,10 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Every file part of the form: `(name, bytes)`, in order. A part counts as
 /// a file only when its `Content-Disposition` has a `filename`.
-fn file_parts<'a>(body: &'a [u8], boundary: &str) -> Result<Vec<(String, &'a [u8])>, String> {
+pub(crate) fn file_parts<'a>(
+    body: &'a [u8],
+    boundary: &str,
+) -> Result<Vec<(String, &'a [u8])>, String> {
     let open = format!("--{boundary}");
     let between = format!("\r\n--{boundary}");
     let start = if body.starts_with(open.as_bytes()) {

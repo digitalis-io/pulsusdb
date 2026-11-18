@@ -2019,6 +2019,7 @@ dependencies = [
  "pulsus-schema",
  "pulsus-schema-testkit",
  "pulsus-testkit",
+ "regex",
  "serde",
  "serde_bytes",
  "serde_json",

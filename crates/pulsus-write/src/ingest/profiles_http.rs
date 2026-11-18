@@ -1,6 +1,6 @@
 //! The profile push receivers: `POST /push.v1.PusherService/Push`, a Connect
 //! unary call carrying a `PushRequest`, and `POST /ingest`, the reference's
-//! legacy route, which serves every format but JFR. Each reads the
+//! legacy route, which serves every format. Each reads the
 //! tenant first, reads the body under [`MAX_PROFILE_BODY_BYTES`], decodes and
 //! validates every profile, and only then admits the push whole, the shape of
 //! the trace JSON receiver in `ingest/http.rs`. Nothing is read from
@@ -27,6 +27,7 @@ use crate::protocols::profile_push::{
     LegacyQuery, Multipart, legacy_pprof_input, parse_legacy_query, parse_multipart, push_inputs,
 };
 use crate::protocols::profileql_legacy::folded::{parse_groups, parse_lines};
+use crate::protocols::profileql_legacy::jfr::jfr_inputs;
 use crate::protocols::profileql_legacy::speedscope::parse_speedscope;
 use crate::protocols::profileql_legacy::tree::parse_tree;
 use crate::protocols::profileql_legacy::trie::parse_trie;
@@ -419,9 +420,59 @@ async fn ingest_converted(
     }
 }
 
+/// A JFR recording (issue #819 §3.6): its profiles are one model call and
+/// one admission, every refusal in the legacy form
+/// (`pkg/ingester/…/ingest_adapter.go:188-204`). A recording with no sample
+/// stores nothing.
+async fn ingest_jfr(
+    sink: &dyn ProfileSink,
+    headers: &HeaderMap,
+    tenant: &pulsus_model::Tenant,
+    query: &LegacyQuery,
+    content_type: &str,
+    body: &[u8],
+    now_ms: i64,
+) -> Response {
+    let inputs = match jfr_inputs(query, content_type, body, now_ms.saturating_mul(1_000_000)) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            return legacy_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("parsing IngestInput-pprof failed {e}"),
+            );
+        }
+    };
+    if inputs.is_empty() {
+        return empty(StatusCode::OK);
+    }
+    let landing = match parse_profiles(inputs, now_ms) {
+        Ok(landing) => landing,
+        Err(r) => {
+            return legacy_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "pushing IngestInput-pprof failed push series with index 0 and id  failed: \
+                     invalid_argument: {}",
+                    r.message
+                ),
+            );
+        }
+    };
+    if landing.is_empty() {
+        return empty(StatusCode::OK);
+    }
+    let asynchronous = is_async(headers);
+    match admit(sink, headers, tenant, landing).await {
+        Ok(()) if asynchronous => empty(StatusCode::ACCEPTED),
+        Ok(()) => empty(StatusCode::OK),
+        Err(Failure::Refused(r)) => legacy_refusal(r),
+        Err(Failure::Insert(e)) => legacy_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 /// `POST /ingest`, `/<ref>/ingest` and `/api/profiles/v1/ingest` (§4): a
-/// whole-body pprof profile, a multipart form, or a body of one of the
-/// converted formats. Success is `200` with an empty body, `202` under
+/// whole-body pprof profile, a multipart form, a JFR recording, or a body of
+/// one of the converted formats. Success is `200` with an empty body, `202` under
 /// `X-Pulsus-Async: 1`.
 pub async fn ingest_profile_legacy(
     sink: &dyn ProfileSink,
@@ -457,10 +508,7 @@ pub async fn ingest_profile_legacy(
         .unwrap_or("");
     let form = match format_of(query.format.as_deref(), content_type) {
         Format::Jfr => {
-            return legacy_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "format jfr is not supported",
-            );
+            return ingest_jfr(sink, &headers, &tenant, &query, content_type, &body, now_ms).await;
         }
         Format::Pprof => Multipart {
             profile: Some(body),

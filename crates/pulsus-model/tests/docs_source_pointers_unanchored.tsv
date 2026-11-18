@@ -1062,6 +1062,7 @@ docs/reference-defects-we-do-not-copy.md	modules/livestore/instance_search.go:25
 docs/reference-defects-we-do-not-copy.md	parser.go:182	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:188	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:521	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	parser/header.go:25	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_diff.go:65-67	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:39-42	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_time_series.go:78-83	not_in_this_repository
@@ -1127,6 +1128,11 @@ docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_metrics.go:198-200	not_
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_metrics.go:209-212	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/engine.go:98-129	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/engine_metrics.go:1140-1204	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pprof/parser.go:121	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pprof/parser.go:131	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pprof/parser.go:57	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pprof/parser.go:78	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pprof/parser.go:84	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/versioned.go:98-100	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:1103-1105	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:128-152	not_in_this_repository

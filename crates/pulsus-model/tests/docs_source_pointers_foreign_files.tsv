@@ -73,6 +73,7 @@ number_data_points.go
 params.go
 parse.go
 parser.go
+parser/header.go
 pkg/api/http.go
 pkg/distributor/distributor.go
 pkg/distributor/http.go
@@ -166,6 +167,7 @@ pkg/util/traceid.go
 pkg/util/validation/validate.go
 pkg/validation/limits.go
 pkg/validation/validate.go
+pprof/parser.go
 querier.go
 query.go
 querysharding.go

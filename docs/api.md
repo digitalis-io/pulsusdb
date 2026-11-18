@@ -270,23 +270,24 @@ POST /api/profiles/v1/ingest?name=<app>{tags}&from=<ts>&spyName=<spy>&sampleRate
 Content-Type: multipart/form-data | binary/octet-stream+trie | binary/octet-stream+tree | any
 ```
 
-The reference's `/ingest`, also mounted at `/ingest` and `/pyroscope/ingest` (§8.2), in every format but JFR. A pprof body, raw or gzipped (found by its magic bytes; `Content-Encoding` is not read), becomes one profile. A folded, lines, trie or tree body becomes one profile, and a speedscope file one profile for each profile it holds. Each is validated and stored as a push to `POST /push.v1.PusherService/Push` is (§8.2). Each push is one insert into `profile_landing` and no read, a speedscope file of several profiles included: its profiles are stored together or not at all.
+The reference's `/ingest`, also mounted at `/ingest` and `/pyroscope/ingest` (§8.2), in every format. A pprof body, raw or gzipped (found by its magic bytes; `Content-Encoding` is not read), becomes one profile. A folded, lines, trie or tree body becomes one profile, a speedscope file one profile for each profile it holds, and a JFR recording one profile for each kind of sample it holds (below). Each is validated and stored as a push to `POST /push.v1.PusherService/Push` is (§8.2). Each push is one insert into `profile_landing` and no read, a speedscope file or a JFR recording of several profiles included: its profiles are stored together or not at all.
 
 | Parameter | Absent | Used |
 |---|---|---|
 | `name` | refused | `<service>{k=v,...}`: the service name is `service_name` unless the set holds one, and each label not starting `__` is a series label (`profile_id` included), with `__session_id__` too on the folded, lines, trie, tree and speedscope paths. On those paths the service's last `.` part is the profile type (below). A bad name is `400` `name: <error>` |
 | `from` | now | pprof: the profile's time when its own is in 1970; the other formats: the profile's time. Unix seconds, milliseconds (13 digits), microseconds (16) or nanoseconds (19), `YYYYMMDD`, or `now-1h`-style offsets |
+| `until` | now | JFR: the profile's end, so its duration is `until` − `from`; read as `from` is. Not read on the other paths |
 | `spyName` | `unknown` | the spy label; on the pprof path `pyspy`, `rbspy` and `scripting` name each function `"<file> <name>"`, and `dotnetspy` repairs .NET function ids |
 | `sampleRate` | 100 | not read on the pprof path. Elsewhere, a `process_cpu` or `wall` profile at a rate other than 0 is stored in nanoseconds: each value is multiplied by the period `10^9 / sampleRate`, so 3 samples at 100 store 30,000,000. A value that is not an integer, or is negative, is 100 |
 | `format` | — | below |
-| `until`, `units`, `aggregationType` | — | not read |
+| `units`, `aggregationType` | — | not read |
 
 | Condition, first match wins | Body | Answer |
 |---|---|---|
 | `format=trie`, or `Content-Type: binary/octet-stream+trie` | the trie binary: per node a varint name length, the name appended to the key, a varint value and a varint descendant count; a value adds to the stack its key spells, split on `;` | stored |
 | `format=tree`, or `Content-Type: binary/octet-stream+tree` | the tree binary: per node, depth first, a varint name length (at most 65,535), the name, a varint self value and a varint child count (at most 16,000); a self value adds to the stack of the names below the root. Two siblings of one name sum | stored |
 | `format=lines` | one stack per line, `a;b;c`, each line counted; empty lines are skipped, and a line of 65,536 bytes or more refuses the push | stored |
-| `format=jfr` | not served | `422` `format jfr is not supported` |
+| `format=jfr` | a JFR recording: the whole body, not gunzipped; or, when `Content-Type` contains `multipart/form-data`, the first `jfr` file part, gunzipped when it starts `1f 8b` (at most 4,194,304 bytes after), with the `labels` file part, gzipped or not, naming each sample's context labels | stored |
 | `format=pprof` | the whole body is one pprof profile | stored |
 | `format=speedscope` | a speedscope JSON file, evented or sampled profiles (below) | stored |
 | `Content-Type` contains `multipart/form-data` | the `profile` file part; `sample_type_config` (type name to `{"display-name": ...}`) names the series; `prev_profile` is refused | stored |
@@ -312,7 +313,25 @@ At a `sampleRate` other than 0, a `process_cpu` profile's sample type is `cpu` `
 
 A speedscope file's profiles of one name, type, unit and start are merged. A file of more than one profile after the merge names each `<service>.<unit>`, so the unit is its type, and every profile carries its name, when it has one, as `profile_name`. At the default `sampleRate` each unit takes its own rate: `nanoseconds` 10^9, `microseconds` 10^8, `milliseconds` 10^5, `seconds` 100, `none` 10^4, `bytes` 0. Each weight and each time between events is multiplied by 100 (by 1 for `nanoseconds` and `bytes`) before it is truncated to an integer.
 
-Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async: 1` it is `202`, admitted without waiting for the insert. A body with no profile (empty, a form without `profile`, or stacks whose values are all 0) is `200` and stores nothing. Every error is `application/json` with the body `{"code":"<code>","message":"<message>"}`. Most are the reference's plain-HTTP form, with `X-Content-Type-Options: nosniff` and a newline, the code named from the status:
+A JFR recording's events become these profiles, each one series per sample type, named by its own type rather than by `name`'s last `.` part. The recording's last `event` setting is the `jfr_event` label.
+
+| Event | Taken when | Series name | Sample types | Period type | Each event adds |
+|---|---|---|---|---|---|
+| `jdk.ExecutionSample` | its thread state is known and not `STATE_SLEEPING` | `process_cpu` | `cpu` `nanoseconds` | `cpu` `nanoseconds` | the period `10^9 / sampleRate` |
+| `jdk.ExecutionSample` | the `event` setting is `wall` | `wall` | `wall` `nanoseconds` | `wall` `nanoseconds` | the period |
+| `profiler.WallClockSample` | its state is `STATE_RUNNABLE` and the setting is `wall` | `process_cpu` | as above | as above | its `samples` times the period |
+| `profiler.WallClockSample` | always | `wall` | as above | as above | its `samples` times the period |
+| `jdk.ObjectAllocationInNewTLAB` | always | `memory` | `alloc_in_new_tlab_objects` `count`, `alloc_in_new_tlab_bytes` `bytes` | `space` `bytes` | 1 and its TLAB size |
+| `jdk.ObjectAllocationOutsideTLAB` | always | `memory` | `alloc_outside_tlab_objects` `count`, `alloc_outside_tlab_bytes` `bytes` | `space` `bytes` | 1 and its size |
+| `jdk.JavaMonitorEnter` | always | `mutex` | `contentions` `count`, `delay` `nanoseconds` | `mutex` `count` | 1 and its duration in nanoseconds |
+| `jdk.ThreadPark` | always | `block` | `contentions` `count`, `delay` `nanoseconds` | `block` `count` | 1 and its duration in nanoseconds |
+| `profiler.LiveObject` | always | `memory` | `live` `count` | `objects` `count` | 1 |
+| `jdk.ObjectAllocationSample` | always | `memory` | `alloc_sample_objects` `count`, `alloc_sample_bytes` `bytes` | `space` `bytes` | 1 and its weight |
+| `profiler.Malloc` | always | `memory` | `malloc_objects` `count`, `malloc_bytes` `bytes` | none | 1 and its size |
+
+A frame is `<class>.<method>` at its line, and generated class names are merged: `App$$Lambda$4/1283928880` is stored as `App$$Lambda_`. A sample carries its context's labels from the `labels` part, `profile_id` from its span id, `span_name` and `trace_id`, so a sample of each thread is its own series. Each series is labelled with every `name` label not starting `__` (and `__session_id__`), `jfr_event`, the spy label, and `service_name` set to the whole service name, or `app_name` when `name` holds a `service_name`, unless `name` already holds that label. At `sampleRate=0` CPU and wall values are 0.
+
+Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async: 1` it is `202`, admitted without waiting for the insert. A body with no profile (empty, a form without `profile`, stacks whose values are all 0, or a recording with no sample) is `200` and stores nothing. Every error is `application/json` with the body `{"code":"<code>","message":"<message>"}`. Most are the reference's plain-HTTP form, with `X-Content-Type-Options: nosniff` and a newline, the code named from the status:
 
 | Case | Status | Code | Message |
 |---|---|---|---|
@@ -323,7 +342,8 @@ Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async
 | a bad multipart form | 422 | `unknown` | `parsing IngestInput-pprof failed failed to parse pprof /ingest multipart form <error>` |
 | a profile that does not decode | 422 | `unknown` | `parsing IngestInput-pprof failed invalid_argument: <error>` |
 | a profile the checks refuse | 422 | `unknown` | `pushing IngestInput-pprof failed push series with index 0 and id  failed: invalid_argument: <error>` |
-| `format=jfr` | 422 | `unknown` | above |
+| a JFR recording or form that does not read | 422 | `unknown` | `parsing IngestInput-pprof failed <error>`: the reader's error, such as `jfr parser ParseEvent error: error reading chunk header: unexpected EOF`, or `jfr field is required`, `loadJFRFromForm failed to decompress jfr: <error>`, `failed to parse labels form field: <error>` |
+| a JFR profile the checks refuse | 422 | `unknown` | `pushing IngestInput-pprof failed push series with index 0 and id  failed: invalid_argument: <error>` |
 | a folded, lines, trie, tree or speedscope body that does not parse | 422 | `unknown` | the parser's error, such as `strconv.Atoi: parsing "x": invalid syntax`, `bufio.Scanner: token too long`, `EOF`, `tree node children count 16001 exceeds maximum 16000` or `Unknown schema: <schema>` |
 | backpressure | 429 | `resource_exhausted` | `sink is applying backpressure: buffers are full` |
 | a reused `Idempotency-Key` | 400 | `invalid_argument` | §1.0 |
@@ -342,7 +362,7 @@ A parsed folded, lines, trie or tree body that is then refused answers in the pu
 | a reused `Idempotency-Key`, a push over its size ceiling or its UTC dates | `400` `invalid_argument` | as above |
 | the insert failed | `500` `internal` | `500` `unknown` |
 
-Four behaviours differ from the reference on purpose: a folded line of 65,536 bytes or more is read, a `name` carrying `profile_id` is stored, speedscope values are computed as described above, and tree siblings of one name sum (`docs/reference-defects-we-do-not-copy.md` entries 43 to 46).
+Six behaviours differ from the reference on purpose: a folded line of 65,536 bytes or more is read, a `name` carrying `profile_id` is stored, speedscope values are computed as described above, tree siblings of one name sum, a JFR lock or park delay is stored in nanoseconds rather than clock ticks, and each JFR CPU, allocation or lock event counts once rather than as the last wall-clock sample's count (`docs/reference-defects-we-do-not-copy.md` entries 43 to 46, 48 and 49). A JFR recording's profiles are stored together or not at all, where the reference stores each series on its own.
 
 ---
 

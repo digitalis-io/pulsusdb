@@ -162,6 +162,38 @@ that is not a row here fails the suite.
 - **Why:** #818 plan §8.
 - **Case:** #823 part B.
 
+### `ingest-jfr-delay-in-nanoseconds`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording holding `jdk.JavaMonitorEnter` or `jdk.ThreadPark`
+  events on a clock other than one tick per nanosecond.
+- **PulsusDB:** each delay is converted to nanoseconds with its chunk's
+  ticks per second: the library's `example.jfr` stores about 8,005,192,311.
+- **Reference:** the tick count is stored as nanoseconds: 18,443,760,794.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 48.
+- **Case:** #823 part B.
+
+### `ingest-jfr-event-count-not-carried`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording holding `profiler.WallClockSample` events with a
+  `samples` count above 1 and later CPU, allocation or lock events.
+- **PulsusDB:** each of those later events counts once.
+- **Reference:** each counts as the last wall-clock sample's count.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 49.
+- **Case:** #823 part B.
+
+### `ingest-jfr-series-stored-together`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording of several profiles, one of which the checks
+  refuse.
+- **PulsusDB:** nothing is stored, and the refusal names index 0.
+- **Reference:** each series is pushed on its own, so the others are stored,
+  and the refusal names the refused series' position.
+- **Why:** atomic writes; #819 plan E6 and E7.
+- **Case:** #823 part B.
+
 ### `otlp-multiple-values-are-summed`
 
 - **Route:** `/v1development/profiles`.

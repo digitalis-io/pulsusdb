@@ -10,22 +10,19 @@
 
 mod reader;
 
-#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read as _;
 
 use prost::Message;
-use pulsus_profiles_wire::google_v1::Profile;
-#[cfg(test)]
-use pulsus_profiles_wire::google_v1::{Sample, ValueType};
+use pulsus_profiles_wire::google_v1::{
+    Function, Label, Line, Location, Mapping, Profile, Sample, ValueType,
+};
 
-#[cfg(test)]
-use self::reader::Correlation;
-use self::reader::{Event, Pools, Reader};
+use self::reader::{Correlation, Event, IdMap, Pools, Reader};
 use crate::ingest::profiles::ProfileInput;
-#[cfg(test)]
-use crate::protocols::profile_model::SPY_LABEL;
-use crate::protocols::profile_push::LegacyQuery;
+use crate::protocols::profile_model::{MAX_PROFILE_SIZE_BYTES, SPY_LABEL};
+use crate::protocols::profile_push::{Labels, LegacyQuery, boundary_of, file_parts};
 
 /// The `labels` form part: each context id's labels, as ids into `strings`
 /// (`pprof/jfr_labels.proto`).
@@ -53,32 +50,404 @@ pub struct JfrProfiles {
     pub profiles: Vec<(&'static str, Profile)>,
 }
 
-/// Stub until the change: builds nothing.
-pub(crate) struct Builders {}
+/// One kind of sample: its series name, sample types and period type
+/// (`pprof/pprof.go:150-203`).
+struct SampleKind {
+    metric: &'static str,
+    sample_types: &'static [(&'static str, &'static str)],
+    period_type: Option<(&'static str, &'static str)>,
+}
+
+const CPU: usize = 0;
+const WALL: usize = 1;
+const IN_NEW_TLAB: usize = 2;
+const OUTSIDE_TLAB: usize = 3;
+const LOCK: usize = 4;
+const PARK: usize = 5;
+const LIVE_OBJECT: usize = 6;
+const ALLOC_SAMPLE: usize = 7;
+const MALLOC: usize = 8;
+
+const COUNT_DELAY: &[(&str, &str)] = &[("contentions", "count"), ("delay", "nanoseconds")];
+
+const KINDS: [SampleKind; 9] = [
+    SampleKind {
+        metric: "process_cpu",
+        sample_types: &[("cpu", "nanoseconds")],
+        period_type: Some(("cpu", "nanoseconds")),
+    },
+    SampleKind {
+        metric: "wall",
+        sample_types: &[("wall", "nanoseconds")],
+        period_type: Some(("wall", "nanoseconds")),
+    },
+    SampleKind {
+        metric: "memory",
+        sample_types: &[
+            ("alloc_in_new_tlab_objects", "count"),
+            ("alloc_in_new_tlab_bytes", "bytes"),
+        ],
+        period_type: Some(("space", "bytes")),
+    },
+    SampleKind {
+        metric: "memory",
+        sample_types: &[
+            ("alloc_outside_tlab_objects", "count"),
+            ("alloc_outside_tlab_bytes", "bytes"),
+        ],
+        period_type: Some(("space", "bytes")),
+    },
+    SampleKind {
+        metric: "mutex",
+        sample_types: COUNT_DELAY,
+        period_type: Some(("mutex", "count")),
+    },
+    SampleKind {
+        metric: "block",
+        sample_types: COUNT_DELAY,
+        period_type: Some(("block", "count")),
+    },
+    SampleKind {
+        metric: "memory",
+        sample_types: &[("live", "count")],
+        period_type: Some(("objects", "count")),
+    },
+    SampleKind {
+        metric: "memory",
+        sample_types: &[
+            ("alloc_sample_objects", "count"),
+            ("alloc_sample_bytes", "bytes"),
+        ],
+        period_type: Some(("space", "bytes")),
+    },
+    SampleKind {
+        metric: "memory",
+        sample_types: &[("malloc_objects", "count"), ("malloc_bytes", "bytes")],
+        period_type: None,
+    },
+];
+
+/// One profile being built (`pprof/profile_builder.go`): functions keyed by
+/// method, locations by method and line, samples by stack and correlation.
+/// Methods are keyed by their low 32 bits, as the library's are.
+struct Builder {
+    metric: &'static str,
+    profile: Profile,
+    strings: IdMap<String, i64>,
+    functions: IdMap<u32, u64>,
+    locations: IdMap<(u32, u32), u64>,
+    samples: IdMap<(u64, Correlation), usize>,
+}
+
+impl Builder {
+    fn new(kind: &SampleKind, time_nanos: i64, duration_nanos: i64) -> Builder {
+        let mut b = Builder {
+            metric: kind.metric,
+            profile: Profile {
+                time_nanos,
+                duration_nanos,
+                mapping: vec![Mapping {
+                    id: 1,
+                    has_functions: true,
+                    ..Mapping::default()
+                }],
+                ..Profile::default()
+            },
+            strings: IdMap::default(),
+            functions: IdMap::default(),
+            locations: IdMap::default(),
+            samples: IdMap::default(),
+        };
+        b.intern("");
+        for (ty, unit) in kind.sample_types {
+            let vt = ValueType {
+                r#type: b.intern(ty),
+                unit: b.intern(unit),
+            };
+            b.profile.sample_type.push(vt);
+        }
+        if let Some((ty, unit)) = kind.period_type {
+            b.profile.period_type = Some(ValueType {
+                r#type: b.intern(ty),
+                unit: b.intern(unit),
+            });
+        }
+        b
+    }
+
+    fn intern(&mut self, s: &str) -> i64 {
+        if let Some(&i) = self.strings.get(s) {
+            return i;
+        }
+        let i = self.profile.string_table.len() as i64;
+        self.profile.string_table.push(s.to_string());
+        self.strings.insert(s.to_string(), i);
+        i
+    }
+
+    /// The sample's labels: its context's labels from the snapshot, then
+    /// `profile_id`, `span_name` and `trace_id` from its correlation
+    /// (`pprof/profile_builder.go:131-194`).
+    fn sample_labels(&mut self, labels: &LabelsSnapshot, c: &Correlation) -> Vec<Label> {
+        let text = |id: i64| labels.strings.get(&id).map_or("", String::as_str);
+        let mut out = Vec::new();
+        if let Some(ctx) = labels.contexts.get(&(c.context_id as i64)) {
+            for (&k, &v) in &ctx.labels {
+                let label = Label {
+                    key: self.intern(text(k)),
+                    str: self.intern(text(v)),
+                    ..Label::default()
+                };
+                out.push(label);
+            }
+        }
+        if c.span_id != 0 {
+            let label = Label {
+                key: self.intern("profile_id"),
+                str: self.intern(&format!("{:016x}", c.span_id)),
+                ..Label::default()
+            };
+            out.push(label);
+        }
+        if c.span_name != 0 {
+            let name = text(c.span_name as i64);
+            if !name.is_empty() {
+                let label = Label {
+                    key: self.intern("span_name"),
+                    str: self.intern(name),
+                    ..Label::default()
+                };
+                out.push(label);
+            }
+        }
+        if c.trace_id_hi != 0 || c.trace_id_lo != 0 {
+            let label = Label {
+                key: self.intern("trace_id"),
+                str: self.intern(&format!("{:016x}{:016x}", c.trace_id_hi, c.trace_id_lo)),
+                ..Label::default()
+            };
+            out.push(label);
+        }
+        out
+    }
+}
+
+/// A recording's profiles as its events arrive (`pprof/parser.go:52-150`,
+/// `pprof/pprof.go:79-148`).
+pub(crate) struct Builders {
+    builders: [Option<Builder>; 9],
+    time_nanos: i64,
+    duration_nanos: i64,
+    period: i64,
+    event: String,
+}
+
+/// A lock or park duration in nanoseconds: its chunk's ticks scaled, or the
+/// ticks when the chunk names no rate (entry 48).
+fn delay_nanos(ticks: u64, ticks_per_second: u64) -> i64 {
+    if ticks_per_second == 0 {
+        return ticks as i64;
+    }
+    (i128::from(ticks) * 1_000_000_000 / i128::from(ticks_per_second)) as i64
+}
 
 impl Builders {
-    pub(crate) fn new(_time_nanos: i64, _duration_nanos: i64, _sample_rate: u32) -> Builders {
-        Builders {}
+    pub(crate) fn new(time_nanos: i64, duration_nanos: i64, sample_rate: u32) -> Builders {
+        Builders {
+            builders: Default::default(),
+            time_nanos,
+            duration_nanos,
+            period: if sample_rate == 0 {
+                0
+            } else {
+                1_000_000_000 / i64::from(sample_rate)
+            },
+            event: String::new(),
+        }
     }
 
+    /// One event. Each counts once, a wall-clock sample as its `samples`
+    /// (entry 49).
     pub(crate) fn add(
         &mut self,
-        _pools: &Pools<'_>,
-        _labels: &LabelsSnapshot,
-        _event: &Event<'_>,
-        _ticks_per_second: u64,
+        pools: &Pools<'_>,
+        labels: &LabelsSnapshot,
+        event: &Event<'_>,
+        ticks_per_second: u64,
     ) {
+        let state = |id: &u64| pools.thread_states.get(id).map(|s| s.as_ref());
+        match event {
+            Event::ExecutionSample {
+                stack,
+                state: st,
+                correlation,
+            } => {
+                if state(st).is_some_and(|s| s != "STATE_SLEEPING") {
+                    self.add_stack(CPU, pools, labels, *stack, correlation, &[1]);
+                }
+                if self.event == "wall" {
+                    self.add_stack(WALL, pools, labels, *stack, correlation, &[1]);
+                }
+            }
+            Event::WallClockSample {
+                stack,
+                state: st,
+                samples,
+                correlation,
+            } => {
+                let v = [i64::from(*samples)];
+                if state(st) == Some("STATE_RUNNABLE") && self.event == "wall" {
+                    self.add_stack(CPU, pools, labels, *stack, correlation, &v);
+                }
+                self.add_stack(WALL, pools, labels, *stack, correlation, &v);
+            }
+            Event::AllocInNewTlab {
+                stack,
+                tlab_size,
+                correlation,
+            } => {
+                let v = [1, *tlab_size as i64];
+                self.add_stack(IN_NEW_TLAB, pools, labels, *stack, correlation, &v);
+            }
+            Event::AllocOutsideTlab {
+                stack,
+                allocation_size,
+                correlation,
+            } => {
+                let v = [1, *allocation_size as i64];
+                self.add_stack(OUTSIDE_TLAB, pools, labels, *stack, correlation, &v);
+            }
+            Event::MonitorEnter {
+                stack,
+                duration,
+                correlation,
+            } => {
+                let v = [1, delay_nanos(*duration, ticks_per_second)];
+                self.add_stack(LOCK, pools, labels, *stack, correlation, &v);
+            }
+            Event::ThreadPark { stack, duration } => {
+                let v = [1, delay_nanos(*duration, ticks_per_second)];
+                self.add_stack(PARK, pools, labels, *stack, &Correlation::default(), &v);
+            }
+            Event::LiveObject { stack } => {
+                let none = Correlation::default();
+                self.add_stack(LIVE_OBJECT, pools, labels, *stack, &none, &[1]);
+            }
+            Event::AllocSample { stack, weight } => {
+                let v = [1, *weight as i64];
+                let none = Correlation::default();
+                self.add_stack(ALLOC_SAMPLE, pools, labels, *stack, &none, &v);
+            }
+            Event::Malloc { stack, size } => {
+                let v = [1, *size as i64];
+                let none = Correlation::default();
+                self.add_stack(MALLOC, pools, labels, *stack, &none, &v);
+            }
+            Event::ActiveSetting { name, value } => {
+                if name == "event" {
+                    self.event = value.to_string();
+                }
+            }
+        }
     }
 
+    /// Adds `values` to the sample of `stack` and `correlation`, making the
+    /// builder first and the sample when it is new (`pprof/pprof.go:79-148`).
+    fn add_stack(
+        &mut self,
+        kind: usize,
+        pools: &Pools<'_>,
+        labels: &LabelsSnapshot,
+        stack: u64,
+        correlation: &Correlation,
+        values: &[i64],
+    ) {
+        let mul = if kind == CPU || kind == WALL {
+            self.period
+        } else {
+            1
+        };
+        let (time_nanos, duration_nanos) = (self.time_nanos, self.duration_nanos);
+        let b = self.builders[kind]
+            .get_or_insert_with(|| Builder::new(&KINDS[kind], time_nanos, duration_nanos));
+        let Some(frames) = pools.stack_traces.get(&stack) else {
+            return;
+        };
+        if let Some(&i) = b.samples.get(&(stack, *correlation)) {
+            for (d, v) in b.profile.sample[i].value.iter_mut().zip(values) {
+                *d = d.wrapping_add(v.wrapping_mul(mul));
+            }
+            return;
+        }
+        let mut location_id = Vec::with_capacity(frames.len());
+        for f in frames {
+            let key = (f.method as u32, f.line);
+            if let Some(&loc) = b.locations.get(&key) {
+                location_id.push(loc);
+                continue;
+            }
+            let Some(method) = pools.methods.get(&f.method) else {
+                continue;
+            };
+            let function_id = match b.functions.get(&key.0) {
+                Some(&id) => id,
+                None => {
+                    let Some(&class) = pools.classes.get(&method.class) else {
+                        continue;
+                    };
+                    let name = format!("{}.{}", pools.symbol(class), pools.symbol(method.name));
+                    let name = b.intern(&name);
+                    let id = b.profile.function.len() as u64 + 1;
+                    b.profile.function.push(Function {
+                        id,
+                        name,
+                        ..Function::default()
+                    });
+                    b.functions.insert(key.0, id);
+                    id
+                }
+            };
+            let id = b.profile.location.len() as u64 + 1;
+            b.profile.location.push(Location {
+                id,
+                mapping_id: 1,
+                line: vec![Line {
+                    function_id,
+                    line: i64::from(f.line),
+                }],
+                ..Location::default()
+            });
+            b.locations.insert(key, id);
+            location_id.push(id);
+        }
+        let value = values.iter().map(|v| v.wrapping_mul(mul)).collect();
+        let label = b.sample_labels(labels, correlation);
+        b.samples
+            .insert((stack, *correlation), b.profile.sample.len());
+        b.profile.sample.push(Sample {
+            location_id,
+            value,
+            label,
+        });
+    }
+
+    /// The profiles, by builder (§3.3), and the `event` setting.
     pub(crate) fn finish(self) -> JfrProfiles {
         JfrProfiles {
-            event: String::new(),
-            profiles: Vec::new(),
+            event: self.event,
+            profiles: self
+                .builders
+                .into_iter()
+                .flatten()
+                .map(|b| (b.metric, b.profile))
+                .collect(),
         }
     }
 }
 
-/// The recording's profiles.
+/// The recording's profiles (§3.2 to §3.4): `time_nanos` and
+/// `duration_nanos` are every profile's, and a `sample_rate` other than 0
+/// scales CPU and wall samples by its period.
 pub fn parse_jfr(
     body: &[u8],
     labels: &LabelsSnapshot,
@@ -94,14 +463,112 @@ pub fn parse_jfr(
     Ok(builders.finish())
 }
 
-/// Stub until the change: no input.
+/// The reference's `decompress` (`profile.go:136-162`): a gzip body under
+/// the profile size limit, anything else as it is.
+fn decompress(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+    if bytes.len() < 2 {
+        return Err("failed to read magic".to_string());
+    }
+    if bytes[..2] != [0x1f, 0x8b] {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(bytes)
+        .take(MAX_PROFILE_SIZE_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("failed to decompress jfr: {e}"))?;
+    if out.len() as u64 > MAX_PROFILE_SIZE_BYTES {
+        return Err(format!(
+            "decompressed size exceeds maximum allowed size of {MAX_PROFILE_SIZE_BYTES} bytes"
+        ));
+    }
+    Ok(Cow::Owned(out))
+}
+
+/// The form's `jfr` and `labels` parts (`profile.go:93-134`).
+fn read_form<'b>(
+    content_type: &str,
+    body: &'b [u8],
+) -> Result<(Cow<'b, [u8]>, LabelsSnapshot), String> {
+    let boundary = boundary_of(content_type).ok_or("malformed multipart content type header")?;
+    let parts = file_parts(body, &boundary)?;
+    let field = |name: &str| {
+        parts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
+            .filter(|b| !b.is_empty())
+    };
+    let jfr = field("jfr").ok_or("jfr field is required")?;
+    let jfr =
+        decompress(jfr).map_err(|e| format!("loadJFRFromForm failed to decompress jfr: {e}"))?;
+    let mut labels = LabelsSnapshot::default();
+    if let Some(part) = field("labels") {
+        let part = decompress(part)
+            .map_err(|e| format!("loadJFRFromForm failed to decompress labels: {e}"))?;
+        labels = LabelsSnapshot::decode(part.as_ref())
+            .map_err(|e| format!("failed to parse labels form field: {e}"))?;
+    }
+    Ok((jfr, labels))
+}
+
+/// A JFR push as the model's inputs (§3.1, §3.5): one per profile, each
+/// under the reference's series labels. An error is the text the answer
+/// carries after `parsing IngestInput-pprof failed `.
 pub fn jfr_inputs(
-    _query: &LegacyQuery,
-    _content_type: &str,
-    _body: &[u8],
-    _now_ns: i64,
+    query: &LegacyQuery,
+    content_type: &str,
+    body: &[u8],
+    now_ns: i64,
 ) -> Result<Vec<ProfileInput>, String> {
-    Ok(Vec::new())
+    let (jfr, labels) = if content_type.contains("multipart/form-data") {
+        read_form(content_type, body)?
+    } else {
+        (Cow::Borrowed(body), LabelsSnapshot::default())
+    };
+    let time_nanos = query.from_ns.unwrap_or(now_ns);
+    let duration_nanos = query.until_ns.unwrap_or(now_ns).wrapping_sub(time_nanos);
+    let out = parse_jfr(&jfr, &labels, time_nanos, duration_nanos, query.sample_rate)?;
+
+    let service = query
+        .name
+        .iter()
+        .find(|(k, _)| k == "__name__")
+        .map_or("", |(_, v)| v.as_str());
+    let kept: Labels = query
+        .name
+        .iter()
+        .filter(|(k, _)| !k.starts_with("__") || k == "__session_id__")
+        .cloned()
+        .collect();
+    let service_label = if kept.iter().any(|(k, _)| k == "service_name") {
+        "app_name"
+    } else {
+        "service_name"
+    };
+    let add_service = !service.is_empty() && !kept.iter().any(|(k, _)| k == service_label);
+    Ok(out
+        .profiles
+        .into_iter()
+        .map(|(metric, profile)| {
+            let mut labels = kept.clone();
+            labels.push((SPY_LABEL.to_string(), query.spy_name.clone()));
+            labels.push(("__delta__".to_string(), "false".to_string()));
+            labels.push(("jfr_event".to_string(), out.event.clone()));
+            labels.push(("__name__".to_string(), metric.to_string()));
+            if add_service {
+                labels.push((service_label.to_string(), service.to_string()));
+            }
+            ProfileInput {
+                labels,
+                decompressed_bytes: profile.encoded_len() as u64,
+                profile,
+                id: None,
+                annotations: Vec::new(),
+                language: None,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
