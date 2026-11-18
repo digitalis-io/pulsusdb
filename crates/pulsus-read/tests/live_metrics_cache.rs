@@ -132,7 +132,8 @@ async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<Fingerprin
 
 fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> LabelCacheConfig {
     LabelCacheConfig {
-        skip_unavailable_shards: false,
+        landing_table: series_table.replace("metric_series", "metric_landing"),
+        feed_overlap_ms: 300_000,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -887,6 +888,20 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     );
     assert_eq!(good.num_series, 10, "the last GOOD snapshot");
     assert!(cache.is_warm());
+    // The series the good pass holds, by fingerprint.
+    let in_window = DataWindow {
+        start_ms: recent,
+        end_ms: now_ms,
+    };
+    let held = |cache: &LabelCache| match cache.resolve(&no_tenant(), "up", &[], in_window) {
+        Resolution::Fingerprints(fps) => fps,
+        other => panic!("expected the cache to answer, got {other:?}"),
+    };
+    let good_fps = held(&cache);
+    assert_eq!(
+        good_fps,
+        (1..=10).map(Fingerprint::from_raw).collect::<Vec<_>>()
+    );
 
     // Widen the corpus so the next sweep over the SAME cache cannot fit
     // under the same ceiling.
@@ -901,8 +916,8 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
-                 SELECT 2, 'up', number + 1000, {recent}, \
+                "INSERT INTO {db}.metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels) \
+                 SELECT {now_ms}, 2, 'up', number + 1000, {recent}, \
                         concat('{{\"job\":\"w', toString(number), '\"}}') \
                  FROM numbers(200000)"
             ),
@@ -912,6 +927,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
         .await
         .expect("widen metric_series");
 
+    let anchor = cache.sweep_time_ms(&no_tenant());
     let err = cache
         .refresh()
         .await
@@ -924,16 +940,33 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
         other => panic!("expected a server 241, got {other:?}"),
     }
 
-    // Behaviour deliberately unchanged: the last good snapshot is still
-    // resident, not blanked — a blanked cache would mass-false-empty every
-    // in-window query.
+    // The cache is not blanked — a blanked cache would mass-false-empty
+    // every in-window query. Issue #880: the pass is a feed applied in
+    // batches, so the batches it applied before the breach stay (each a
+    // registration the store holds), and its recency anchor does not move.
     let after = cache.tsdb_snapshot(
         &no_tenant(),
         pulsus_read::metrics::labels::TSDB_TOP_METRIC_NAMES,
     );
+    assert!(
+        after.num_series >= good.num_series,
+        "a failed sweep must never clobber the last good snapshot: {} of {}",
+        after.num_series,
+        good.num_series
+    );
+    let after_fps = held(&cache);
+    let lost: Vec<&Fingerprint> = good_fps
+        .iter()
+        .filter(|fp| !after_fps.contains(fp))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "a failed sweep must keep every series the good pass held; lost {lost:?}"
+    );
     assert_eq!(
-        after.num_series, good.num_series,
-        "a failed sweep must never clobber the last good snapshot"
+        cache.sweep_time_ms(&no_tenant()),
+        anchor,
+        "a failed sweep keeps its recency anchor"
     );
     assert!(cache.is_warm(), "a failed sweep must not un-warm the cache");
 

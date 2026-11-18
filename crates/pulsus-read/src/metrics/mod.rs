@@ -16,8 +16,8 @@
 //!   #30 landing first) plus [`matcher::DataWindow`], the resolver-boundary
 //!   window type that stays local to this crate.
 //! - [`labels`] — the resolver core: [`labels::LabelCache`],
-//!   [`labels::LabelCacheConfig`], [`labels::CacheSnapshot`],
-//!   [`labels::SeriesResolver`], [`labels::Resolution`],
+//!   [`labels::LabelCacheConfig`], [`labels::SeriesResolver`],
+//!   [`labels::Resolution`],
 //!   [`labels::LabelledResolution`] (issue #31's labelled variant),
 //!   [`labels::FallbackReason`]. In-process matcher evaluation (incl. a
 //!   bounded compiled-regex cache) lives here.
@@ -38,9 +38,13 @@
 //!   and reach the escaper directly. One boundary crossing is NOT
 //!   sealed: the `_for_test` literal seam (the leaf's boundary inventory
 //!   states what it permits; issue #328's D1 retires it).
-//! - [`refresh`] — the only ClickHouse-touching code: the §5.2 sweep and
-//!   [`refresh::spawn_refresh_loop`].
-//! - [`rows`] — `ChClient` result-row shapes for the sweep.
+//! - `promql_label_index` *(issue #880)* — [`LabelIndex`], one tenant's
+//!   cache: a symbol table, packed per-series labels and sorted posting
+//!   lists, updated in place.
+//! - [`refresh`] — the only ClickHouse-touching code: the cache's build
+//!   and feed passes, and [`refresh::spawn_refresh_loop`].
+//! - [`rows`] — `ChClient` result-row shapes for the passes and the
+//!   discovery reads.
 //! - [`stats`] — [`stats::CacheMetrics`] atomics + a plain-value snapshot,
 //!   mirroring `pulsus-write`'s `WriterMetrics` precedent.
 //! - [`exec`] *(issue #31)* — [`exec::MetricsEngine`]: `pulsus_promql::plan`
@@ -67,7 +71,7 @@
 //! **Time-awareness invariant (correctness, not optimization):** the cache
 //! answers only queries whose full data window lies inside the cache
 //! window. A series alive last week but silent today is absent from the
-//! window-bounded snapshot; a historical query for it must resolve via
+//! window-bounded cache; a historical query for it must resolve via
 //! `metric_series` with bucket-floored bounds
 //! ([`pulsus_model::floor_to_activity_bucket`]), never from the cache
 //! (docs/architecture.md §5.2).
@@ -89,6 +93,7 @@ pub mod grouped_rows;
 pub mod grouped_sql;
 pub mod labels;
 pub mod matcher;
+mod promql_label_index;
 mod re2_authority;
 pub mod read_cache;
 pub mod refresh;
@@ -135,15 +140,16 @@ pub use exec::{
 };
 pub use exemplars::{ExemplarSeries, StoredExemplar};
 pub use labels::{
-    CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,
+    DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig, LabelPassProbe,
     LabelledResolution, MetricSeriesGroup, MultiMetricResolution, MultiMetricScanProbe, Resolution,
     SeriesResolver, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot,
 };
 pub use matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
+pub use promql_label_index::LabelIndex;
 #[doc(hidden)]
 pub use re2_authority::pattern_requires_re2_authority_for_test;
 pub use refresh::spawn_refresh_loop;
-pub use rows::SeriesRow;
+pub use rows::{RegistrationRow, SeriesRow};
 pub use sample_rows::SampleRow;
 // Unsealed by design — exists because `tests/re2_screen_differential.rs`
 // is an external binary. Issue #328's D1 extraction moved the SCREEN to

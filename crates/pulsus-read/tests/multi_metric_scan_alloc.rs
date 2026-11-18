@@ -98,7 +98,9 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static ALLOCATOR: CountingAlloc = CountingAlloc;
 
-use pulsus_read::metrics::{CacheSnapshot, MultiMetricResolution, MultiMetricScanProbe};
+use pulsus_read::metrics::{
+    LabelIndex as CacheSnapshot, MultiMetricResolution, MultiMetricScanProbe,
+};
 
 /// The scan budget under test (`B`).
 const SCAN_BUDGET: u64 = 50_000;

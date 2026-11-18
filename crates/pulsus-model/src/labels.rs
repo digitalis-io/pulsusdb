@@ -455,6 +455,14 @@ impl LabelSet {
     where
         I: IntoIterator<Item = (String, String)>,
     {
+        // Issue #880: input already sorted by key with no key twice — the
+        // label cache's packed labels, the canonical JSON the writer
+        // stores — is the set as it stands; grouping it would copy every
+        // string again to arrive at the same entries.
+        let pairs: Vec<(String, String)> = pairs.into_iter().collect();
+        if pairs.windows(2).all(|w| w[0].0 < w[1].0) {
+            return LabelSet { entries: pairs };
+        }
         let groups = group_by(pairs, |k| k.to_string());
         let mut entries = Vec::with_capacity(groups.len());
         for (key, distinct) in groups {

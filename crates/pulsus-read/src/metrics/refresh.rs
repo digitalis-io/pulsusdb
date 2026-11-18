@@ -1,42 +1,32 @@
-//! The only ClickHouse-touching code in this module: the docs/architecture.md
-//! §5.2 sweep (every `(metric_name, fingerprint)` in `metric_series` since
-//! `floor(now - window)`, with its own label row in `metric_labels` —
-//! [`super::sql::sweep_query`]), building a whole new
-//! [`super::labels::CacheSnapshot`] and atomically swapping it into the
-//! resident [`super::labels::LabelCache`]. [`spawn_refresh_loop`] runs this
-//! on an interval in a self-healing shape (the server's retention rotation
-//! task once had the same shape; issue #619 removed it): a
-//! failed
-//! sweep logs a warning and bumps `refresh_failures_total`, but **never**
-//! clobbers the last good snapshot — a blanked cache would mass-false-empty
-//! every in-window query.
+//! The only ClickHouse-touching code of the label cache (issue #880): one
+//! pass per tenant, every `PULSUS_CACHE_TTL`. A cold tenant's first pass
+//! builds its [`super::promql_label_index::LabelIndex`] from
+//! `metric_labels` ([`super::sql::label_index_build_query`]); every pass
+//! after reads only the series registrations `metric_landing` received
+//! since the last one, less an overlap ([`super::sql::label_index_feed_query`]),
+//! and applies them in place. Rows are streamed and applied in batches of
+//! [`APPLY_BATCH_ROWS`], so a pass never holds its whole answer.
+//!
+//! A pass's header — generation, recency anchor, covered-from edge and
+//! watermark — moves only when the pass is accepted
+//! ([`super::labels::LabelCache::commit_sweep`]). A failed pass leaves its
+//! applied rows, each a registration the store holds, and the header as it
+//! was, so the recency gate and the next feed's start are unchanged.
+//! [`spawn_refresh_loop`] runs a pass on an interval in a self-healing
+//! shape: a failed pass logs a warning and bumps `refresh_failures_total`,
+//! and the next tick tries again.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, QuerySettings};
-use pulsus_model::{Fingerprint, LabelSet, Tenant, floor_to_activity_bucket};
+use pulsus_model::{LabelSet, Tenant, floor_to_activity_bucket};
 
-use super::matcher::DataWindow;
 use tokio::task::JoinHandle;
 
-use super::labels::{CacheSnapshot, LabelCache, LabelCacheConfig, TenantCache};
-use super::rows::SeriesRow;
-
-/// Renders the §5.2 sweep SQL ([`super::sql::sweep_query`]): every series
-/// active since `floor(now - window)`, with its labels, no upper bound (the
-/// sweep always runs "as of now"). Pure so it is snapshot-testable without a
-/// clock/DB.
-fn sweep_sql(
-    tenant: &Tenant,
-    series_table: &str,
-    labels_table: &str,
-    window: DataWindow,
-) -> String {
-    super::sql::sweep_query(tenant, series_table, labels_table, window)
-}
+use super::labels::{LabelCache, LabelCacheConfig, TenantCache};
+use super::rows::RegistrationRow;
 
 /// Wall-clock now, milliseconds since the Unix epoch. `SystemTime::now()`
 /// predating the Unix epoch is a broken-clock scenario, not one that
@@ -52,102 +42,188 @@ pub(crate) fn now_unix_ms() -> i64 {
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// One tenant's sweep, built but not yet swapped in (issue #803): the
-/// maps, the sweep's own `now_ms` and its floored lower bound. The
-/// generation is set at the swap, from the tenant's snapshot then.
-#[derive(Debug, Default)]
-pub(crate) struct SweptSnapshot {
-    pub(crate) by_fingerprint: HashMap<Fingerprint, LabelSet>,
-    pub(crate) by_metric: HashMap<String, Vec<Fingerprint>>,
-    pub(crate) sweep_time_ms: i64,
-    pub(crate) covered_from_ms: i64,
+/// A feed whose watermark is older than this builds instead.
+/// `PULSUS_METRICS_LANDING_RETENTION_HOURS` is at least 1, and a landing
+/// part is dropped only once its newest row is that old
+/// (`ttl_only_drop_parts = 1`), so every row received in the last hour is
+/// still there.
+pub(crate) const FEED_MAX_AGE_MS: i64 = 3_000_000;
+
+/// Rows applied per write lock: bounds how long one batch holds it.
+pub(crate) const APPLY_BATCH_ROWS: usize = 1_024;
+
+/// A replica whose copy lags this much or more is not read by a cache
+/// statement; a shard with no fresher replica fails the pass.
+pub(crate) const CACHE_MAX_REPLICA_DELAY_SECS: u64 = 30;
+
+/// Which statement a pass sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassKind {
+    /// Every series registered in `[lower_bound_ms, now]`, from
+    /// `metric_labels`.
+    Build { lower_bound_ms: i64 },
+    /// The registrations `metric_landing` received from `from_ms` on.
+    Feed { from_ms: i64 },
 }
 
-impl SweptSnapshot {
-    pub(crate) fn series_count(&self) -> u64 {
-        self.by_fingerprint.len() as u64
-    }
+/// `floor_to_activity_bucket(now - window)`: the edge a pass covers from.
+pub(crate) fn lower_bound_ms(now_ms: i64, window_ms: i64) -> i64 {
+    floor_to_activity_bucket(now_ms - window_ms, pulsus_model::ACTIVITY_BUCKET_MS)
+}
 
-    /// Swaps this sweep into `slot` under a brief write lock (never held
-    /// across an `.await`), one generation past the snapshot it replaces.
-    pub(crate) fn swap_into(self, slot: &TenantCache) {
-        let generation = slot.current_snapshot().generation.saturating_add(1);
-        let snapshot = CacheSnapshot {
-            by_fingerprint: self.by_fingerprint,
-            by_metric: self.by_metric,
-            // The sweep's own `now_ms` (code review round-2 fix: this — not a
-            // wall-clock `Instant` captured at swap time — is the recency
-            // anchor `resolve_over`'s upper-bound gate and `LabelCache::age_ms`
-            // both measure against; see `CacheSnapshot::sweep_time_ms`'s doc
-            // comment).
-            sweep_time_ms: self.sweep_time_ms,
-            covered_from_ms: self.covered_from_ms,
-            generation,
-        };
-        let mut guard = match slot.snapshot.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Arc::new(snapshot);
+/// The pass's decision: a cold tenant builds, and so does one whose
+/// watermark is more than [`FEED_MAX_AGE_MS`] old; any other feeds from its
+/// watermark less the overlap.
+pub(crate) fn pass_kind(
+    generation: u64,
+    watermark_ms: i64,
+    now_ms: i64,
+    overlap_ms: i64,
+    window_ms: i64,
+) -> PassKind {
+    if generation == 0 || now_ms - watermark_ms > FEED_MAX_AGE_MS {
+        PassKind::Build {
+            lower_bound_ms: lower_bound_ms(now_ms, window_ms),
+        }
+    } else {
+        PassKind::Feed {
+            from_ms: watermark_ms - overlap_ms,
+        }
     }
 }
 
-/// One tenant's sweep (issue #803): streams [`SeriesRow`]s and builds the
-/// maps of a new snapshot, touching no cache state.
-pub(crate) async fn sweep_tenant(
+/// What a tenant's statement ended with, carried to the commit: the pass's
+/// start and its covered-from edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassStamp {
+    pub(crate) now_ms: i64,
+    pub(crate) lower_bound_ms: i64,
+}
+
+/// Applies one batch of a pass to `slot`'s index, leaving `batch` empty.
+///
+/// Under a read lock, each row whose series is not resident is marked;
+/// those rows' labels are parsed with no lock held; then, under one write
+/// lock, every row is applied. A feed row whose bucket is behind
+/// `lower_bound_ms` or after `now_ms` is skipped; a build row's bucket is
+/// taken as at most `now_ms` (its statement already bounds it below). One
+/// pass runs at a time, so nothing else inserts between the two locks; a
+/// row the read lock saw as new and an earlier row of the same batch
+/// inserted is applied as a touch.
+pub(crate) fn apply_batch(
+    slot: &TenantCache,
+    batch: &mut Vec<RegistrationRow>,
+    build: bool,
+    now_ms: i64,
+    lower_bound_ms: i64,
+) {
+    let bucket = |row: &RegistrationRow| -> Option<i64> {
+        if build {
+            Some(row.bucket_ms.min(now_ms))
+        } else if row.bucket_ms < lower_bound_ms || row.bucket_ms > now_ms {
+            None
+        } else {
+            Some(row.bucket_ms)
+        }
+    };
+    let unknown: Vec<bool> = {
+        let index = slot.read_index();
+        batch
+            .iter()
+            .map(|row| {
+                bucket(row).is_some_and(|b| b >= lower_bound_ms)
+                    && index.find(row.fingerprint).is_none()
+            })
+            .collect()
+    };
+    let mut parsed: Vec<Option<LabelSet>> = batch
+        .iter()
+        .zip(&unknown)
+        .map(|(row, &new)| {
+            new.then(|| crate::canonical_labels::parse_canonical_label_set(&row.labels))
+        })
+        .collect();
+    {
+        let mut index = slot.write_index();
+        for (row, labels) in batch.iter().zip(parsed.iter_mut()) {
+            let Some(bucket_ms) = bucket(row) else {
+                continue;
+            };
+            index.apply(
+                row.fingerprint,
+                &row.metric_name,
+                bucket_ms,
+                lower_bound_ms,
+                || {
+                    labels.take().unwrap_or_else(|| {
+                        crate::canonical_labels::parse_canonical_label_set(&row.labels)
+                    })
+                },
+            );
+        }
+    }
+    batch.clear();
+}
+
+/// One tenant's pass (issue #880): its statement, streamed into its index
+/// in batches. `Ok` carries the stamp the commit needs; the rows applied
+/// before an error stay.
+pub(crate) async fn pass_tenant(
     client: &ChClient,
     config: &LabelCacheConfig,
     tenant: &Tenant,
-) -> Result<SweptSnapshot, ChError> {
+    slot: &TenantCache,
+) -> Result<PassStamp, ChError> {
     let now_ms = now_unix_ms();
-    let lower_bound_ms =
-        floor_to_activity_bucket(now_ms - config.window_ms, pulsus_model::ACTIVITY_BUCKET_MS);
-    let sql = sweep_sql(
-        tenant,
-        &config.series_table,
-        &config.labels_table,
-        DataWindow {
-            start_ms: lower_bound_ms,
-            end_ms: now_ms,
-        },
+    let lb = lower_bound_ms(now_ms, config.window_ms);
+    let (generation, watermark_ms) = {
+        let index = slot.read_index();
+        (index.generation, index.watermark_ms)
+    };
+    let kind = pass_kind(
+        generation,
+        watermark_ms,
+        now_ms,
+        config.feed_overlap_ms,
+        config.window_ms,
     );
-    let rows = fetch_rows(client, config, &sql).await?;
-
-    let mut by_fingerprint: HashMap<Fingerprint, LabelSet> = HashMap::with_capacity(rows.len());
-    let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
-    for row in rows {
-        // The fingerprint is the series ID, which includes the metric name
-        // (issue #623), so one label set under two names is two IDs and
-        // neither map can merge series across metrics. Statement 2 returns
-        // each ID once; a repeat would carry the same row, so whichever the
-        // sweep saw last overwrites with the same content.
-        by_fingerprint.insert(
-            row.fingerprint,
-            crate::canonical_labels::parse_canonical_label_set(&row.labels),
-        );
-        by_metric
-            .entry(row.metric_name)
-            .or_default()
-            .push(row.fingerprint);
+    let sql = match kind {
+        PassKind::Build { lower_bound_ms } => super::sql::label_index_build_query(
+            tenant,
+            &config.labels_table,
+            lower_bound_ms,
+            now_ms,
+        ),
+        PassKind::Feed { from_ms } => {
+            super::sql::label_index_feed_query(tenant, &config.landing_table, from_ms)
+        }
+    };
+    let build = matches!(kind, PassKind::Build { .. });
+    let settings = sweep_settings(config.read_max_memory_bytes);
+    let mut stream = client
+        .query_stream::<RegistrationRow>(&sql, &settings)
+        .await?;
+    let mut batch = Vec::with_capacity(APPLY_BATCH_ROWS);
+    while let Some(row) = stream.next().await {
+        batch.push(row?);
+        if batch.len() == APPLY_BATCH_ROWS {
+            apply_batch(slot, &mut batch, build, now_ms, lb);
+        }
     }
-    for fps in by_metric.values_mut() {
-        fps.sort_unstable();
-        fps.dedup();
-    }
-    Ok(SweptSnapshot {
-        by_fingerprint,
-        by_metric,
-        sweep_time_ms: now_ms,
-        covered_from_ms: lower_bound_ms,
+    apply_batch(slot, &mut batch, build, now_ms, lb);
+    Ok(PassStamp {
+        now_ms,
+        lower_bound_ms: lb,
     })
 }
 
-/// What one label-cache pass read (issue #803): every tenant swept, every
-/// tenant whose statement failed, and the first such failure. Saved by
+/// What one label-cache pass read (issue #803): every tenant whose
+/// statement ended without error, with its stamp, every tenant whose
+/// statement failed, and the first such failure. Committed by
 /// [`LabelCache::commit_sweep`] only once the pass is accepted.
 #[derive(Debug, Default)]
 pub(crate) struct SweepOutcome {
-    pub(crate) swept: Vec<(Tenant, SweptSnapshot)>,
+    pub(crate) swept: Vec<(Tenant, PassStamp)>,
     pub(crate) failed: Vec<Tenant>,
     pub(crate) first_error: Option<ChError>,
 }
@@ -159,12 +235,12 @@ pub(crate) struct SweepOutcome {
 pub(crate) async fn sweep_attempt(
     client: &ChClient,
     config: &LabelCacheConfig,
-    tenants: &[Tenant],
+    slots: &[(Tenant, Arc<TenantCache>)],
 ) -> Result<SweepOutcome, ChError> {
     let mut outcome = SweepOutcome::default();
-    for tenant in tenants {
-        match sweep_tenant(client, config, tenant).await {
-            Ok(swept) => outcome.swept.push((tenant.clone(), swept)),
+    for (tenant, slot) in slots {
+        match pass_tenant(client, config, tenant, slot).await {
+            Ok(stamp) => outcome.swept.push((tenant.clone(), stamp)),
             Err(err) => {
                 outcome.failed.push(tenant.clone());
                 if outcome.first_error.is_none() {
@@ -176,82 +252,49 @@ pub(crate) async fn sweep_attempt(
     Ok(outcome)
 }
 
-/// Issue #398: the sweep carries the same per-query memory ceiling
-/// (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
-/// throw-not-spill) as every request-path metrics read, from
-/// `reader.promql_read_max_memory_bytes`. It sent `QuerySettings::new()`
-/// before — the one metrics ClickHouse read with no bound at all.
+/// The settings of every label-cache statement (issues #398, #880). A free
+/// function so the decision is provable without a ClickHouse connection
+/// (the `read_query_settings`/`probe_fanout_bound` precedent).
 ///
-/// The failure BEHAVIOUR is unchanged on purpose: a breach still returns
-/// `Err` here, and [`spawn_refresh_loop`] still logs it and keeps serving
-/// the last good snapshot. This only stops an unbounded sweep from
-/// competing for server memory; it does not, and is not meant to, change
-/// the fact that a degraded cache keeps answering `200` (recorded as
-/// remaining work on issue #398).
-async fn fetch_rows(
-    client: &ChClient,
-    config: &LabelCacheConfig,
-    sql: &str,
-) -> Result<Vec<SeriesRow>, ChError> {
-    let mut rows = Vec::new();
-    let mut stream = client
-        .query_stream::<SeriesRow>(
-            sql,
-            &sweep_settings(config.read_max_memory_bytes, config.skip_unavailable_shards),
-        )
-        .await?;
-    while let Some(row) = stream.next().await {
-        rows.push(row?);
-    }
-    Ok(rows)
-}
-
-/// The label-cache sweep's query settings (issue #398): the per-query
-/// memory ceiling from `reader.promql_read_max_memory_bytes`, the same
-/// throw-not-spill pair `metrics::exec::metrics_read_settings` sets. A
-/// free function so the decision is provable without a ClickHouse
-/// connection (the `read_query_settings`/`probe_fanout_bound` precedent).
-///
-/// **`distributed_product_mode = 'local'`, always** (issue #623). Clustered,
-/// the sweep reads `metric_labels*_dist` for the `(metric_name,
-/// fingerprint)` pairs a nested `metric_series*_dist` read names, which the
-/// default `'deny'` refuses.
-/// `'local'` is exact: one kind-2 row writes a series' activity row and its
-/// label row on the same node, so each shard's labels cover each shard's
-/// series. Single-node there is no `Distributed` table and the setting
-/// changes nothing.
-///
-/// **`join_algorithm = 'hash'`** (issue #623). The sweep reads label rows
-/// first and joins nothing, so the setting decides nothing for it today; it
-/// is the metrics reads' join choice ([`super::exec`]'s series reads), kept
-/// here so a sweep that did join would not fall to the server's default
-/// `parallel_hash`, which reserved about 42 MiB before reading a row —
-/// measured on 26.3.29.7, growing with the thread count.
-pub(crate) fn sweep_settings(
-    read_max_memory_bytes: u64,
-    skip_unavailable_shards: bool,
-) -> QuerySettings {
-    // Issue #18 part 2c r20: no lag guard. The sweep nests `metric_series`
-    // inside `metric_labels`, and the server checks a replica's lag for
-    // the outer table only, so it keeps the server's replica choice.
+/// - The per-query memory ceiling from `reader.promql_read_max_memory_bytes`
+///   and the throw-not-spill pair `metrics::exec::metrics_read_settings`
+///   sets.
+/// - The answer pins with `skip_unavailable_shards = 0`, whatever
+///   `PULSUS_SKIP_UNAVAILABLE_SHARDS` says: a pass must read every shard,
+///   and one that cannot fails, leaving its watermark where it was.
+/// - The replica guard: a replica [`CACHE_MAX_REPLICA_DELAY_SECS`] or more
+///   behind is not read, and a shard with no fresher replica fails the
+///   pass (`fallback_to_stale_replicas_for_distributed_queries = 0`), with
+///   the local copy preferred. Each statement reads one table, so the
+///   server applies the guard to it.
+/// - `distributed_product_mode = 'local'` and `join_algorithm = 'hash'`,
+///   the metrics reads' choices (issue #623), so a statement that nested or
+///   joined would not fall to the server's defaults.
+/// - `log_comment`: the task, as every background statement names it
+///   (issue #778).
+pub(crate) fn sweep_settings(read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
-        .answer_pins(false, skip_unavailable_shards)
+        .answer_pins(false, false)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
         .set("distributed_product_mode", "local")
         .set("join_algorithm", "hash")
-        // Issue #778: the sweep names its task, as every background
-        // statement does.
+        .set(
+            "max_replica_delay_for_distributed_queries",
+            CACHE_MAX_REPLICA_DELAY_SECS,
+        )
+        .set("fallback_to_stale_replicas_for_distributed_queries", 0u64)
+        .set("prefer_localhost_replica", 1u64)
         .set("log_comment", "background:label-cache-sweep")
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
 /// [`LabelCache::refresh`] pass per tick, in a self-healing shape: a failed
-/// sweep only logs and bumps a failure
-/// counter (already done inside the pass), it never aborts the loop or
-/// panics — the next tick simply tries again. `tokio::time::interval`'s
-/// first tick fires immediately, so the cache starts warming as soon as
-/// this task is spawned, not after the first full `ttl` elapses.
+/// pass only logs and bumps a failure counter (already done inside the
+/// pass), it never aborts the loop or panics — the next tick simply tries
+/// again. `tokio::time::interval`'s first tick fires immediately, so the
+/// cache starts warming as soon as this task is spawned, not after the
+/// first full `ttl` elapses.
 pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(ttl);
@@ -261,7 +304,7 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
             if let Err(err) = cache.refresh().await {
                 tracing::warn!(
                     error = %err,
-                    "label cache refresh sweep failed; serving the last good snapshot"
+                    "label cache pass failed; answering from what the cache holds"
                 );
             }
         }
@@ -272,37 +315,31 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
 mod tests {
     use super::*;
 
-    /// **Issue #623: the sweep is statement 2 with no matcher**: the lookup
-    /// rows of every series active in the cache window, by the activity
-    /// table's day and hour mask.
+    /// **T4 (issue #880).** A cold tenant builds; a watermark more than
+    /// 50 minutes old builds; anything newer feeds from the watermark less
+    /// the overlap.
     #[test]
-    fn sweep_sql_reads_the_lookup_for_the_active_series() {
+    fn pass_kind_builds_when_cold_or_stale_and_feeds_otherwise() {
+        let now = 1_788_823_800_000;
+        let window = 3_600_000;
+        let lb = floor_to_activity_bucket(now - window, pulsus_model::ACTIVITY_BUCKET_MS);
         assert_eq!(
-            sweep_sql(
-                &Tenant::from_header(None, false).expect("the empty tenant"),
-                "metric_series",
-                "metric_labels",
-                DataWindow {
-                    start_ms: 1_788_820_200_000,
-                    end_ms: 1_788_823_800_000,
-                },
-            ),
-            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
-             FROM (\n\
-             \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
-             \x20 FROM metric_labels\n\
-             \x20 WHERE org_id = ''\n\
-             \x20   AND fingerprint IN (\n\
-             \x20     SELECT fingerprint\n\
-             \x20     FROM metric_series\n\
-             \x20     WHERE org_id = ''\n\
-             \x20       AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
-             \x20       AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
-             day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
-             \x20   )\n\
-             )\n\
-             GROUP BY fingerprint\n\
-             ORDER BY metric_name, fingerprint"
+            pass_kind(0, 0, now, 300_000, window),
+            PassKind::Build { lower_bound_ms: lb }
+        );
+        assert_eq!(
+            pass_kind(0, now - 1_000, now, 300_000, window),
+            PassKind::Build { lower_bound_ms: lb }
+        );
+        assert_eq!(
+            pass_kind(1, now - 3_000_001, now, 300_000, window),
+            PassKind::Build { lower_bound_ms: lb }
+        );
+        assert_eq!(
+            pass_kind(1, now - 3_000_000, now, 300_000, window),
+            PassKind::Feed {
+                from_ms: now - 3_300_000
+            }
         );
     }
 
