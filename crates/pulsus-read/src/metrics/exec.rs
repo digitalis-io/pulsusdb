@@ -6581,7 +6581,7 @@ mod tests {
     /// exists to remove.
     #[test]
     fn label_cache_sweep_carries_the_memory_ceiling() {
-        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false);
+        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM);
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -6810,10 +6810,6 @@ mod tests {
                     (
                         "series_read_settings".to_string(),
                         series_read_settings(TEST_READ_MEM, distributed, skip, 5),
-                    ),
-                    (
-                        "sweep_settings".to_string(),
-                        crate::metrics::refresh::sweep_settings(TEST_READ_MEM, skip),
                     ),
                 ];
                 for st in [Count, Rows, Thinned, Series] {

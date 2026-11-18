@@ -268,25 +268,29 @@ Binary expressions evaluate both sides concurrently. Instant and range queries s
 
 ### 5.2 Label cache
 
-An in-process map `fingerprint → labels` plus `metric_name → [fingerprints]`, populated by a periodic (default 60s) query:
+An in-process index per tenant: one table of label strings, each held once; each series' labels packed as references into it; and a sorted series-ID list per label name and value and per metric name. A selector is answered by intersecting those lists, then testing the remaining matchers on each candidate. The index is built at start from `metric_labels`:
 
 ```sql
-SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels
-FROM (
-  SELECT fingerprint, metric_name AS name, labels AS label_text
-  FROM metric_labels
-  WHERE fingerprint IN (
-      SELECT fingerprint
-      FROM metric_series
-      WHERE day BETWEEN <first day> AND <last day>
-        AND bitAnd(hours, <the window's hours of each day>) != 0
-    )
-)
-GROUP BY fingerprint
-ORDER BY metric_name, fingerprint
+SELECT fingerprint, metric_name, last_seen AS bucket_ms, labels
+FROM metric_labels
+WHERE org_id = <tenant>
+  AND last_seen >= <floor(now - PULSUS_CACHE_WINDOW) to the hour>
+  AND first_seen <= <now>
 ```
 
-- Matcher evaluation (with a compiled-regex cache) happens against this map; results are sorted fingerprint vectors.
+and kept current every `PULSUS_CACHE_TTL` (default 60s) from the series registrations `metric_landing` received since the last pass, applied in place:
+
+```sql
+SELECT fingerprint, metric_name, unix_milli AS bucket_ms, labels
+FROM metric_landing
+WHERE kind = 2
+  AND org_id = <tenant>
+  AND received_ms >= <the last pass's start - overlap>
+```
+
+The overlap is `PULSUS_QUERY_TIMEOUT` + 180 s, the bound on how late a registration becomes readable. Every cache statement reads every shard and refuses a replica 30 s or more behind, whatever `PULSUS_SKIP_UNAVAILABLE_SHARDS` says; a pass that cannot fails and is tried again at the next interval, and a watermark older than 50 minutes builds again. A series leaves when its newest registration falls behind the window's hour edge, once an hour. A pass that fails part-way leaves the rows it applied, each a registration the store holds, and the recency anchor moves only when a pass completes.
+
+- Matcher evaluation (with a compiled-regex cache) happens against this index; results are sorted fingerprint vectors.
 - **Time-awareness (correctness rule):** the cache may only answer a query whose data window lies within the cache window — a series alive last week but silent today is *absent from the cache*, and answering from it would return false empties. Historical queries always resolve via a time-bounded read of `metric_series`, the matchers selecting IDs from the label index where the read has no metric name and a label matcher that does not match the empty string (issue #635), and from `metric_labels` otherwise: the window bounds the `day` column and gives each day's `hours` mask the window's hours, exact to the hour the writer registers a series in (exact SQL in [schemas.md §2.1](schemas.md)) — so a mid-hour window still finds a series active in that hour, and a series first seen after the window is excluded. The cache is a fast path for the recent window, never the source of truth.
 - **Recency gate (issue #30 code review, both edges checked):** the cache is authoritative for a query iff **both** the query's data-window start is at or after the cache's covered-from edge **and** the query's data-window end is at or before `sweep_time + staleness_threshold` (`staleness_threshold = staleness_multiplier × PULSUS_CACHE_TTL`, default 3×). The upper edge matters because a periodic-refresh cache structurally cannot know about a series whose first activity lands after its last sweep — a query reaching past that point risks a false empty for a brand-new series, the same failure mode the lower-bound rule already guards against. This yields a **bounded, documented recency gap**: in normal operation a brand-new series is invisible to the cache for at most one refresh interval (typically ≤ `PULSUS_CACHE_TTL`, worst case ≤ `staleness_threshold`), after which the query is forced onto the SQL fallback (which always sees the real table) — never an unbounded or silent gap, and every already-known series is answered exactly. This is the accepted advisory-degradation window: correctness is never compromised, only the fast path's applicability window narrows near the cache's own recency edge.
 - **Cardinality guard — two distinct roles, stated explicitly (issue #30):** `PULSUS_CACHE_MAX_SERIES` is a **per-selector** guard, not a resident-cache size limit — if one selector's in-process match exceeds it, that selector's resolution falls back to a SQL JOIN/sub-query against `metric_series` instead of shipping a huge IN-list. **Residency** (how many fingerprints the cache holds at all) is bounded separately, by the **active-series time window** (`PULSUS_CACHE_WINDOW`, default 24h — the whole point of this section's time-awareness rule), never by a count. A refresh sweep whose resident size exceeds `PULSUS_CACHE_MAX_SERIES` is not rejected or truncated — it sets an advisory degraded/oversize gauge (on `/metrics`) and the cache keeps serving everything it holds; this gauge feeds the M3 scale benchmark's memory-at-cardinality measurement, it is not a correctness signal.
@@ -411,8 +415,8 @@ Where those five actually get decided, stated exactly, because "above the charge
 |------|-----------------------------|
 | Rust ClickHouse client maturity (native protocol, aggregate-state columns) | M0 spike benchmarks `clickhouse` vs `klickhouse`; HTTP+RowBinary is an acceptable fallback for everything except `AggregateFunction` state reads, which can be avoided by `-Merge` in SQL |
 | `promql-parser` crate lagging the pinned reference grammar (duration expressions, UTF-8 label names, experimental syntax) | M2 spike validates the crate against the upstream parser test suite; divergences are patched/upstreamed; the committed fallback is porting the upstream parser — full grammar compliance is non-negotiable |
-| Label cache memory at design-target cardinality (millions of active series; ~300–600 B/series → GiB-scale reader RAM) | Active-window bounding + JOIN fallback (§5.2); the M3 scale corpus (5M active / 20M churned series) is the acceptance gate, incl. refresh-query cost and `metric_series` volume with a `1d` activity bucket |
-| Label resolution at millions of series: cache refresh sweep cost; JSON-matching SQL reads dominating broad/historical selectors | Matchers run on the lookup, a key range per metric name, and the window on the day activity, exact to the hour (issue #623); `query_log_gates.rs` pins a named read below a row bound and one metric's samples as one key range |
+| Label cache memory at design-target cardinality (millions of active series; about 155 B/series at 14 labels → about 0.7 GiB of reader RAM at 5M) | Active-window bounding + JOIN fallback (§5.2); the M3 scale corpus (5M active / 20M churned series) is the acceptance gate, incl. the start-up build's cost and `metric_series` volume with a `1d` activity bucket |
+| Label resolution at millions of series: the label cache's start-up build; JSON-matching SQL reads dominating broad/historical selectors | Matchers run on the lookup, a key range per metric name, and the window on the day activity, exact to the hour (issue #623); `query_log_gates.rs` pins a named read below a row bound and one metric's samples as one key range |
 | Skip-index false-positive rates on log bodies (scale-dependent: rate is a function of corpus size/content, not topology) | None to tune: the body's `text` index has no false positives (#624 part 3b); planner records skip-index effectiveness metrics to guide defaults; validated at Tier-2 scale by the M1 follow-up (#25) — M1 Tier-1 evidence does not touch this row |
 | Projection write amplification on `trace_spans` | Acceptable at typical trace volumes; if not, fall back to a second explicit table maintained by MV (same read path) |
 | Shard-local execution claims (co-sharding → local joins/aggregation) are design intent, not yet observed behavior, for **metrics/traces/profiles**; the **logs family graduated in M1** (issue #16), covering both the stream-resolution/read path and label/tag discovery | M3/M4 distributed benchmarks verify the remaining signal families with `EXPLAIN PIPELINE` + `system.query_log` on a multi-shard cluster before those rows graduate from hypothesis; logs graduated on Tier-1 4-shard evidence captured **per stage and per shard, including the coordinator's own local-shard read, verified against a client-computed expected shard roster** (three CODE-review corrections on #16: terminal-stage-only spot check → per-stage capture; excluded coordinator shard → full shard roster; tolerant 1..N shard-count check → exact sharding-key-derived roster, so a pruned shard is *proven* pruned rather than merely absent), see `docs/benchmarks/m1-logs-read-path.md`. **That evidence was captured while the logs sharding key was the bare `fingerprint` column; the key is `cityHash64(fingerprint)` since issue #498.** What survives the change is the execution SHAPE and the method — per-stage, per-shard capture including the coordinator's own read; each stage confined to the shards that own its fingerprints; and an excluded shard proven pruned against a roster computed before the query ran rather than inferred from its absence. What does NOT survive is anything that says WHICH shards, **including whether they are a subset at all**: the three-of-four roster, shard 4 as the pruned one, the per-shard placement and the per-shard row counts. Measured against a live server over the captured fingerprint lists, the ten-fingerprint stage that reached three of four shards under the previous key reaches all four under the current one, so “fingerprint-scoped stages participate on a subset” is itself a superseded figure. All of these are marked where they appear (`docs/benchmarks/m1-logs-read-path.md`). **Issue #603 supersedes them a second time, and further**: the writer no longer inserts through the `_dist` wrappers at all, so which node holds which fingerprint's rows is decided by the connection that took the push rather than by the sharding key — the per-shard placement, roster and row counts are superseded whatever the key is. No read's *answer* changes; what changes is where its rows are read from, and label discovery becomes two statements whose active-fingerprint set crosses the network (§7). **Re-capturing has not been done.** It needs the four-shard fixture, the same corpus **pushed through the ingest API** rather than loaded through the `_dist` wrappers, a rerun of `xtask bench --dist`, and — belonging with the same capture — the per-shard `NetworkSendBytes`/`NetworkReceiveBytes` figure for each discovery statement shape, which a single node cannot measure. Tier-2 latency-at-scale validation for logs is separately tracked by #25 |

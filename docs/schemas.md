@@ -173,7 +173,7 @@ WHERE org_id = ''
   )
 ```
 
-Statement 2, series with their labels — discovery, the label-cache sweep (no matcher, the cache window) and the fan-out's discovery (scoped to the cache's names and IDs):
+Statement 2, series with their labels — discovery and the fan-out's discovery (scoped to the cache's names and IDs):
 
 ```sql
 SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels

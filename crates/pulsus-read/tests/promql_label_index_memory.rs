@@ -131,8 +131,16 @@ impl Fixture {
         let names = (0..NAMES)
             .map(|i| {
                 let family = [
-                    "container", "apiserver", "etcd", "node", "kube", "longhorn", "prober",
-                    "go", "process", "http",
+                    "container",
+                    "apiserver",
+                    "etcd",
+                    "node",
+                    "kube",
+                    "longhorn",
+                    "prober",
+                    "go",
+                    "process",
+                    "http",
                 ][(i % 10) as usize];
                 let suffix = if i % 7 == 0 {
                     "seconds_bucket"
@@ -270,7 +278,13 @@ fn stream(
 
 #[test]
 fn the_label_cache_holds_a_series_in_under_220_bytes_and_peaks_under_1_2x() {
+    // Every pass's generator is made before the first reading: each holds
+    // its targets' base labels, which are the fixture's, not the cache's.
     let mut first = Fixture::new(SERIES, 0x880);
+    let mut again = Fixture::new(SERIES, 0x880);
+    let mut new = Fixture::new(NEW_SERIES, 0x881);
+    let mut third = Fixture::new(SERIES, 0x880);
+    let mut third_new = Fixture::new(NEW_SERIES, 0x881);
     let base = live();
     let probe = LabelPassProbe::new_for_test();
 
@@ -290,8 +304,6 @@ fn the_label_cache_holds_a_series_in_under_220_bytes_and_peaks_under_1_2x() {
     // (b) The next hour's feed: every series again, and 10,000 new.
     let now = HOUR + H + 600_000;
     reset_peak();
-    let mut again = Fixture::new(SERIES, 0x880);
-    let mut new = Fixture::new(NEW_SERIES, 0x881);
     stream(&probe, &mut again, HOUR + H, false, now, HOUR, |_| false);
     stream(&probe, &mut new, HOUR + H, false, now, HOUR, |_| false);
     probe.commit_for_test(now, HOUR);
@@ -311,11 +323,25 @@ fn the_label_cache_holds_a_series_in_under_220_bytes_and_peaks_under_1_2x() {
     // (c) Two hours later every series but one in fifty registers again, and
     // the age-out removes the rest.
     let now = HOUR + 3 * H + 600_000;
-    let mut third = Fixture::new(SERIES, 0x880);
-    let mut third_new = Fixture::new(NEW_SERIES, 0x881);
-    let one_in_fifty = |i: u64| i % 50 == 0;
-    stream(&probe, &mut third, HOUR + 3 * H, false, now, HOUR + 2 * H, one_in_fifty);
-    stream(&probe, &mut third_new, HOUR + 3 * H, false, now, HOUR + 2 * H, one_in_fifty);
+    let one_in_fifty = |i: u64| i.is_multiple_of(50);
+    stream(
+        &probe,
+        &mut third,
+        HOUR + 3 * H,
+        false,
+        now,
+        HOUR + 2 * H,
+        one_in_fifty,
+    );
+    stream(
+        &probe,
+        &mut third_new,
+        HOUR + 3 * H,
+        false,
+        now,
+        HOUR + 2 * H,
+        one_in_fifty,
+    );
     let before = live() - base;
     reset_peak();
     probe.commit_for_test(now, HOUR + 2 * H);

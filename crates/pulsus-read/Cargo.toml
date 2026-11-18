@@ -44,6 +44,8 @@ futures.workspace = true
 # In-process matcher evaluation for the label cache's `Re`/`Nre` matchers
 # (issue #30), bounded by a compiled-regex cache.
 regex.workspace = true
+# Issue #880: the label cache's symbol table and fingerprint shards.
+hashbrown.workspace = true
 # The LogQL `json` parser stage (issue M6-09, `logql::pipeline`): each
 # surviving line's body is parsed once per query with the compiled
 # pipeline — cost bounded to rows that already passed line-filter
@@ -63,14 +65,13 @@ base64 = "0.22"
 # Loki v3.7.4 (`model/labels/sharding.go`). Same `xxh64` seed-0 primitive
 # `pulsus-model`/`pulsus-promql` already use for fingerprinting.
 xxhash-rust.workspace = true
-# The refresh loop (`spawn_refresh_loop`) and the resident snapshot slot
-# (`std::sync::RwLock<Arc<CacheSnapshot>>` plus the `tokio::task::JoinHandle`
-# the loop runs in) are the first async/task-spawning code in this crate
-# (issue #30) — promoted from a dev-only dependency to a real one.
+# The refresh loop (`spawn_refresh_loop`) and the `tokio::task::JoinHandle`
+# it runs in are the first async/task-spawning code in this crate (issue
+# #30) — promoted from a dev-only dependency to a real one.
 tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
-# `refresh.rs`'s self-healing sweep loop logs a failed sweep rather than
-# clobbering the last good snapshot (architect plan) — the same
-# `tracing::warn!` convention every other crate in this workspace uses.
+# `refresh.rs`'s self-healing loop logs a failed pass rather than stopping
+# (architect plan) — the same `tracing::warn!` convention every other crate
+# in this workspace uses.
 tracing.workspace = true
 
 [dev-dependencies]

@@ -337,7 +337,6 @@ fn cache_config_dist(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
         landing_table: "metric_landing_dist".to_string(),
         feed_overlap_ms: 300_000,
-        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -1528,7 +1527,6 @@ async fn a_shard_unreadable_past_the_overlap_loses_no_series() {
     let cache = LabelCache::new(
         client_as(db, &user).await,
         LabelCacheConfig {
-            skip_unavailable_shards: true,
             feed_overlap_ms: 2_000,
             ..cache_config_dist(db)
         },
@@ -1569,7 +1567,10 @@ async fn a_shard_unreadable_past_the_overlap_loses_no_series() {
     );
 
     let before = now_ms();
-    cache.refresh().await.expect("the pass after the table is back");
+    cache
+        .refresh()
+        .await
+        .expect("the pass after the table is back");
     assert_eq!(
         cache.resolve(&no_tenant(), "feed_down_b", &[], recent_window(before)),
         Resolution::Fingerprints(vec![pulsus_model::Fingerprint::from_raw(b)]),

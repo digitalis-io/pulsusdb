@@ -1,25 +1,24 @@
 //! [`LabelCache`]: the resident, time-aware label cache and its
 //! synchronous, pure [`SeriesResolver::resolve`] — docs/architecture.md
 //! §5.2. [`LabelCache::refresh`] (async, ClickHouse-touching) lives in
-//! [`super::refresh`]; this module owns the snapshot shape, the resolver
-//! contract, and in-process matcher evaluation (including the bounded
-//! compiled-regex cache).
+//! [`super::refresh`]; the index itself in [`super::promql_label_index`];
+//! this module owns the resolver contract, its gates, and the bounded
+//! compiled-regex cache.
 //!
 //! **Purity is deliberate** (architect plan): `resolve` never awaits and
-//! never talks to ClickHouse — it reads the current [`CacheSnapshot`]
-//! (cloned out from behind a brief read lock, matching `AppState.pool`'s
-//! "async-filled, read constantly" discipline) and every degradation (cold,
-//! stale, out-of-window, over-cardinality, unsupported regex) is a
-//! data-driven branch returning [`Resolution::SqlFallback`] — never a wrong
-//! result, never a panic. [`resolve_over`] is the pure algorithmic core,
-//! factored out of [`LabelCache`] itself so it is unit-testable against a
-//! hand-built [`CacheSnapshot`] with no `ChClient`/network dependency at
-//! all — only [`LabelCache::new`]/[`LabelCache::refresh`] need a real
-//! connection.
+//! never talks to ClickHouse — it reads the tenant's [`LabelIndex`] under
+//! its read lock, held for the call and never across an `.await`, and
+//! every degradation (cold, stale, out-of-window, over-cardinality,
+//! unsupported regex) is a data-driven branch returning
+//! [`Resolution::SqlFallback`] — never a wrong result, never a panic.
+//! [`resolve_over`] is the pure algorithmic core, factored out of
+//! [`LabelCache`] itself so it is unit-testable against a hand-built
+//! [`LabelIndex`] with no `ChClient`/network dependency at all — only
+//! [`LabelCache::new`]/[`LabelCache::refresh`] need a real connection.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use pulsus_clickhouse::ChClient;
@@ -28,6 +27,7 @@ use pulsus_promql::re2_pattern_to_rust;
 use regex::Regex;
 
 use super::matcher::{DataWindow, LabelMatcher, MatchOp};
+use super::promql_label_index::LabelIndex;
 use super::re2_authority::{first_matcher_requiring_re2_authority, pattern_requires_re2_authority};
 use super::stats::{CacheMetrics, CacheMetricsSnapshot};
 
@@ -60,7 +60,7 @@ pub struct LabelCacheConfig {
     /// resolution lives in the server's config wiring, not here).
     pub series_table: String,
     /// `metric_labels` (or its `_dist`-suffixed wrapper), one row per
-    /// series, which the sweep reads for the series it finds (issue #623).
+    /// series, which the label cache's start-up build reads (issue #880).
     pub labels_table: String,
     /// `PULSUS_CACHE_WINDOW`, milliseconds — bounds cache *residency*
     /// (reading 1, task-manager resolution #1 on issue #30).
@@ -69,69 +69,28 @@ pub struct LabelCacheConfig {
     /// an in-process match exceeding this falls back to the SQL/JOIN
     /// sub-query, never a resident-cache size cap.
     pub cache_max_series: u64,
-    /// `PULSUS_CACHE_TTL` — the refresh sweep interval.
+    /// `PULSUS_CACHE_TTL` — how often a pass runs.
     pub ttl: Duration,
     /// See [`DEFAULT_STALENESS_MULTIPLIER`].
     pub staleness_multiplier: u32,
     /// Issue #398: `reader.promql_read_max_memory_bytes` — the same
     /// `max_memory_usage` ceiling (throw-not-spill) every request-path
-    /// metrics read carries, applied to the background refresh sweep too
-    /// ([`super::refresh::fetch_rows`]), which sent `QuerySettings::new()`
-    /// before. The sweep is not on any request path and its failure never
-    /// becomes an HTTP status, so it is bounded here rather than exempted:
-    /// an exemption would leave one unbounded metrics read competing for
-    /// server memory, which is the carve-out shape #398 exists to remove.
-    /// Its failure BEHAVIOUR is deliberately unchanged — warn and keep
-    /// serving the last good snapshot.
+    /// metrics read carries, applied to the label cache's statements too
+    /// ([`super::refresh::sweep_settings`]). They are not on any request
+    /// path and their failure never becomes an HTTP status, so they are
+    /// bounded here rather than exempted: an exemption would leave one
+    /// unbounded metrics read competing for server memory, which is the
+    /// carve-out shape #398 exists to remove. A failed pass warns and the
+    /// cache keeps answering from what it holds.
     pub read_max_memory_bytes: u64,
-    /// `PULSUS_SKIP_UNAVAILABLE_SHARDS` (#603 follow-up): the sweep sends
-    /// the answer pins with it, as every request-path metrics read does.
-    pub skip_unavailable_shards: bool,
-    /// `metric_landing` (or its `_dist`-suffixed wrapper), whose kind-2 rows
-    /// the label cache's feed reads (issue #880).
+    /// `metric_landing` (or its `_dist`-suffixed wrapper), whose kind-2
+    /// rows — the series registrations — every pass after the build reads
+    /// (issue #880).
     pub landing_table: String,
-    /// How far before its watermark a feed starts reading (issue #880).
+    /// How far before its watermark a feed starts reading (issue #880):
+    /// `CLAIM_INSERT_BOUND + PULSUS_QUERY_TIMEOUT + 60 s`, the bound on how
+    /// late a registration becomes readable after the writer stamps it.
     pub feed_overlap_ms: i64,
-}
-
-/// Resident snapshot: `fingerprint -> LabelSet` plus `metric_name ->
-/// sorted [fingerprint]`. Immutable once built — [`super::refresh`] builds
-/// a whole new one and atomically swaps it in (never mutated in place), so
-/// readers always observe either the whole old or whole new snapshot, never
-/// a partial map.
-#[derive(Debug, Default)]
-pub struct CacheSnapshot {
-    pub(crate) by_fingerprint: HashMap<Fingerprint, LabelSet>,
-    /// Values are sorted, deduped fingerprint lists — the sweep returns one
-    /// row per `(metric_name, fingerprint)`, re-sorted after the sweep
-    /// completes (see [`super::refresh`]).
-    pub(crate) by_metric: HashMap<String, Vec<Fingerprint>>,
-    /// The sweep's own `now_ms` (wall-clock milliseconds since the Unix
-    /// epoch, [`super::refresh::now_unix_ms`]) — meaningless (`0`) only for
-    /// the never-swept, `generation == 0` default snapshot. This is the
-    /// cache's **recency anchor** (code-review round-2 fix, replacing a
-    /// wall-clock-`Instant`-since-swap staleness check): a periodic-refresh
-    /// cache structurally cannot know about a series whose first activity
-    /// is after this timestamp, so [`resolve_over`]'s upper-bound gate and
-    /// [`LabelCache::age_ms`]'s `/metrics` gauge both measure against it,
-    /// not against when the snapshot happened to be swapped in.
-    pub(crate) sweep_time_ms: i64,
-    /// The floored lower bound the sweep queried from
-    /// (`floor_to_activity_bucket(now - window_ms, bucket_ms)`) — the
-    /// cache's covered-from edge for the out-of-window check.
-    pub(crate) covered_from_ms: i64,
-    /// `0` = cold (no successful sweep yet); every successful sweep
-    /// increments this by one.
-    pub(crate) generation: u64,
-}
-
-impl CacheSnapshot {
-    /// Resident fingerprint count (used by tests/metrics; the authoritative
-    /// gauge value lives in [`CacheMetrics`], updated at the same time this
-    /// snapshot is swapped in).
-    pub fn series_count(&self) -> usize {
-        self.by_fingerprint.len()
-    }
 }
 
 /// Why a query degraded to the SQL/JOIN fallback — explain-friendly (#31's
@@ -324,8 +283,8 @@ fn cached_name_matches(
 }
 
 /// The issue #85 name-less/regex-`__name__` resolution, pure over the
-/// snapshot (the [`resolve_over`] factoring precedent): walk the
-/// name-keyed `by_metric` map in native `HashMap` iteration order, keep
+/// index (the [`resolve_over`] factoring precedent): walk the index's
+/// metric-name lists in native `HashMap` iteration order, keep
 /// the names passing `name_matchers`, evaluate the ordinary label
 /// `matchers` over each kept name's series, and return the non-empty
 /// per-metric groups (sorted by name before returning — see below). Shares
@@ -370,7 +329,7 @@ fn match_exceeds_series_cap(count: usize, cap: u64) -> bool {
 
 #[allow(clippy::too_many_arguments)] // mirrors resolve_over/resolve_labelled_over's shape
 pub(crate) fn resolve_multi_metric_over(
-    snapshot: &CacheSnapshot,
+    snapshot: &LabelIndex,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
@@ -418,14 +377,14 @@ pub(crate) fn resolve_multi_metric_over(
         return MultiMetricResolution::Unresolvable { reason };
     }
 
-    // Issue #89 fix: walk `by_metric` directly in native `HashMap` order —
-    // NO pre-loop `keys().collect()`/sort. The old sorted-name walk
-    // allocated and sorted every resident name before either the fan-out
-    // or `cache_max_series` guard could fire, an O(resident cache) cost
-    // regardless of match rate. `examined` gates the enumeration itself:
-    // it bails to `ScanBudgetExceeded` the instant it would cross
-    // `scan_budget`, so at most `scan_budget + 1` names/fingerprints are
-    // ever inspected. Determinism is preserved on the success path by
+    // Issue #89 fix: walk the metric-name lists directly in native
+    // `HashMap` order — NO pre-loop `keys().collect()`/sort, and each name
+    // is borrowed from the symbol table, so the walk allocates nothing per
+    // name. `examined` gates the enumeration itself: one unit per name,
+    // and for a name that passes, one per series in its list, counted
+    // before the list is matched; the walk bails to `ScanBudgetExceeded`
+    // the instant the count crosses `scan_budget`, reporting
+    // `scan_budget + 1`. Determinism is preserved on the success path by
     // sorting the bounded `groups` output below (never the input
     // universe): when the walk completes under budget, every name was
     // examined, so the matched set is order-independent regardless of
@@ -433,16 +392,19 @@ pub(crate) fn resolve_multi_metric_over(
     let mut groups: Vec<MetricSeriesGroup> = Vec::new();
     let mut total_series = 0usize;
     let mut examined: u64 = 0;
-    for (name, candidates) in &snapshot.by_metric {
+    let over_budget = |metrics: &CacheMetrics| {
+        metrics
+            .miss_scan_budget_total
+            .fetch_add(1, Ordering::Relaxed);
+        MultiMetricResolution::ScanBudgetExceeded {
+            examined: scan_budget.saturating_add(1) as usize,
+            cap: scan_budget,
+        }
+    };
+    for (name, candidates) in snapshot.metrics() {
         examined += 1;
         if scan_budget_exhausted(examined, scan_budget) {
-            metrics
-                .miss_scan_budget_total
-                .fetch_add(1, Ordering::Relaxed);
-            return MultiMetricResolution::ScanBudgetExceeded {
-                examined: examined as usize,
-                cap: scan_budget,
-            };
+            return over_budget(metrics);
         }
         match cached_name_matches(regex_cache, name_matchers, name) {
             Ok(true) => {}
@@ -454,36 +416,23 @@ pub(crate) fn resolve_multi_metric_over(
                 return MultiMetricResolution::Unresolvable { reason };
             }
         }
-        let mut matched: Vec<(Fingerprint, LabelSet)> = Vec::new();
-        for &fp in candidates {
-            examined += 1;
-            if scan_budget_exhausted(examined, scan_budget) {
-                metrics
-                    .miss_scan_budget_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return MultiMetricResolution::ScanBudgetExceeded {
-                    examined: examined as usize,
-                    cap: scan_budget,
-                };
-            }
-            let Some(labels) = snapshot.by_fingerprint.get(&fp) else {
-                continue;
-            };
-            match matches(regex_cache, labels, matchers) {
-                Ok(true) => matched.push((fp, labels.clone())),
-                Ok(false) => {}
-                Err(reason) => {
-                    metrics
-                        .miss_regex_unsupported_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    return MultiMetricResolution::Unresolvable { reason };
-                }
-            }
+        examined = examined.saturating_add(candidates.len() as u64);
+        if scan_budget_exhausted(examined, scan_budget) {
+            return over_budget(metrics);
         }
-        if matched.is_empty() {
+        let selected = match snapshot.select_from(candidates, matchers, regex_cache) {
+            Ok(ids) => ids,
+            Err(reason) => {
+                metrics
+                    .miss_regex_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return MultiMetricResolution::Unresolvable { reason };
+            }
+        };
+        if selected.is_empty() {
             continue;
         }
-        total_series += matched.len();
+        total_series += selected.len();
         if match_exceeds_series_cap(total_series, config.cache_max_series) {
             metrics
                 .miss_over_cardinality_total
@@ -507,9 +456,13 @@ pub(crate) fn resolve_multi_metric_over(
                 cap: fanout_cap,
             };
         }
+        let mut matched: Vec<(Fingerprint, LabelSet)> = selected
+            .iter()
+            .map(|&id| (snapshot.fingerprint(id), snapshot.label_set(id)))
+            .collect();
         matched.sort_unstable_by_key(|(fp, _)| *fp);
         groups.push(MetricSeriesGroup {
-            metric_name: name.clone(),
+            metric_name: name.to_string(),
             series: matched,
         });
     }
@@ -602,13 +555,20 @@ impl RegexCache {
     /// critical section does) still degrades gracefully rather than
     /// propagating a panic.
     fn is_match(&self, pattern: &str, value: &str) -> Option<bool> {
+        self.compiled(pattern).map(|re| re.is_match(value))
+    }
+
+    /// `pattern` compiled, anchored, for a caller that tests many values
+    /// against it (issue #880): the same admission and RE2-authority rules
+    /// as [`Self::is_match`], with `None` meaning the same thing.
+    pub(crate) fn compiled(&self, pattern: &str) -> Option<Arc<Regex>> {
         let mut guard = match self.compiled.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(entry) = guard.get(pattern) {
             return match entry {
-                CachedPattern::InProcess(re) => Some(re.is_match(value)),
+                CachedPattern::InProcess(re) => Some(Arc::clone(re)),
                 CachedPattern::Re2Authority => None,
             };
         }
@@ -632,39 +592,8 @@ impl RegexCache {
             pattern.to_string(),
             CachedPattern::InProcess(Arc::clone(&re)),
         );
-        Some(re.is_match(value))
+        Some(re)
     }
-}
-
-/// Evaluates every matcher against `labels`, using Prometheus absent-label
-/// semantics: a missing label reads as `""` — identical to what
-/// `JSONExtractString(labels, k)` returns for an absent key on the SQL path
-/// (architect plan: load-bearing for the differential AC). Returns `Err`
-/// with the first matcher whose regex could not be evaluated in-process
-/// (short-circuits the whole selector, per the architect plan amendment: a
-/// `RegexUnsupported` selector never completes in-process matching).
-fn matches(
-    regex_cache: &RegexCache,
-    labels: &LabelSet,
-    matchers: &[LabelMatcher],
-) -> Result<bool, FallbackReason> {
-    for m in matchers {
-        let value = labels.get(&m.key).unwrap_or("");
-        let ok = match m.op {
-            MatchOp::Eq => value == m.value,
-            MatchOp::Neq => value != m.value,
-            MatchOp::Re => regex_cache
-                .is_match(&m.value, value)
-                .ok_or_else(|| FallbackReason::RegexUnsupported { key: m.key.clone() })?,
-            MatchOp::Nre => !regex_cache
-                .is_match(&m.value, value)
-                .ok_or_else(|| FallbackReason::RegexUnsupported { key: m.key.clone() })?,
-        };
-        if !ok {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// Renders the fallback sub-query and pairs it with `reason` — shared by
@@ -741,7 +670,7 @@ fn labelled_sql_fallback(
 
 /// The pure resolution algorithm: `resolve`'s whole contract, factored out
 /// of [`LabelCache`] so it is testable against a hand-built
-/// [`CacheSnapshot`] with no `ChClient` at all. `metrics` is updated with
+/// [`LabelIndex`] with no `ChClient` at all. `metrics` is updated with
 /// exactly one hit/miss counter per call (architect plan: every
 /// degradation is a data-driven branch, recorded for `/metrics`).
 ///
@@ -764,7 +693,7 @@ fn labelled_sql_fallback(
 /// query is forced to the SQL fallback — see docs/architecture.md §5.2.
 #[allow(clippy::too_many_arguments)] // the tenant beside the resolver's own inputs
 pub(crate) fn resolve_over(
-    snapshot: &CacheSnapshot,
+    snapshot: &LabelIndex,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
@@ -821,27 +750,19 @@ pub(crate) fn resolve_over(
         return sql_fallback(config, tenant, metric_name, window, matchers, reason);
     }
 
-    let Some(candidates) = snapshot.by_metric.get(metric_name) else {
-        metrics.hits_total.fetch_add(1, Ordering::Relaxed);
-        return Resolution::Fingerprints(Vec::new());
-    };
-
-    let mut matched = Vec::new();
-    for &fp in candidates {
-        let Some(labels) = snapshot.by_fingerprint.get(&fp) else {
-            continue;
-        };
-        match matches(regex_cache, labels, matchers) {
-            Ok(true) => matched.push(fp),
-            Ok(false) => {}
-            Err(reason) => {
-                metrics
-                    .miss_regex_unsupported_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return sql_fallback(config, tenant, metric_name, window, matchers, reason);
-            }
+    let selected = match snapshot.select(metric_name, matchers, regex_cache) {
+        Ok(ids) => ids,
+        Err(reason) => {
+            metrics
+                .miss_regex_unsupported_total
+                .fetch_add(1, Ordering::Relaxed);
+            return sql_fallback(config, tenant, metric_name, window, matchers, reason);
         }
-    }
+    };
+    let mut matched: Vec<Fingerprint> = selected
+        .iter()
+        .map(|&id| snapshot.fingerprint(id))
+        .collect();
 
     if match_exceeds_series_cap(matched.len(), config.cache_max_series) {
         metrics
@@ -862,7 +783,6 @@ pub(crate) fn resolve_over(
     }
 
     matched.sort_unstable();
-    matched.dedup();
     metrics.hits_total.fetch_add(1, Ordering::Relaxed);
     Resolution::Fingerprints(matched)
 }
@@ -875,12 +795,12 @@ pub(crate) fn resolve_over(
 /// call the other: [`resolve_over`]'s `Resolution::Fingerprints` is a
 /// stable public contract already depended on by other call sites/tests,
 /// and re-deriving labels from fingerprints after the fact would mean a
-/// second (possibly-swapped) snapshot read — reading the snapshot once and
-/// walking it once for both fingerprint and label output avoids that
-/// race entirely.
+/// second read of the index, under a second lock — reading it once under
+/// one lock for both fingerprint and label output avoids that race
+/// entirely.
 #[allow(clippy::too_many_arguments)] // the tenant beside the resolver's own inputs
 pub(crate) fn resolve_labelled_over(
-    snapshot: &CacheSnapshot,
+    snapshot: &LabelIndex,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
@@ -937,40 +857,20 @@ pub(crate) fn resolve_labelled_over(
         return labelled_sql_fallback(config, tenant, metric_name, window, matchers, reason);
     }
 
-    let Some(candidates) = snapshot.by_metric.get(metric_name) else {
-        metrics.hits_total.fetch_add(1, Ordering::Relaxed);
-        return LabelledResolution::Series(Vec::new());
-    };
-
-    let mut matched: Vec<(Fingerprint, LabelSet)> = Vec::new();
-    for &fp in candidates {
-        let Some(labels) = snapshot.by_fingerprint.get(&fp) else {
-            continue;
-        };
-        match matches(regex_cache, labels, matchers) {
-            Ok(true) => matched.push((fp, labels.clone())),
-            Ok(false) => {}
-            Err(reason) => {
-                metrics
-                    .miss_regex_unsupported_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return labelled_sql_fallback(
-                    config,
-                    tenant,
-                    metric_name,
-                    window,
-                    matchers,
-                    reason,
-                );
-            }
+    let selected = match snapshot.select(metric_name, matchers, regex_cache) {
+        Ok(ids) => ids,
+        Err(reason) => {
+            metrics
+                .miss_regex_unsupported_total
+                .fetch_add(1, Ordering::Relaxed);
+            return labelled_sql_fallback(config, tenant, metric_name, window, matchers, reason);
         }
-    }
-
-    if match_exceeds_series_cap(matched.len(), config.cache_max_series) {
+    };
+    if match_exceeds_series_cap(selected.len(), config.cache_max_series) {
         metrics
             .miss_over_cardinality_total
             .fetch_add(1, Ordering::Relaxed);
-        let matched_count = matched.len();
+        let matched_count = selected.len();
         return labelled_sql_fallback(
             config,
             tenant,
@@ -983,22 +883,26 @@ pub(crate) fn resolve_labelled_over(
             },
         );
     }
+    let mut matched: Vec<(Fingerprint, LabelSet)> = selected
+        .iter()
+        .map(|&id| (snapshot.fingerprint(id), snapshot.label_set(id)))
+        .collect();
 
     matched.sort_unstable_by_key(|(fp, _)| *fp);
     metrics.hits_total.fetch_add(1, Ordering::Relaxed);
     LabelledResolution::Series(matched)
 }
 
-/// The resident label cache: one snapshot slot and compiled-regex cache
+/// The resident label cache: one [`LabelIndex`] and compiled-regex cache
 /// per tenant in use (issue #635 part 4), the config, the `ChClient` the
-/// refresh sweep queries through, and the metrics atomics. Fields are
-/// `pub(crate)` — visible to [`super::refresh`] (which owns the sweep +
-/// swap) without leaking outside this crate.
+/// passes query through, and the metrics atomics. Fields are
+/// `pub(crate)` — visible to [`super::refresh`] (which owns the pass)
+/// without leaking outside this crate.
 pub struct LabelCache {
     pub(crate) client: ChClient,
     pub(crate) config: LabelCacheConfig,
     /// Every tenant a read has asked for, and the empty tenant from the
-    /// start. The refresh loop sweeps each, with that tenant's statement.
+    /// start. Each pass reads each, with that tenant's statement.
     pub(crate) tenants: RwLock<HashMap<Tenant, Arc<TenantCache>>>,
     pub(crate) metrics: CacheMetrics,
     /// Issue #803: one pass at a time. A pass rebinds the one client at the
@@ -1007,27 +911,36 @@ pub struct LabelCache {
     pass: tokio::sync::Mutex<()>,
 }
 
-/// One tenant's resident cache (issue #635 part 4): its snapshot, swept
-/// with its own statement, and its compiled regexes.
+/// One tenant's resident cache (issue #635 part 4): its index, kept
+/// current with its own statements (issue #880), and its compiled regexes.
 pub(crate) struct TenantCache {
-    pub(crate) snapshot: RwLock<Arc<CacheSnapshot>>,
+    pub(crate) index: RwLock<LabelIndex>,
     pub(crate) regex_cache: RegexCache,
 }
 
 impl TenantCache {
     fn new() -> Self {
         TenantCache {
-            snapshot: RwLock::new(Arc::new(CacheSnapshot::default())),
+            index: RwLock::new(LabelIndex::default()),
             regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
         }
     }
 
-    pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {
-        let guard = match self.snapshot.read() {
+    /// The index for reading. Never held across an `.await`.
+    pub(crate) fn read_index(&self) -> RwLockReadGuard<'_, LabelIndex> {
+        match self.index.read() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
-        };
-        Arc::clone(&guard)
+        }
+    }
+
+    /// The index for one batch of a pass or its commit. Never held across
+    /// an `.await`.
+    pub(crate) fn write_index(&self) -> RwLockWriteGuard<'_, LabelIndex> {
+        match self.index.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -1050,35 +963,38 @@ impl LabelCache {
         }
     }
 
-    /// One refresh sweep + atomic swap for every tenant in use (delegates
-    /// to [`super::refresh`], the only ClickHouse-touching code in this
-    /// module), as one read request (issue #803). A tenant whose statement
-    /// fails keeps its last good snapshot while the others swap, and the
-    /// first failure is returned.
+    /// One pass for every tenant in use (delegates to [`super::refresh`],
+    /// the only ClickHouse-touching code in this module), as one read
+    /// request (issue #803). A tenant whose statement fails keeps its
+    /// header while the others commit, and the first failure is returned.
     pub async fn refresh(&self) -> Result<(), pulsus_clickhouse::ChError> {
         self.refresh_pass(&self.tenants_in_use()).await
     }
 
-    /// One sweep of `tenant`'s cache (issue #635 part 4), which puts the
-    /// tenant in use: a pass over that one tenant.
+    /// One pass over `tenant`'s cache (issue #635 part 4), which puts the
+    /// tenant in use.
     pub async fn refresh_tenant(&self, tenant: &Tenant) -> Result<(), pulsus_clickhouse::ChError> {
         self.tenant_cache(tenant);
         self.refresh_pass(std::slice::from_ref(tenant)).await
     }
 
-    /// Saves an accepted label-cache pass (issue #803): swaps each swept
-    /// tenant's snapshot in, counts one refresh failure per tenant whose
-    /// statement failed, and returns the first such failure, as
-    /// [`Self::refresh`] always has. A tenant that failed keeps its last
-    /// good snapshot while the others swap.
+    /// Saves an accepted label-cache pass (issue #803): commits each
+    /// tenant whose statement ended without error (issue #880: its age-out
+    /// once an hour, then its header), counts one refresh failure per
+    /// tenant whose statement failed, and returns the first such failure,
+    /// as [`Self::refresh`] always has. A tenant that failed keeps its
+    /// header while the others commit.
     pub(crate) fn commit_sweep(
         &self,
         outcome: super::refresh::SweepOutcome,
     ) -> Result<(), pulsus_clickhouse::ChError> {
-        for (tenant, swept) in outcome.swept {
+        for (tenant, stamp) in outcome.swept {
             let slot = self.tenant_cache(&tenant);
-            let series_count = swept.series_count();
-            swept.swap_into(&slot);
+            let series_count = {
+                let mut index = slot.write_index();
+                index.commit(stamp.now_ms, stamp.lower_bound_ms);
+                index.len() as u64
+            };
             self.metrics
                 .record_refresh(series_count, self.config.cache_max_series);
         }
@@ -1090,18 +1006,24 @@ impl LabelCache {
 
     /// One label-cache pass over `tenants` (issue #803): one read request,
     /// every tenant's statement on one server, run once more on another
-    /// when that server fails. Only the accepted attempt is saved; when
-    /// both attempts fail, every tenant keeps its last good snapshot and
-    /// counts one refresh failure.
+    /// when that server fails. Only the accepted attempt is committed; when
+    /// both attempts fail, every tenant keeps its header and counts one
+    /// refresh failure. The rows either attempt applied stay (issue #880):
+    /// each is a registration the store holds.
     async fn refresh_pass(&self, tenants: &[Tenant]) -> Result<(), pulsus_clickhouse::ChError> {
         let _one_pass = self.pass.lock().await;
         let client = &self.client;
         let config = &self.config;
+        let slots: Vec<(Tenant, Arc<TenantCache>)> = tenants
+            .iter()
+            .map(|t| (t.clone(), self.tenant_cache(t)))
+            .collect();
+        let slots = slots.as_slice();
         let outcome = client
             .run_read_request(
                 move |avoid| async move {
                     client.rebind_avoiding(avoid);
-                    let result = super::refresh::sweep_attempt(client, config, tenants).await;
+                    let result = super::refresh::sweep_attempt(client, config, slots).await;
                     pulsus_clickhouse::Attempt {
                         result,
                         failure: client.server_failure(),
@@ -1121,7 +1043,7 @@ impl LabelCache {
         }
     }
 
-    /// The tenants the refresh loop sweeps, sorted.
+    /// The tenants each pass reads, sorted.
     pub(crate) fn tenants_in_use(&self) -> Vec<Tenant> {
         let guard = match self.tenants.read() {
             Ok(g) => g,
@@ -1154,55 +1076,58 @@ impl LabelCache {
         )
     }
 
-    /// `true` once at least one sweep has succeeded (task-manager
+    /// `true` once at least one pass has committed (task-manager
     /// resolution #3 on issue #30: warm-empty counts as warm — a fresh
-    /// cluster with no `metric_series` rows yet must still become ready).
-    /// Never holds the snapshot lock across an `.await` (this method isn't
-    /// even async): a brief read-lock clone-then-drop, mirroring
-    /// `ops::ready`'s own discipline.
+    /// cluster with no series yet must still become ready). Never holds
+    /// the index lock across an `.await` (this method isn't even async),
+    /// mirroring `ops::ready`'s own discipline.
     pub fn is_warm(&self) -> bool {
-        self.current_snapshot().generation >= 1
+        self.empty_tenant().read_index().generation >= 1
     }
 
-    /// Age since the last successful sweep, in milliseconds
-    /// (`now_ms - snapshot.sweep_time_ms`) — `None` when cold (`generation
-    /// == 0`, no successful sweep yet). Code-review round-2 fix: the
-    /// `/metrics` age gauge. Deliberately **not** a stored atomic — age
-    /// changes continuously, so it is derived fresh on every call from the
-    /// snapshot's `sweep_time_ms` (the same recency anchor
-    /// [`resolve_over`]'s upper-bound gate uses) and the wall clock.
+    /// Age since the last committed pass, in milliseconds
+    /// (`now_ms - sweep_time_ms`) — `None` when cold (`generation == 0`).
+    /// Code-review round-2 fix: the `/metrics` age gauge. Deliberately
+    /// **not** a stored atomic — age changes continuously, so it is derived
+    /// fresh on every call from the header's `sweep_time_ms` (the same
+    /// recency anchor [`resolve_over`]'s upper-bound gate uses) and the
+    /// wall clock.
     pub fn age_ms(&self) -> Option<u64> {
-        let snapshot = self.current_snapshot();
-        if snapshot.generation == 0 {
+        let slot = self.empty_tenant();
+        let (generation, sweep_time_ms) = {
+            let index = slot.read_index();
+            (index.generation, index.sweep_time_ms)
+        };
+        if generation == 0 {
             return None;
         }
         let now_ms = super::refresh::now_unix_ms();
-        Some(now_ms.saturating_sub(snapshot.sweep_time_ms).max(0) as u64)
+        Some(now_ms.saturating_sub(sweep_time_ms).max(0) as u64)
     }
 
     pub fn metrics(&self) -> CacheMetricsSnapshot {
         self.metrics.snapshot()
     }
 
-    /// Issue #778: when `tenant`'s snapshot was swept, `None` while it is
+    /// Issue #778: when `tenant`'s last pass started, `None` while it is
     /// cold. The read cache keeps nothing newer than this allows.
     pub fn sweep_time_ms(&self, tenant: &Tenant) -> Option<i64> {
-        let snapshot = self.tenant_cache(tenant).current_snapshot();
-        (snapshot.generation >= 1).then_some(snapshot.sweep_time_ms)
+        let slot = self.tenant_cache(tenant);
+        let index = slot.read_index();
+        (index.generation >= 1).then_some(index.sweep_time_ms)
     }
 
-    /// The empty tenant's snapshot: the single-tenant deployment's, and
-    /// what readiness and the age gauge report.
-    pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {
+    /// The empty tenant's cache: the single-tenant deployment's, and what
+    /// readiness and the age gauge report.
+    fn empty_tenant(&self) -> Arc<TenantCache> {
         self.tenant_cache(&Tenant::from_header(None, false).expect("the empty tenant"))
-            .current_snapshot()
     }
 }
 
 /// The resident cache's own summary of itself: `numSeries` plus a
 /// bounded, sorted-descending top-N by per-metric series count (issue #32
-/// `status/tsdb`, task-manager resolution #2: "from the resident #30 cache
-/// snapshot, zero extra ClickHouse — freshness = cache TTL"). Deliberately
+/// `status/tsdb`, task-manager resolution #2: "from the resident #30 cache,
+/// zero extra ClickHouse — freshness = cache TTL"). Deliberately
 /// never a full unbounded metric-name listing: a cardinality report is
 /// only ever useful as a bounded "top offenders" view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1219,31 +1144,30 @@ pub struct TsdbCacheSnapshot {
 pub const TSDB_TOP_METRIC_NAMES: usize = 10;
 
 /// [`LabelCache::tsdb_snapshot`]'s pure core, factored out the same way
-/// [`resolve_over`] is: testable against a hand-built [`CacheSnapshot`]
+/// [`resolve_over`] is: testable against a hand-built [`LabelIndex`]
 /// with no `ChClient` at all.
-pub(crate) fn tsdb_snapshot_over(snapshot: &CacheSnapshot, limit: usize) -> TsdbCacheSnapshot {
+pub(crate) fn tsdb_snapshot_over(snapshot: &LabelIndex, limit: usize) -> TsdbCacheSnapshot {
     let mut by_metric: Vec<(String, u64)> = snapshot
-        .by_metric
-        .iter()
-        .map(|(name, fps)| (name.clone(), fps.len() as u64))
+        .metrics()
+        .map(|(name, ids)| (name.to_string(), ids.len() as u64))
         .collect();
     by_metric.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     by_metric.truncate(limit);
     TsdbCacheSnapshot {
-        num_series: snapshot.series_count() as u64,
+        num_series: snapshot.len() as u64,
         series_count_by_metric_name: by_metric,
     }
 }
 
 impl LabelCache {
-    /// Issue #32's `status/tsdb` accessor: a lock-free read of the current
-    /// snapshot (mirrors [`LabelCache::is_warm`]'s own discipline — never
-    /// held across an `.await`, and this method isn't even async). A cold
-    /// cache (`generation == 0`) yields an all-zero, empty summary rather
-    /// than a ClickHouse fallback query (task-manager resolution #2: "no
-    /// SQL variant for M2").
+    /// Issue #32's `status/tsdb` accessor: a read of the tenant's index
+    /// under its read lock (mirrors [`LabelCache::is_warm`]'s own
+    /// discipline — never held across an `.await`, and this method isn't
+    /// even async). A cold cache (`generation == 0`) yields an all-zero,
+    /// empty summary rather than a ClickHouse fallback query (task-manager
+    /// resolution #2: "no SQL variant for M2").
     pub fn tsdb_snapshot(&self, tenant: &Tenant, limit: usize) -> TsdbCacheSnapshot {
-        tsdb_snapshot_over(&self.tenant_cache(tenant).current_snapshot(), limit)
+        tsdb_snapshot_over(&self.tenant_cache(tenant).read_index(), limit)
     }
 }
 
@@ -1256,7 +1180,7 @@ impl SeriesResolver for LabelCache {
         window: DataWindow,
     ) -> Resolution {
         let slot = self.tenant_cache(tenant);
-        let snapshot = slot.current_snapshot();
+        let snapshot = slot.read_index();
         resolve_over(
             &snapshot,
             &slot.regex_cache,
@@ -1287,7 +1211,7 @@ impl LabelCache {
         window: DataWindow,
     ) -> LabelledResolution {
         let slot = self.tenant_cache(tenant);
-        let snapshot = slot.current_snapshot();
+        let snapshot = slot.read_index();
         resolve_labelled_over(
             &snapshot,
             &slot.regex_cache,
@@ -1318,7 +1242,7 @@ impl LabelCache {
         scan_budget: u64,
     ) -> MultiMetricResolution {
         let slot = self.tenant_cache(tenant);
-        let snapshot = slot.current_snapshot();
+        let snapshot = slot.read_index();
         resolve_multi_metric_over(
             &snapshot,
             &slot.regex_cache,
@@ -1344,7 +1268,7 @@ impl LabelCache {
 /// CI-runnable surface (plan review round 3). Internals (`RegexCache`,
 /// `CacheMetrics`, `LabelCacheConfig` construction) stay `pub(crate)`/
 /// private; only the two opaque entry points below are public.
-impl CacheSnapshot {
+impl LabelIndex {
     /// `n` one-series metrics (`m000000`..), each with an empty
     /// [`LabelSet`] — mirrors the `#[cfg(test)]` `many_metric_snapshot`
     /// helper, but public so the isolated alloc-gate binary can build a
@@ -1353,48 +1277,44 @@ impl CacheSnapshot {
     /// sweep timestamp far in the future) so control reaches the walk
     /// rather than one of the cold/stale/out-of-window short-circuits.
     #[doc(hidden)]
-    pub fn with_distinct_metric_names_for_test(n: usize) -> CacheSnapshot {
-        let mut by_fingerprint = HashMap::with_capacity(n);
-        let mut by_metric = HashMap::with_capacity(n);
+    pub fn with_distinct_metric_names_for_test(n: usize) -> LabelIndex {
+        let mut index = LabelIndex::default();
         for i in 0..n {
-            by_fingerprint.insert(
+            index.apply(
                 Fingerprint::from_raw(i as u128),
-                LabelSet::from_verbatim(Vec::new()),
+                &format!("m{i:06}"),
+                0,
+                0,
+                LabelSet::default,
             );
-            by_metric.insert(format!("m{i:06}"), vec![Fingerprint::from_raw(i as u128)]);
         }
-        CacheSnapshot {
-            by_fingerprint,
-            by_metric,
-            // Mirrors the `#[cfg(test)]` `BASE_SWEEP_MS` baseline: far
-            // larger than any window used against this fixture, so the
-            // staleness gate never fires.
-            sweep_time_ms: 1_000_000_000_000,
-            covered_from_ms: 0,
-            generation: 1,
-        }
+        // Mirrors the `#[cfg(test)]` `BASE_SWEEP_MS` baseline: far larger
+        // than any window used against this fixture, so the staleness gate
+        // never fires.
+        index.sweep_time_ms = 1_000_000_000_000;
+        index.covered_from_ms = 0;
+        index.generation = 1;
+        index
     }
 }
 
 impl LabelCache {
     /// `tenant`'s header: generation, recency anchor and watermark (issue
-    /// #880), for the live suites. Tests first: no watermark yet, so the
-    /// anchor stands in for it.
+    /// #880), for the live suites.
     #[doc(hidden)]
     pub fn header_for_test(&self, tenant: &Tenant) -> (u64, i64, i64) {
-        let s = self.tenant_cache(tenant).current_snapshot();
-        (s.generation, s.sweep_time_ms, s.sweep_time_ms)
+        let slot = self.tenant_cache(tenant);
+        let index = slot.read_index();
+        (index.generation, index.sweep_time_ms, index.watermark_ms)
     }
 }
 
-/// Issue #880: one tenant's cache driven through the pass's batch path with
-/// no `ChClient`, for the peak-memory suite
-/// (`tests/promql_label_index_memory.rs`). Tests first: today's shape, a
-/// whole snapshot built beside the resident one and swapped in.
+/// Issue #880: one tenant's cache driven through the pass's own batch path
+/// ([`super::refresh::apply_batch`]) and commit with no `ChClient`, for the
+/// peak-memory suite (`tests/promql_label_index_memory.rs`).
 #[doc(hidden)]
 pub struct LabelPassProbe {
     slot: TenantCache,
-    pending: Mutex<super::refresh::SweptSnapshot>,
 }
 
 impl LabelPassProbe {
@@ -1402,56 +1322,30 @@ impl LabelPassProbe {
     pub fn new_for_test() -> Self {
         LabelPassProbe {
             slot: TenantCache::new(),
-            pending: Mutex::new(super::refresh::SweptSnapshot::default()),
         }
     }
 
-    /// One batch of a pass; `rows` is left empty.
+    /// One batch of a pass, a build's or a feed's; `rows` is left empty.
     #[doc(hidden)]
     pub fn apply_batch_for_test(
         &self,
         rows: &mut Vec<super::rows::RegistrationRow>,
-        _build: bool,
-        _now_ms: i64,
-        _lower_bound_ms: i64,
+        build: bool,
+        now_ms: i64,
+        lower_bound_ms: i64,
     ) {
-        let mut pending = match self.pending.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for row in rows.drain(..) {
-            pending.by_fingerprint.insert(
-                row.fingerprint,
-                crate::canonical_labels::parse_canonical_label_set(&row.labels),
-            );
-            pending
-                .by_metric
-                .entry(row.metric_name)
-                .or_default()
-                .push(row.fingerprint);
-        }
+        super::refresh::apply_batch(&self.slot, rows, build, now_ms, lower_bound_ms);
     }
 
-    /// Commits the pass.
+    /// Commits the pass, as an accepted attempt does.
     #[doc(hidden)]
     pub fn commit_for_test(&self, now_ms: i64, lower_bound_ms: i64) {
-        let mut pending = match self.pending.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let mut swept = std::mem::take(&mut *pending);
-        for fps in swept.by_metric.values_mut() {
-            fps.sort_unstable();
-            fps.dedup();
-        }
-        swept.sweep_time_ms = now_ms;
-        swept.covered_from_ms = lower_bound_ms;
-        swept.swap_into(&self.slot);
+        self.slot.write_index().commit(now_ms, lower_bound_ms);
     }
 
     #[doc(hidden)]
     pub fn series_count_for_test(&self) -> usize {
-        self.slot.current_snapshot().series_count()
+        self.slot.read_index().len()
     }
 }
 
@@ -1459,7 +1353,7 @@ impl LabelPassProbe {
 /// [`RegexCache`] — the isolated alloc-gate binary's only way to reach the
 /// `pub(crate)` resolver. Its name matcher is fixed at construction (a
 /// reject-all `__name__` regex that matches no
-/// [`CacheSnapshot::with_distinct_metric_names_for_test`] fixture name),
+/// [`LabelIndex::with_distinct_metric_names_for_test`] fixture name),
 /// so every call examines up to `scan_budget + 1` names and rejects — the
 /// binary measures only the resolver's own aux heap over that walk, never
 /// any network/ClickHouse machinery (none exists here).
@@ -1481,7 +1375,6 @@ impl MultiMetricScanProbe {
             regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
             metrics: CacheMetrics::default(),
             config: LabelCacheConfig {
-                skip_unavailable_shards: false,
                 db: "pulsus".to_string(),
                 series_table: "metric_series".to_string(),
                 labels_table: "metric_labels".to_string(),
@@ -1515,7 +1408,7 @@ impl MultiMetricScanProbe {
     #[doc(hidden)]
     pub fn resolve_for_test(
         &self,
-        snapshot: &CacheSnapshot,
+        snapshot: &LabelIndex,
         scan_budget: u64,
     ) -> MultiMetricResolution {
         resolve_multi_metric_over(
@@ -1571,7 +1464,6 @@ mod tests {
 
     fn config() -> LabelCacheConfig {
         LabelCacheConfig {
-            skip_unavailable_shards: false,
             db: "pulsus".to_string(),
             series_table: "metric_series".to_string(),
             labels_table: "metric_labels".to_string(),
@@ -1598,31 +1490,21 @@ mod tests {
     /// probe [`FallbackReason::StaleCache`] need to reason about it.
     const BASE_SWEEP_MS: i64 = 1_000_000_000_000;
 
+    /// A hand-built index holding `entries`, with this header.
     fn snapshot(
         entries: Vec<SnapshotEntry<'_>>,
         covered_from_ms: i64,
         sweep_time_ms: i64,
         generation: u64,
-    ) -> CacheSnapshot {
-        let mut by_fingerprint = HashMap::new();
-        let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
+    ) -> LabelIndex {
+        let mut index = LabelIndex::default();
         for (metric_name, fp, pairs) in entries {
-            by_fingerprint.insert(fp, labels(pairs));
-            by_metric
-                .entry(metric_name.to_string())
-                .or_default()
-                .push(fp);
+            index.apply(fp, metric_name, 0, 0, || labels(pairs));
         }
-        for fps in by_metric.values_mut() {
-            fps.sort_unstable();
-        }
-        CacheSnapshot {
-            by_fingerprint,
-            by_metric,
-            sweep_time_ms,
-            covered_from_ms,
-            generation,
-        }
+        index.sweep_time_ms = sweep_time_ms;
+        index.covered_from_ms = covered_from_ms;
+        index.generation = generation;
+        index
     }
 
     fn window(start_ms: i64, end_ms: i64) -> DataWindow {
@@ -1630,7 +1512,7 @@ mod tests {
     }
 
     fn resolve(
-        snap: &CacheSnapshot,
+        snap: &LabelIndex,
         cfg: &LabelCacheConfig,
         metric_name: &str,
         matchers: &[LabelMatcher],
@@ -1652,7 +1534,7 @@ mod tests {
 
     #[test]
     fn a_cold_cache_always_falls_back_regardless_of_window() {
-        let snap = CacheSnapshot::default();
+        let snap = LabelIndex::default();
         assert_eq!(snap.generation, 0);
         let res = resolve(&snap, &config(), "up", &[], window(0, 1_000));
         match res {
@@ -2232,7 +2114,7 @@ mod tests {
         // Warm-empty readiness (task-manager resolution #3): generation 1
         // with zero resident series must still be warm; generation 0 must
         // not be.
-        assert!(CacheSnapshot::default().generation < 1);
+        assert!(LabelIndex::default().generation < 1);
         let warm_empty = snapshot(vec![], 0, BASE_SWEEP_MS, 1);
         assert!(warm_empty.generation >= 1);
     }
@@ -2265,7 +2147,7 @@ mod tests {
     // --- resolve_labelled (issue #31) ---
 
     fn resolve_labelled(
-        snap: &CacheSnapshot,
+        snap: &LabelIndex,
         cfg: &LabelCacheConfig,
         metric_name: &str,
         matchers: &[LabelMatcher],
@@ -2338,7 +2220,7 @@ mod tests {
 
     #[test]
     fn resolve_labelled_of_a_cold_cache_falls_back_with_the_same_reason_as_resolve() {
-        let snap = CacheSnapshot::default();
+        let snap = LabelIndex::default();
         match resolve_labelled(&snap, &config(), "up", &[], window(0, 1_000)) {
             LabelledResolution::SqlFallback { reason, .. } => {
                 assert_eq!(reason, FallbackReason::ColdCache)
@@ -2456,7 +2338,7 @@ mod tests {
 
     #[test]
     fn tsdb_snapshot_over_a_cold_cache_is_empty() {
-        let snap = tsdb_snapshot_over(&CacheSnapshot::default(), TSDB_TOP_METRIC_NAMES);
+        let snap = tsdb_snapshot_over(&LabelIndex::default(), TSDB_TOP_METRIC_NAMES);
         assert_eq!(snap.num_series, 0);
         assert!(snap.series_count_by_metric_name.is_empty());
     }
@@ -2513,7 +2395,7 @@ mod tests {
     }
 
     fn resolve_multi(
-        snap: &CacheSnapshot,
+        snap: &LabelIndex,
         cfg: &LabelCacheConfig,
         name_matchers: &[LabelMatcher],
         matchers: &[LabelMatcher],
@@ -2637,20 +2519,20 @@ mod tests {
 
     /// A snapshot with `n` one-series metrics (`m0000`..), for the cap
     /// boundary tests.
-    fn many_metric_snapshot(n: usize) -> CacheSnapshot {
-        let mut by_fingerprint = HashMap::new();
-        let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
+    fn many_metric_snapshot(n: usize) -> LabelIndex {
+        let mut index = LabelIndex::default();
         for i in 0..n {
-            by_fingerprint.insert(Fingerprint::from_raw(i as u128), labels(&[]));
-            by_metric.insert(format!("m{i:04}"), vec![Fingerprint::from_raw(i as u128)]);
+            index.apply(
+                Fingerprint::from_raw(i as u128),
+                &format!("m{i:04}"),
+                0,
+                0,
+                || labels(&[]),
+            );
         }
-        CacheSnapshot {
-            by_fingerprint,
-            by_metric,
-            sweep_time_ms: BASE_SWEEP_MS,
-            covered_from_ms: 0,
-            generation: 1,
-        }
+        index.sweep_time_ms = BASE_SWEEP_MS;
+        index.generation = 1;
+        index
     }
 
     /// The adjudicated boundary (issuecomment-4997289437/-4997456745):
@@ -2709,7 +2591,7 @@ mod tests {
         // Cold.
         assert!(matches!(
             resolve_multi(
-                &CacheSnapshot::default(),
+                &LabelIndex::default(),
                 &cfg,
                 &[],
                 &[],
@@ -2804,22 +2686,14 @@ mod tests {
 
     /// One metric name with `n` fingerprints, for the fingerprint-dimension
     /// scan-budget tests.
-    fn many_fingerprint_snapshot(name: &str, n: usize) -> CacheSnapshot {
-        let mut by_fingerprint = HashMap::new();
-        let mut fps = Vec::with_capacity(n);
+    fn many_fingerprint_snapshot(name: &str, n: usize) -> LabelIndex {
+        let mut index = LabelIndex::default();
         for i in 0..n {
-            by_fingerprint.insert(Fingerprint::from_raw(i as u128), labels(&[]));
-            fps.push(Fingerprint::from_raw(i as u128));
+            index.apply(Fingerprint::from_raw(i as u128), name, 0, 0, || labels(&[]));
         }
-        let mut by_metric = HashMap::new();
-        by_metric.insert(name.to_string(), fps);
-        CacheSnapshot {
-            by_fingerprint,
-            by_metric,
-            sweep_time_ms: BASE_SWEEP_MS,
-            covered_from_ms: 0,
-            generation: 1,
-        }
+        index.sweep_time_ms = BASE_SWEEP_MS;
+        index.generation = 1;
+        index
     }
 
     /// v2 test (a): the fingerprint-dimension bound — a single name with
@@ -3013,11 +2887,13 @@ mod tests {
 
     /// Issue #803 (T6): an accepted pass in which one tenant's statement
     /// failed for a reason other than a server failure keeps that tenant's
-    /// old snapshot, swaps the others, counts one failure and returns it.
+    /// header, commits the others, counts one failure and returns it. Issue
+    /// #880: the pass applied fingerprint 42 to t2's index before the
+    /// commit.
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_sweep_keeps_the_tenants_that_succeeded() {
         use crate::metrics::pass_failure_tests::{cache_config, stub_client};
-        use crate::metrics::refresh::{SweepOutcome, SweptSnapshot};
+        use crate::metrics::refresh::{PassStamp, SweepOutcome};
         use crate::metrics::stub_server::{Mode, StubServer};
 
         let stub = StubServer::start(Mode::Code(60));
@@ -3026,22 +2902,22 @@ mod tests {
         let t2 = Tenant::from_header(Some(&http::HeaderValue::from_static("t2")), false)
             .expect("tenant t2");
         for t in [&t1, &t2] {
-            let slot = cache.tenant_cache(t);
-            *slot.snapshot.write().expect("snapshot lock") =
-                Arc::new(snapshot(Vec::new(), 0, BASE_SWEEP_MS, 1));
+            *cache.tenant_cache(t).write_index() = snapshot(Vec::new(), 0, BASE_SWEEP_MS, 1);
         }
         let fp = Fingerprint::from_raw(42);
-        let mut by_fingerprint = HashMap::new();
-        by_fingerprint.insert(fp, LabelSet::default());
-        let s = SweptSnapshot {
-            by_fingerprint,
-            by_metric: HashMap::from([("up".to_string(), vec![fp])]),
-            sweep_time_ms: BASE_SWEEP_MS,
-            covered_from_ms: 0,
-        };
+        cache
+            .tenant_cache(&t2)
+            .write_index()
+            .apply(fp, "up", 0, 0, LabelSet::default);
         let failures_before = cache.metrics.snapshot().refresh_failures_total;
         let out = cache.commit_sweep(SweepOutcome {
-            swept: vec![(t2.clone(), s)],
+            swept: vec![(
+                t2.clone(),
+                PassStamp {
+                    now_ms: BASE_SWEEP_MS,
+                    lower_bound_ms: 0,
+                },
+            )],
             failed: vec![t1.clone()],
             first_error: Some(pulsus_clickhouse::ChError::Server {
                 code: 241,
@@ -3055,16 +2931,16 @@ mod tests {
             ),
             "{out:?}"
         );
-        let s2 = cache.tenant_cache(&t2).current_snapshot();
-        assert_eq!(s2.generation, 2, "t2 swapped");
+        let s2 = cache.tenant_cache(&t2);
+        assert_eq!(s2.read_index().generation, 2, "t2 committed");
         assert!(
-            s2.by_fingerprint.contains_key(&fp),
-            "t2 holds the new snapshot"
+            s2.read_index().find(fp).is_some(),
+            "t2 holds the applied series"
         );
         assert_eq!(
-            cache.tenant_cache(&t1).current_snapshot().generation,
+            cache.tenant_cache(&t1).read_index().generation,
             1,
-            "t1 keeps its old snapshot"
+            "t1 keeps its header"
         );
         assert_eq!(
             cache.metrics.snapshot().refresh_failures_total - failures_before,

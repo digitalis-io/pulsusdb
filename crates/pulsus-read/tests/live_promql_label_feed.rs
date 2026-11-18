@@ -54,7 +54,6 @@ fn test_config(database: &str) -> ChConnConfig {
 
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
-        skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),

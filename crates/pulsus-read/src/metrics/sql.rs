@@ -106,31 +106,40 @@ fn lookup_tables<'a>(series_table: &'a str, labels_table: &'a str) -> SeriesTabl
     }
 }
 
-/// The sweep's statement (`super::refresh`): statement 2 with no matcher,
-/// every series active in the cache window with its own name and labels.
-pub fn sweep_query(
-    tenant: &Tenant,
-    series_table: &str,
-    labels_table: &str,
-    window: DataWindow,
-) -> String {
-    series_read(tenant, window, &[], &[], &[])
-        .with_labels(lookup_tables(series_table, labels_table))
-}
-
-/// The label cache's build (issue #880). Tests first: not rendered yet.
+/// The label cache's build (issue #880, `super::refresh`): every series
+/// with a registration in `[lower_bound_ms, now_ms]`, from the lookup
+/// table's own first and last registration. No `GROUP BY` and no `FINAL`:
+/// a series appears once per unmerged part, and the index keeps the
+/// newest bucket.
 pub fn label_index_build_query(
-    _tenant: &Tenant,
-    _labels_table: &str,
-    _lower_bound_ms: i64,
-    _now_ms: i64,
+    tenant: &Tenant,
+    labels_table: &str,
+    lower_bound_ms: i64,
+    now_ms: i64,
 ) -> String {
-    String::new()
+    format!(
+        "SELECT fingerprint, metric_name, last_seen AS bucket_ms, labels\n\
+         FROM {labels_table}\n\
+         WHERE org_id = {}\n\
+         \x20 AND last_seen >= {lower_bound_ms}\n\
+         \x20 AND first_seen <= {now_ms}",
+        tenant.sql_literal()
+    )
 }
 
-/// The label cache's feed (issue #880). Tests first: not rendered yet.
-pub fn label_index_feed_query(_tenant: &Tenant, _landing_table: &str, _from_ms: i64) -> String {
-    String::new()
+/// The label cache's feed (issue #880, `super::refresh`): the series
+/// registrations — `metric_landing`'s kind-2 rows — received from
+/// `from_ms` on. The landing table is partitioned by `received_ms`'s hour,
+/// so the bound prunes every older part.
+pub fn label_index_feed_query(tenant: &Tenant, landing_table: &str, from_ms: i64) -> String {
+    format!(
+        "SELECT fingerprint, metric_name, unix_milli AS bucket_ms, labels\n\
+         FROM {landing_table}\n\
+         WHERE kind = 2\n\
+         \x20 AND org_id = {}\n\
+         \x20 AND received_ms >= {from_ms}",
+        tenant.sql_literal()
+    )
 }
 
 /// Statement 1 (issue #623): the IDs of `metric_name`'s series that
@@ -2040,7 +2049,8 @@ mod tests {
             s1,
             s2,
             by_names,
-            sweep_query(&no_tenant(), "metric_series", "metric_labels", evening()),
+            label_index_build_query(&no_tenant(), "metric_labels", 0, 1),
+            label_index_feed_query(&no_tenant(), "metric_landing", 0),
         ] {
             assert!(!sql.contains("JOIN"), "{sql}");
         }

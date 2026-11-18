@@ -49,17 +49,17 @@ pub(crate) fn cache_config() -> LabelCacheConfig {
         ttl: Duration::from_secs(60),
         staleness_multiplier: crate::DEFAULT_STALENESS_MULTIPLIER,
         read_max_memory_bytes: 1 << 30,
-        skip_unavailable_shards: false,
         landing_table: "metric_landing".to_string(),
         feed_overlap_ms: 300_000,
     }
 }
 
-/// The header of [`super::rows::SeriesRow`].
+/// The header of [`super::rows::RegistrationRow`].
 fn e_series() -> Reply {
     Reply::Empty(vec![
         ("fingerprint", "UInt128"),
         ("metric_name", "String"),
+        ("bucket_ms", "Int64"),
         ("labels", "String"),
     ])
 }
@@ -89,7 +89,7 @@ fn e_delay() -> Reply {
 }
 
 fn generation(cache: &LabelCache, tenant: &Tenant) -> u64 {
-    cache.tenant_cache(tenant).current_snapshot().generation
+    cache.tenant_cache(tenant).read_index().generation
 }
 
 /// P1. `t1` is the cache's built-in empty tenant, `t2` a second one, so
@@ -148,11 +148,7 @@ async fn a_label_pass_whose_two_attempts_fail_keeps_both_old_snapshots() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_feed_keeps_the_header_and_the_next_feed_reads_from_the_old_watermark() {
     let a = StubServer::start(Mode::Script(vec![Reply::Code(210), e_series()]));
-    let b = StubServer::start(Mode::Script(vec![
-        e_series(),
-        Reply::Code(210),
-        e_series(),
-    ]));
+    let b = StubServer::start(Mode::Script(vec![e_series(), Reply::Code(210), e_series()]));
     let config = cache_config();
     let overlap_ms = config.feed_overlap_ms;
     let cache = LabelCache::new(stub_client(&[&a, &b]).await, config);
@@ -163,7 +159,10 @@ async fn a_failed_feed_keeps_the_header_and_the_next_feed_reads_from_the_old_wat
     assert_eq!(generation_1, 1, "pass 1 committed");
 
     let second = cache.refresh().await;
-    assert!(second.is_err(), "both attempts of pass 2 failed: {second:?}");
+    assert!(
+        second.is_err(),
+        "both attempts of pass 2 failed: {second:?}"
+    );
     assert_eq!(
         cache.header_for_test(&t),
         (1, sweep_1, watermark),

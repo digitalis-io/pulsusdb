@@ -134,7 +134,6 @@ fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> 
     LabelCacheConfig {
         landing_table: series_table.replace("metric_series", "metric_landing"),
         feed_overlap_ms: 300_000,
-        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
