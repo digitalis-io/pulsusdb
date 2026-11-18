@@ -1026,3 +1026,12 @@ mod tests {
         );
     }
 }
+
+/// Stub until the budget lands: the bytes a body of `len` bytes may have
+/// the reader allocate.
+pub fn budget_bytes(len: usize) -> u64 {
+    (len as u64)
+        .saturating_mul(16)
+        .saturating_add(1 << 20)
+        .min(64 << 20)
+}

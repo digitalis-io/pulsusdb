@@ -13,7 +13,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use pulsus_write::protocols::profileql_legacy::jfr::{JfrProfiles, LabelsSnapshot, parse_jfr};
+use pulsus_write::protocols::profileql_legacy::jfr::{
+    JfrProfiles, LabelsSnapshot, budget_bytes, parse_jfr,
+};
+
+/// The answer to a body over its allocation budget.
+const OVER_BUDGET: &str =
+    "jfr parser ParseEvent error: the recording needs more memory than its size allows";
 
 /// The most this test binary holds at once.
 const CAP: usize = 1 << 30;
@@ -21,6 +27,8 @@ const CAP: usize = 1 << 30;
 struct CappedAlloc;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// The most held at once since it was last reset.
+static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CappedAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -28,6 +36,7 @@ unsafe impl GlobalAlloc for CappedAlloc {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             return std::ptr::null_mut();
         }
+        PEAK.fetch_max(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
 
@@ -218,6 +227,12 @@ fn frame_fields() -> Vec<Field> {
 
 /// The metadata event: `extra` more strings in its table beside the names.
 fn metadata(classes: &[Class], extra: usize) -> Vec<u8> {
+    metadata_with(classes, extra, &[])
+}
+
+/// [`metadata`], the strings in `utf16` written as UTF-16, which the reader
+/// has to copy.
+fn metadata_with(classes: &[Class], extra: usize, utf16: &[&str]) -> Vec<u8> {
     let mut strings: Vec<String> = Vec::new();
     let mut at = |s: &str| -> u64 {
         if let Some(i) = strings.iter().position(|t| t == s) {
@@ -263,7 +278,15 @@ fn metadata(classes: &[Class], extra: usize) -> Vec<u8> {
     content.extend_from_slice(&[0, 0, 0]);
     varint(&mut content, strings.len() as u64);
     for s in &strings {
-        utf8(&mut content, s);
+        if utf16.contains(&s.as_str()) {
+            content.push(4);
+            varint(&mut content, s.chars().count() as u64);
+            for c in s.chars() {
+                varint(&mut content, u64::from(c));
+            }
+        } else {
+            utf8(&mut content, s);
+        }
     }
     content.extend(elements);
     sized(content)
@@ -435,8 +458,8 @@ fn b4_an_events_fields_lie_inside_the_event() {
 }
 
 /// A stack 100,000 frames deep and 200,000 samples of it, each its own
-/// sample by its context id: the profile is far over the size limit long
-/// before its samples are all built.
+/// sample by its context id: the push is refused once its samples outgrow
+/// the budget its size allows.
 #[test]
 fn b5_samples_stop_growing_once_the_profile_is_over_the_size_limit() {
     let mut events = Vec::new();
@@ -451,10 +474,8 @@ fn b5_samples_stop_growing_once_the_profile_is_over_the_size_limit() {
         vec![pool_event(0, &one_deep_stack(100_000))],
         &events,
     );
-    let out = parse_within("a deep stack sampled often", body).expect("a valid recording");
-    let p = &out.profiles[0].1;
-    let ids: usize = p.sample.iter().map(|s| s.location_id.len()).sum();
-    assert!(ids <= 8 << 20, "{ids} location ids held");
+    let out = parse_within("a deep stack sampled often", body);
+    assert_eq!(out.map(|o| o.profiles.len()), Err(OVER_BUDGET.to_string()));
 }
 
 /// 400,000 stack traces whose ids share their low 32 bits: a hash of the
@@ -512,5 +533,206 @@ fn f1_truncated_and_bit_flipped_recordings_are_answered() {
             flipped[at] ^= 1 << (next() % 8);
             let _ = parse_within(&format!("{name} flipped at {at}"), flipped);
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Code review round 2: amplification, and bounds against the body
+// ---------------------------------------------------------------------
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Code review r2 finding 1: 10,000 methods of one class whose name is
+/// 200,000 bytes, each a frame of one stack, so each function name copies
+/// the class name.
+#[test]
+fn r1_many_methods_of_one_long_class_name_are_refused() {
+    let methods = 10_000u64;
+    let mut symbols = Vec::new();
+    varint(&mut symbols, 1);
+    utf8(&mut symbols, &"A".repeat(200_000));
+    for i in 0..methods {
+        varint(&mut symbols, 1_000 + i);
+        utf8(&mut symbols, &format!("m{i}"));
+    }
+    let mut table = Vec::new();
+    for i in 0..methods {
+        varint(&mut table, 1 + i);
+        table.push(1);
+        varint(&mut table, 1_000 + i);
+    }
+    let mut states = Vec::new();
+    varint(&mut states, 1);
+    utf8(&mut states, "STATE_RUNNABLE");
+    let mut stack = vec![1, 0];
+    varint(&mut stack, methods);
+    for i in 0..methods {
+        varint(&mut stack, 1 + i);
+        stack.push(0);
+    }
+    let pools = vec![
+        (SYMBOL, methods + 1, symbols),
+        (CLASS, 1, vec![1, 1]),
+        (METHOD, methods, table),
+        (THREAD_STATE, 1, states),
+        (STACK_TRACE, 1, stack),
+    ];
+    let body = recording(
+        metadata(&classes(frame_fields()), 0),
+        vec![pool_event(0, &pools)],
+        &[5, EXECUTION_SAMPLE as u8, 1, 1, 0],
+    );
+    let out = parse_within("one long class name, many methods", body);
+    assert_eq!(out.map(|o| o.profiles.len()), Err(OVER_BUDGET.to_string()));
+}
+
+/// Code review r2 finding 2: one UTF-16 metadata string of 200,000
+/// characters, the name of 10,000 fields.
+#[test]
+fn r2_many_fields_naming_one_long_metadata_string_share_it() {
+    let long = leak("a".repeat(200_000));
+    let mut types = classes(frame_fields());
+    types.push((
+        200,
+        "x",
+        (0..10_000).map(|_| (long, INT, false, false)).collect(),
+    ));
+    let body = recording(
+        metadata_with(&types, 0, &[long]),
+        vec![pool_event(0, &one_deep_stack(1))],
+        &[],
+    );
+    let out = parse_within("one long name, many fields", body);
+    assert!(out.is_ok(), "{:?}", out.map(|o| o.profiles.len()));
+}
+
+/// An event of a type no class has, holding `inner`: the event walk steps
+/// over it whatever `inner` declares.
+fn wrapped(inner: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    varint(&mut content, 999);
+    content.extend_from_slice(inner);
+    sized(content)
+}
+
+/// `record` with its five-byte declared length replaced by `len`.
+fn declared(mut record: Vec<u8>, len: u64) -> Vec<u8> {
+    record[..5].copy_from_slice(&padded5(len));
+    record
+}
+
+/// One chunk: `meta` and `pool`, each inside a wrapping event, so their own
+/// declared lengths are read only by the metadata and pool readers.
+fn wrapped_recording(meta: &[u8], pool: &[u8]) -> Vec<u8> {
+    let (m, p) = (wrapped(meta), wrapped(pool));
+    // The wrapper's five-byte size and two-byte type precede each.
+    let meta_at = 68 + 7;
+    let pool_at = 68 + m.len() + 7;
+    let size = 68 + m.len() + p.len();
+    let mut out = header(size as i64, pool_at as i64, meta_at);
+    out.extend(m);
+    out.extend(p);
+    out
+}
+
+#[test]
+fn r3_a_wrapped_recording_reads() {
+    let body = wrapped_recording(
+        &metadata(&classes(frame_fields()), 0),
+        &pool_event(0, &one_deep_stack(1)),
+    );
+    let out = parse_within("wrapped", body);
+    assert!(out.is_ok(), "{:?}", out.map(|o| o.profiles.len()));
+}
+
+/// The metadata is read inside its declared length.
+#[test]
+fn r4_metadata_is_read_inside_its_declared_length() {
+    let body = wrapped_recording(
+        &declared(metadata(&classes(frame_fields()), 0), 16),
+        &pool_event(0, &one_deep_stack(1)),
+    );
+    let out = parse_within("metadata longer than declared", body);
+    assert!(out.is_err(), "{:?}", out.map(|o| o.profiles.len()));
+}
+
+/// A constant-pool event is read inside its declared length.
+#[test]
+fn r5_a_pool_event_is_read_inside_its_declared_length() {
+    let body = wrapped_recording(
+        &metadata(&classes(frame_fields()), 0),
+        &declared(pool_event(0, &one_deep_stack(1)), 24),
+    );
+    let out = parse_within("pool event longer than declared", body);
+    assert!(out.is_err(), "{:?}", out.map(|o| o.profiles.len()));
+}
+
+/// A second chunk's pool delta that reaches back into the first chunk.
+#[test]
+fn r6_a_pool_delta_does_not_reach_an_earlier_chunk() {
+    let meta = metadata(&classes(frame_fields()), 0);
+    let first = recording(meta.clone(), vec![pool_event(0, &one_deep_stack(1))], &[]);
+    let back = -(first.len() as i64);
+    let second = recording(meta, vec![pool_event(back, &[])], &[]);
+    let mut body = first;
+    body.extend(second);
+    let out = parse_within("a delta into the first chunk", body);
+    assert!(out.is_err(), "{:?}", out.map(|o| o.profiles.len()));
+}
+
+/// A chunk-header pool, 68 bytes declared, at the end of its pool event.
+#[test]
+fn r7_the_chunk_header_pool_skip_is_inside_the_pool_event() {
+    let mut types = classes(frame_fields());
+    types.push((30, "jdk.types.ChunkHeader", vec![]));
+    let body = recording(
+        metadata(&types, 0),
+        vec![pool_event(0, &[(30, 0, Vec::new())])],
+        &[],
+    );
+    let out = parse_within("a chunk-header pool at the end", body);
+    assert!(out.is_err(), "{:?}", out.map(|o| o.profiles.len()));
+}
+
+/// The most a parse of an `n`-byte body holds at once stays inside the
+/// budget its size allows, over the vendored recordings and the cut and
+/// flipped copies of `f1`.
+#[test]
+fn r8_a_parse_holds_no_more_than_its_budget() {
+    let mut seed: u64 = 0x819_2;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        seed >> 33
+    };
+    let mut bodies = Vec::new();
+    for name in ["example.jfr.gz", "dump1.jfr.gz", "wall.jfr.gz"] {
+        let body = vendored(name);
+        for i in 1..=8 {
+            bodies.push(body[..body.len() * i / 9].to_vec());
+        }
+        for _ in 0..40 {
+            let mut flipped = body.clone();
+            let at = next() as usize % flipped.len();
+            flipped[at] ^= 1 << (next() % 8);
+            bodies.push(flipped);
+        }
+        bodies.push(body);
+    }
+    for body in bodies {
+        let base = LIVE.load(Ordering::Relaxed);
+        PEAK.store(base, Ordering::Relaxed);
+        let out = parse_jfr(&body, &LabelsSnapshot::default(), 0, 0, 100);
+        let held = PEAK.load(Ordering::Relaxed).saturating_sub(base) as u64;
+        drop(out);
+        assert!(
+            held <= budget_bytes(body.len()),
+            "a {}-byte body held {held} bytes, over its budget of {}",
+            body.len(),
+            budget_bytes(body.len())
+        );
     }
 }
