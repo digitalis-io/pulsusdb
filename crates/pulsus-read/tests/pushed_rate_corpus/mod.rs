@@ -628,7 +628,8 @@ pub fn test_config(database: &str) -> ChConnConfig {
 
 pub fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
-        skip_unavailable_shards: false,
+        landing_table: "metric_landing".to_string(),
+        feed_overlap_ms: 300_000,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),

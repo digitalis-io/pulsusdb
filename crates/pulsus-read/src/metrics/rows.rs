@@ -1,5 +1,5 @@
-//! Result-row shape for the label-cache refresh sweep, mirroring
-//! `logql/rows.rs`'s `#[derive(Row)]` convention: deserialized straight off
+//! Result-row shapes for the label cache's passes and the metrics reads,
+//! mirroring `logql/rows.rs`'s `#[derive(Row)]` convention: deserialized straight off
 //! `ChClient::query_stream`.
 
 use pulsus_clickhouse::Row;
@@ -7,16 +7,28 @@ use pulsus_model::Fingerprint;
 use serde::{Deserialize, Serialize};
 
 /// One series from statement 2 or 4 (issue #623): its ID, its name and its
-/// own lookup row's labels — the sweep ([`super::sql::sweep_query`],
-/// docs/architecture.md §5.2), the discovery reads and the fallback's label
+/// own lookup row's labels — the discovery reads and the fallback's label
 /// hydration.
 /// `labels` is the canonical JSON string the writer produced
-/// (`LabelSet::to_canonical_json`) — parsed into a `LabelSet` by
-/// [`super::refresh`], not here (this module only owns the wire shape).
+/// (`LabelSet::to_canonical_json`) — parsed into a `LabelSet` by its
+/// reader, not here (this module only owns the wire shape).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SeriesRow {
     pub fingerprint: Fingerprint,
     pub metric_name: String,
+    pub labels: String,
+}
+
+/// One series registration the label cache reads (issue #880): from
+/// `metric_labels` at start ([`super::sql::label_index_build_query`], its
+/// `last_seen`) and from `metric_landing`'s kind-2 rows after
+/// ([`super::sql::label_index_feed_query`], its `unix_milli`), as
+/// `bucket_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct RegistrationRow {
+    pub fingerprint: Fingerprint,
+    pub metric_name: String,
+    pub bucket_ms: i64,
     pub labels: String,
 }
 

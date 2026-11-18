@@ -800,11 +800,25 @@ async fn l10_a_recreated_database_is_cleared() {
     live_db::build_schema(&r.db).await;
     stop_levels(&r.db).await;
     load_fixture(r.b.port, &r.times, 10.0);
+    let passes = |s: &Server| s.metric("pulsus_label_cache_refreshes_total");
+    let (a_passes, b_passes) = (passes(&r.a), passes(&r.b));
     let deadline = Instant::now() + Duration::from_secs(10);
     while r.a.metric("pulsus_read_cache_clears_total") <= clears {
         assert!(
             Instant::now() < deadline,
             "A's clears_total did not rise within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Issue #880: each server's label cache keeps its series across the
+    // rebuild, and the writer registers none of them again, so a server
+    // still past its recency edge from the rebuild would read the new
+    // database's empty lookup instead. Both commit a pass first.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while passes(&r.a) <= a_passes || passes(&r.b) <= b_passes {
+        assert!(
+            Instant::now() < deadline,
+            "a label cache pass did not commit within 10 s of the rebuild"
         );
         std::thread::sleep(Duration::from_millis(250));
     }

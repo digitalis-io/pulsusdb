@@ -116,6 +116,9 @@ live_metrics_exemplars	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_POR
 # promoted only when that block commits. The landing block's own live
 # coverage is the `Live metric writer suite` step below.
 live_metrics_cache	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_cache
+# Issue #880: a new series reaches the label cache through the feed,
+# and the pass after the build reads `metric_landing` alone.
+live_promql_label_feed	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_promql_label_feed
 # Issue #500: `/api/v1/metadata`'s read returns every distinct
 # descriptor of a name, `limit` counts names after `metric`, and a
 # descriptor not resent within the retention leaves.
