@@ -157,12 +157,9 @@ const fn entry<K, V>() -> u64 {
     2 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) as u64 + 2
 }
 
-/// A string's charge.
-fn text_bytes(s: &Cow<'_, str>) -> u64 {
-    match s {
-        Cow::Borrowed(_) => 0,
-        Cow::Owned(o) => o.len() as u64,
-    }
+/// A string's charge: what it copied from the body.
+fn owned_len(s: &str, owned: bool) -> u64 {
+    if owned { s.len() as u64 } else { 0 }
 }
 
 /// One frame of a stack trace: its method's pool id and its line.
@@ -1032,7 +1029,7 @@ impl Meta {
                     Kind::Str => {
                         let s = cur.field_string(base)?;
                         if let Slot::Text(i) = p.slot {
-                            budget.take(text_bytes(&s))?;
+                            budget.take(owned_len(&s, matches!(s, Cow::Owned(_))))?;
                             out.text[i as usize] = s;
                         }
                     }
@@ -1055,13 +1052,9 @@ impl Meta {
                         cur.varint32()?;
                     }
                     Kind::Frames => {
-                        let mut frame = Values::default();
-                        self.read_object(cur, base, &self.frame_plans, &mut frame, budget)?;
+                        let frame = self.read_frame(cur, base)?;
                         if p.slot == Slot::Frames {
-                            out.frames.push(Frame {
-                                method: frame.num[0],
-                                line: frame.num[1] as u32,
-                            });
+                            out.frames.push(frame);
                         }
                     }
                     Kind::Nested(c) => {
@@ -1079,6 +1072,50 @@ impl Meta {
             }
         }
         Ok(())
+    }
+
+    /// One stack frame by the frame plans: its method and its line. A frame
+    /// binds numbers only, so its strings are read and dropped.
+    fn read_frame(&self, cur: &mut Cursor<'_>, base: usize) -> Read<Frame> {
+        let mut num = [0u64; 2];
+        for p in &self.frame_plans {
+            let n = if p.array { cur.count()? } else { 1 };
+            for _ in 0..n {
+                let v = match p.kind {
+                    Kind::Cp | Kind::Long => cur.varlong()?,
+                    Kind::Int => u64::from(cur.varint32()?),
+                    Kind::Short => u64::from(cur.varint16()?),
+                    Kind::Boolean => u64::from(cur.byte()? != 0),
+                    Kind::Float => u64::from(cur.varint32()?),
+                    Kind::Str => {
+                        cur.field_string(base)?;
+                        0
+                    }
+                    Kind::Nested(c) => {
+                        let k = if p.array { cur.count()? } else { 1 };
+                        for _ in 0..k {
+                            self.skip_nested(cur, base, c)?;
+                        }
+                        0
+                    }
+                    Kind::Frames | Kind::Unknown { .. } => {
+                        let mut v = Values::default();
+                        let budget = Budget::new(0);
+                        self.read_object(cur, base, std::slice::from_ref(p), &mut v, &budget)?;
+                        0
+                    }
+                };
+                if let Slot::Num(i) = p.slot
+                    && (i as usize) < num.len()
+                {
+                    num[i as usize] = v;
+                }
+            }
+        }
+        Ok(Frame {
+            method: num[0],
+            line: num[1] as u32,
+        })
     }
 
     /// An object inside an object: references as 32-bit varints, and no

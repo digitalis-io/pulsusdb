@@ -701,7 +701,7 @@ fn r7_the_chunk_header_pool_skip_is_inside_the_pool_event() {
 /// flipped copies of `f1`.
 #[test]
 fn r8_a_parse_holds_no_more_than_its_budget() {
-    let mut seed: u64 = 0x819_2;
+    let mut seed: u64 = 0x8192;
     let mut next = move || {
         seed = seed
             .wrapping_mul(6_364_136_223_846_793_005)
