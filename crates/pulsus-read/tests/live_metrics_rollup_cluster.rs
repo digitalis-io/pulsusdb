@@ -110,6 +110,8 @@ fn engine_config(db: &str) -> MetricsConfig {
 
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        landing_table: "metric_landing_dist".to_string(),
+        feed_overlap_ms: 300_000,
         skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),

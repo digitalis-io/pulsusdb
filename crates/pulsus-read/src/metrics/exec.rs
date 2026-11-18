@@ -6593,6 +6593,18 @@ mod tests {
         assert_eq!(s.get("join_algorithm"), Some("hash"));
         // U42 (issue #778, addendum 6): the sweep names its task.
         assert_eq!(s.get("log_comment"), Some("background:label-cache-sweep"));
+        // Issue #880: every cache statement reads every shard and refuses
+        // a replica 30 s or more behind, whatever the server is set to.
+        assert_eq!(s.get("skip_unavailable_shards"), Some("0"));
+        assert_eq!(
+            s.get("max_replica_delay_for_distributed_queries"),
+            Some("30")
+        );
+        assert_eq!(
+            s.get("fallback_to_stale_replicas_for_distributed_queries"),
+            Some("0")
+        );
+        assert_eq!(s.get("prefer_localhost_replica"), Some("1"));
     }
 
     #[test]
@@ -6739,14 +6751,14 @@ mod tests {
     }
 
     /// **U2 (issue #18 part 2c): the request-path settings builders carry
-    /// the lag guard, and the label cache's sweep carries none of it.**
-    /// `metrics_read_settings`, `series_read_settings` and each
-    /// `exemplar_settings`, clustered or not, set the configured delay,
+    /// the lag guard.** `metrics_read_settings`, `series_read_settings` and
+    /// each `exemplar_settings`, clustered or not, set the configured delay,
     /// stale replicas as the last resort, and the local copy preferred.
-    /// `sweep_settings` sets none of the three (r20). Which statements keep
-    /// the guard when sent is the dispatcher's choice (U8).
+    /// Which statements keep the guard when sent is the dispatcher's choice
+    /// (U8). The label cache's own guard is in
+    /// `label_cache_sweep_carries_the_memory_ceiling` (issue #880).
     #[test]
-    fn the_read_builders_carry_the_lag_guard_and_the_sweep_does_not() {
+    fn the_read_builders_carry_the_lag_guard() {
         use ExemplarStatement::{Count, Rows, Series, Thinned};
         for distributed in [false, true] {
             let mut builders: Vec<(String, QuerySettings)> = vec![
@@ -6778,16 +6790,6 @@ mod tests {
                     );
                 }
             }
-        }
-        // Issue #18 part 2c r20: the sweep nests one table inside another,
-        // so it is sent with none of the three, as before this part.
-        let sweep = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false);
-        for name in [
-            "max_replica_delay_for_distributed_queries",
-            "fallback_to_stale_replicas_for_distributed_queries",
-            "prefer_localhost_replica",
-        ] {
-            assert_eq!(sweep.get(name), None, "sweep_settings: {name}");
         }
     }
 

@@ -29,7 +29,7 @@ use pulsus_read::metrics::sample_sql::sample_fetch_subquery;
 use pulsus_read::metrics::sql::historical_series_subquery;
 use pulsus_read::{
     DataWindow, ExplainStage, LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig,
-    MetricsEngine, PlanExplain, QueryResult,
+    MetricsEngine, PlanExplain, QueryResult, Resolution, SeriesResolver,
 };
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -335,6 +335,8 @@ async fn wait_for_cross_shard_split(
 
 fn cache_config_dist(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        landing_table: "metric_landing_dist".to_string(),
+        feed_overlap_ms: 300_000,
         skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
@@ -1365,5 +1367,215 @@ async fn a_series_landed_through_two_servers_is_read_whole_by_the_fallback() {
         assert_eq!(single_value(&result), Some(2.0), "{query}: both samples");
     }
 
+    drop_database(&shard1_bootstrap, db).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #880: the label cache's feed over the cluster.
+// ---------------------------------------------------------------------------
+
+/// A fingerprint from `from` up whose rows the landing wrapper's key,
+/// `cityHash64(fingerprint)`, sends to shard `shard` (1 or 2). The test
+/// asserts the placement afterwards by reading each shard's own table.
+async fn fingerprint_for_shard(client: &ChClient, shard: u64, from: u64) -> u128 {
+    let n = single_count(
+        client,
+        &format!(
+            "SELECT toUInt64(number) AS n FROM numbers({from}, 256) \
+             WHERE cityHash64(toUInt128(number)) % 2 = {} LIMIT 1",
+            shard - 1
+        ),
+    )
+    .await;
+    u128::from(n)
+}
+
+/// One series' registration through `metric_landing_dist`, sent on to its
+/// shard before the insert returns.
+async fn register_through_the_wrapper(db: &str, metric_name: &str, fingerprint: u128) {
+    let now = now_ms();
+    let bucket = now - now.rem_euclid(ACTIVITY_BUCKET_MS);
+    let client = ChClient::new(shard1_config(db)).await.expect("connect");
+    let sql = format!(
+        "INSERT INTO metric_landing_dist \
+         (received_ms, kind, metric_name, fingerprint, unix_milli, labels) \
+         VALUES ({now}, 2, '{metric_name}', {fingerprint}, {bucket}, '{{\"job\":\"api\"}}')"
+    );
+    client
+        .execute(
+            &sql,
+            &QuerySettings::new().set("distributed_foreground_insert", 1u64),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    shard1_bootstrap_sync(db).await;
+}
+
+/// Every replica catches up on the landing table and the lookup it fills.
+async fn shard1_bootstrap_sync(db: &str) {
+    let client = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect");
+    for table in ["metric_landing", "metric_labels"] {
+        client
+            .execute(
+                &format!("SYSTEM SYNC REPLICA ON CLUSTER '{CLUSTER_NAME}' {db}.{table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("sync {table}: {e}"));
+    }
+}
+
+/// How many of `fingerprint`'s landing rows a shard holds in its own table.
+async fn landing_rows_on(shard: &ChClient, fingerprint: u128) -> u64 {
+    single_count(
+        shard,
+        &format!(
+            "SELECT toUInt64(count()) AS n FROM metric_landing WHERE fingerprint = {fingerprint}"
+        ),
+    )
+    .await
+}
+
+/// The window up to `end_ms`, ten minutes long.
+fn recent_window(end_ms: i64) -> DataWindow {
+    DataWindow {
+        start_ms: end_ms - 600_000,
+        end_ms,
+    }
+}
+
+/// **T9 (issue #880): the feed reads every shard.** A on shard 1, built;
+/// B registered through the wrapper onto shard 2; the next pass, a feed,
+/// finds B.
+#[tokio::test]
+async fn the_feed_reads_every_shard() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_promql_label_feed_shards");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let shard1 = ChClient::new(shard1_config(db)).await.expect("connect");
+    let shard2 = ChClient::new(shard2_config(db)).await.expect("connect");
+    let a = fingerprint_for_shard(&shard1, 1, 1_000).await;
+    let b = fingerprint_for_shard(&shard1, 2, 2_000).await;
+
+    register_through_the_wrapper(db, "feed_shards_a", a).await;
+    let cache = LabelCache::new(
+        ChClient::new(shard1_config(db)).await.expect("connect"),
+        cache_config_dist(db),
+    );
+    cache.refresh().await.expect("the build");
+
+    register_through_the_wrapper(db, "feed_shards_b", b).await;
+    assert_eq!(
+        (
+            landing_rows_on(&shard1, a).await,
+            landing_rows_on(&shard2, a).await
+        ),
+        (1, 0),
+        "A is on shard 1"
+    );
+    assert_eq!(
+        (
+            landing_rows_on(&shard1, b).await,
+            landing_rows_on(&shard2, b).await
+        ),
+        (0, 1),
+        "B is on shard 2"
+    );
+    let before = now_ms();
+    cache.refresh().await.expect("the feed");
+    match cache.resolve(&no_tenant(), "feed_shards_b", &[], recent_window(before)) {
+        Resolution::Fingerprints(fps) => assert!(
+            fps.contains(&pulsus_model::Fingerprint::from_raw(b)),
+            "the feed read shard 2: {fps:?}"
+        ),
+        other => panic!("expected the cache to answer, got {other:?}"),
+    }
+
+    drop_database(&shard1_bootstrap, db).await;
+}
+
+/// **T11 (issue #880): a shard unreadable past the overlap loses no
+/// series.** The cache connects as a user whose own settings skip an
+/// unavailable shard. B lands on shard 2; three seconds later, past the
+/// two-second overlap, shard 2's `metric_landing` is detached, which the
+/// pinned `skip_unavailable_shards_mode` counts as an unavailable shard.
+/// The pass fails and keeps its header; once the table is back, the next
+/// pass reads from the old watermark and finds B.
+#[tokio::test]
+async fn a_shard_unreadable_past_the_overlap_loses_no_series() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_promql_label_feed_down");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let shard1 = ChClient::new(shard1_config(db)).await.expect("connect");
+    let shard2 = ChClient::new(shard2_config(db)).await.expect("connect");
+    let a = fingerprint_for_shard(&shard1, 1, 3_000).await;
+    let b = fingerprint_for_shard(&shard1, 2, 4_000).await;
+    let user = profile_user(
+        &shard1_bootstrap,
+        db,
+        "feedskip",
+        "skip_unavailable_shards = 1",
+    )
+    .await;
+
+    register_through_the_wrapper(db, "feed_down_a", a).await;
+    let cache = LabelCache::new(
+        client_as(db, &user).await,
+        LabelCacheConfig {
+            skip_unavailable_shards: true,
+            feed_overlap_ms: 2_000,
+            ..cache_config_dist(db)
+        },
+    );
+    cache.refresh().await.expect("the build");
+
+    register_through_the_wrapper(db, "feed_down_b", b).await;
+    assert_eq!(landing_rows_on(&shard2, b).await, 1, "B is on shard 2");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    shard2
+        .execute(
+            &format!("DETACH TABLE {db}.metric_landing"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("detach shard 2's metric_landing");
+
+    let header = cache.header_for_test(&no_tenant());
+    let failed = cache.refresh().await;
+    let header_after = cache.header_for_test(&no_tenant());
+    shard2
+        .execute(
+            &format!("ATTACH TABLE {db}.metric_landing"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("attach shard 2's metric_landing");
+    assert!(
+        failed.is_err(),
+        "a pass that cannot read shard 2 fails: {failed:?}"
+    );
+    assert_eq!(
+        (header_after.0, header_after.2),
+        (header.0, header.2),
+        "the failed pass keeps the generation and the watermark"
+    );
+
+    let before = now_ms();
+    cache.refresh().await.expect("the pass after the table is back");
+    assert_eq!(
+        cache.resolve(&no_tenant(), "feed_down_b", &[], recent_window(before)),
+        Resolution::Fingerprints(vec![pulsus_model::Fingerprint::from_raw(b)]),
+        "the next pass read B"
+    );
+
+    drop_user(&shard1_bootstrap, &user).await;
     drop_database(&shard1_bootstrap, db).await;
 }

@@ -118,6 +118,21 @@ pub fn sweep_query(
         .with_labels(lookup_tables(series_table, labels_table))
 }
 
+/// The label cache's build (issue #880). Tests first: not rendered yet.
+pub fn label_index_build_query(
+    _tenant: &Tenant,
+    _labels_table: &str,
+    _lower_bound_ms: i64,
+    _now_ms: i64,
+) -> String {
+    String::new()
+}
+
+/// The label cache's feed (issue #880). Tests first: not rendered yet.
+pub fn label_index_feed_query(_tenant: &Tenant, _landing_table: &str, _from_ms: i64) -> String {
+    String::new()
+}
+
 /// Statement 1 (issue #623): the IDs of `metric_name`'s series that
 /// `matchers` select on the lookup and the activity table finds in
 /// `window`. Inlined verbatim by issue #31's fallback as `fingerprint IN (
@@ -2247,6 +2262,48 @@ WHERE org_id = 'tenant-q'
             );
             for stmt in [&c, &a, &thinned, &h, &two] {
                 assert!(!stmt.contains("JOIN"), "{stmt}");
+            }
+        }
+    }
+
+    /// **T5 (issue #880): the label cache's two statements, byte for
+    /// byte**, for the empty tenant and `t1`, over the bare tables and
+    /// their `_dist` wrappers.
+    #[test]
+    fn label_index_build_and_feed_statements_render_exactly() {
+        let header = http::HeaderValue::from_static("t1");
+        let t1 = Tenant::from_header(Some(&header), false).expect("tenant t1");
+        for (tenant, org) in [(no_tenant(), "''"), (t1, "'t1'")] {
+            for dist in ["", "_dist"] {
+                assert_eq!(
+                    label_index_build_query(
+                        &tenant,
+                        &format!("metric_labels{dist}"),
+                        1_788_818_400_000,
+                        1_788_823_800_000,
+                    ),
+                    format!(
+                        "SELECT fingerprint, metric_name, last_seen AS bucket_ms, labels\n\
+                         FROM metric_labels{dist}\n\
+                         WHERE org_id = {org}\n\
+                         \x20 AND last_seen >= 1788818400000\n\
+                         \x20 AND first_seen <= 1788823800000"
+                    )
+                );
+                assert_eq!(
+                    label_index_feed_query(
+                        &tenant,
+                        &format!("metric_landing{dist}"),
+                        1_788_823_620_000,
+                    ),
+                    format!(
+                        "SELECT fingerprint, metric_name, unix_milli AS bucket_ms, labels\n\
+                         FROM metric_landing{dist}\n\
+                         WHERE kind = 2\n\
+                         \x20 AND org_id = {org}\n\
+                         \x20 AND received_ms >= 1788823620000"
+                    )
+                );
             }
         }
     }

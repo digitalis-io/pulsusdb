@@ -132,6 +132,8 @@ fn now_ms() -> i64 {
 
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        landing_table: "metric_landing".to_string(),
+        feed_overlap_ms: 300_000,
         skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.

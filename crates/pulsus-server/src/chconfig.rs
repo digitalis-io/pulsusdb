@@ -329,6 +329,8 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         ""
     };
     LabelCacheConfig {
+        landing_table: format!("metric_landing{dist}"),
+        feed_overlap_ms: 300_000,
         db: config.clickhouse.database.clone(),
         series_table: format!("metric_series{dist}"),
         labels_table: format!("metric_labels{dist}"),

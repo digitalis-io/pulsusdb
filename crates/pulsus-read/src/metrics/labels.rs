@@ -87,6 +87,11 @@ pub struct LabelCacheConfig {
     /// `PULSUS_SKIP_UNAVAILABLE_SHARDS` (#603 follow-up): the sweep sends
     /// the answer pins with it, as every request-path metrics read does.
     pub skip_unavailable_shards: bool,
+    /// `metric_landing` (or its `_dist`-suffixed wrapper), whose kind-2 rows
+    /// the label cache's feed reads (issue #880).
+    pub landing_table: String,
+    /// How far before its watermark a feed starts reading (issue #880).
+    pub feed_overlap_ms: i64,
 }
 
 /// Resident snapshot: `fingerprint -> LabelSet` plus `metric_name ->
@@ -1371,6 +1376,85 @@ impl CacheSnapshot {
     }
 }
 
+impl LabelCache {
+    /// `tenant`'s header: generation, recency anchor and watermark (issue
+    /// #880), for the live suites. Tests first: no watermark yet, so the
+    /// anchor stands in for it.
+    #[doc(hidden)]
+    pub fn header_for_test(&self, tenant: &Tenant) -> (u64, i64, i64) {
+        let s = self.tenant_cache(tenant).current_snapshot();
+        (s.generation, s.sweep_time_ms, s.sweep_time_ms)
+    }
+}
+
+/// Issue #880: one tenant's cache driven through the pass's batch path with
+/// no `ChClient`, for the peak-memory suite
+/// (`tests/promql_label_index_memory.rs`). Tests first: today's shape, a
+/// whole snapshot built beside the resident one and swapped in.
+#[doc(hidden)]
+pub struct LabelPassProbe {
+    slot: TenantCache,
+    pending: Mutex<super::refresh::SweptSnapshot>,
+}
+
+impl LabelPassProbe {
+    #[doc(hidden)]
+    pub fn new_for_test() -> Self {
+        LabelPassProbe {
+            slot: TenantCache::new(),
+            pending: Mutex::new(super::refresh::SweptSnapshot::default()),
+        }
+    }
+
+    /// One batch of a pass; `rows` is left empty.
+    #[doc(hidden)]
+    pub fn apply_batch_for_test(
+        &self,
+        rows: &mut Vec<super::rows::RegistrationRow>,
+        _build: bool,
+        _now_ms: i64,
+        _lower_bound_ms: i64,
+    ) {
+        let mut pending = match self.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for row in rows.drain(..) {
+            pending.by_fingerprint.insert(
+                row.fingerprint,
+                crate::canonical_labels::parse_canonical_label_set(&row.labels),
+            );
+            pending
+                .by_metric
+                .entry(row.metric_name)
+                .or_default()
+                .push(row.fingerprint);
+        }
+    }
+
+    /// Commits the pass.
+    #[doc(hidden)]
+    pub fn commit_for_test(&self, now_ms: i64, lower_bound_ms: i64) {
+        let mut pending = match self.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut swept = std::mem::take(&mut *pending);
+        for fps in swept.by_metric.values_mut() {
+            fps.sort_unstable();
+            fps.dedup();
+        }
+        swept.sweep_time_ms = now_ms;
+        swept.covered_from_ms = lower_bound_ms;
+        swept.swap_into(&self.slot);
+    }
+
+    #[doc(hidden)]
+    pub fn series_count_for_test(&self) -> usize {
+        self.slot.current_snapshot().series_count()
+    }
+}
+
 /// Issue #89: an opaque probe over [`resolve_multi_metric_over`], reusing
 /// [`RegexCache`] — the isolated alloc-gate binary's only way to reach the
 /// `pub(crate)` resolver. Its name matcher is fixed at construction (a
@@ -1408,6 +1492,8 @@ impl MultiMetricScanProbe {
                 // Never dispatches (this probe is in-memory only); the
                 // value is the production default for shape parity.
                 read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+                landing_table: "metric_landing".to_string(),
+                feed_overlap_ms: 300_000,
             },
             // Never matches any `m######` fixture name — every examined
             // name `continue`s, so the fingerprint loop never runs and no
@@ -1494,6 +1580,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             staleness_multiplier: DEFAULT_STALENESS_MULTIPLIER,
             read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+            landing_table: "metric_landing".to_string(),
+            feed_overlap_ms: 300_000,
         }
     }
 

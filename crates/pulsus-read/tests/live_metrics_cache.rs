@@ -132,6 +132,8 @@ async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<Fingerprin
 
 fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> LabelCacheConfig {
     LabelCacheConfig {
+        landing_table: series_table.replace("metric_series", "metric_landing"),
+        feed_overlap_ms: 300_000,
         skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.

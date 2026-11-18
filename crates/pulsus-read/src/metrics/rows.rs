@@ -20,6 +20,19 @@ pub struct SeriesRow {
     pub labels: String,
 }
 
+/// One series registration the label cache reads (issue #880): from
+/// `metric_labels` at start ([`super::sql::label_index_build_query`], its
+/// `last_seen`) and from `metric_landing`'s kind-2 rows after
+/// ([`super::sql::label_index_feed_query`], its `unix_milli`), as
+/// `bucket_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct RegistrationRow {
+    pub fingerprint: Fingerprint,
+    pub metric_name: String,
+    pub bucket_ms: i64,
+    pub labels: String,
+}
+
 /// Issue #96's degraded-cache discovery probe result row: the single
 /// `metric_name` column of the bounded `SELECT DISTINCT metric_name`
 /// probe ([`super::sql::distinct_metric_names_probe`]). Deliberately not

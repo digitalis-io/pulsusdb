@@ -89,6 +89,7 @@ pub mod grouped_rows;
 pub mod grouped_sql;
 pub mod labels;
 pub mod matcher;
+mod promql_label_index;
 mod re2_authority;
 pub mod read_cache;
 pub mod refresh;
@@ -136,14 +137,15 @@ pub use exec::{
 pub use exemplars::{ExemplarSeries, StoredExemplar};
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,
-    LabelledResolution, MetricSeriesGroup, MultiMetricResolution, MultiMetricScanProbe, Resolution,
+    LabelPassProbe, LabelledResolution, MetricSeriesGroup, MultiMetricResolution, MultiMetricScanProbe, Resolution,
     SeriesResolver, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot,
 };
 pub use matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
+pub use promql_label_index::LabelIndex;
 #[doc(hidden)]
 pub use re2_authority::pattern_requires_re2_authority_for_test;
 pub use refresh::spawn_refresh_loop;
-pub use rows::SeriesRow;
+pub use rows::{RegistrationRow, SeriesRow};
 pub use sample_rows::SampleRow;
 // Unsealed by design — exists because `tests/re2_screen_differential.rs`
 // is an external binary. Issue #328's D1 extraction moved the SCREEN to

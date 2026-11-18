@@ -245,6 +245,24 @@ pub(crate) fn sweep_settings(
         .set("log_comment", "background:label-cache-sweep")
 }
 
+/// Which statement a pass sends (issue #880). Tests first: not decided yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassKind {
+    Build { lower_bound_ms: i64 },
+    Feed { from_ms: i64 },
+}
+
+/// The pass's decision (issue #880). Tests first: not decided yet.
+pub(crate) fn pass_kind(
+    _generation: u64,
+    _watermark_ms: i64,
+    _now_ms: i64,
+    _overlap_ms: i64,
+    _window_ms: i64,
+) -> PassKind {
+    PassKind::Feed { from_ms: 0 }
+}
+
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
 /// [`LabelCache::refresh`] pass per tick, in a self-healing shape: a failed
 /// sweep only logs and bumps a failure
@@ -303,6 +321,34 @@ mod tests {
              )\n\
              GROUP BY fingerprint\n\
              ORDER BY metric_name, fingerprint"
+        );
+    }
+
+    /// **T4 (issue #880).** A cold tenant builds; a watermark more than
+    /// 50 minutes old builds; anything newer feeds from the watermark less
+    /// the overlap.
+    #[test]
+    fn pass_kind_builds_when_cold_or_stale_and_feeds_otherwise() {
+        let now = 1_788_823_800_000;
+        let window = 3_600_000;
+        let lb = floor_to_activity_bucket(now - window, pulsus_model::ACTIVITY_BUCKET_MS);
+        assert_eq!(
+            pass_kind(0, 0, now, 300_000, window),
+            PassKind::Build { lower_bound_ms: lb }
+        );
+        assert_eq!(
+            pass_kind(0, now - 1_000, now, 300_000, window),
+            PassKind::Build { lower_bound_ms: lb }
+        );
+        assert_eq!(
+            pass_kind(1, now - 3_000_001, now, 300_000, window),
+            PassKind::Build { lower_bound_ms: lb }
+        );
+        assert_eq!(
+            pass_kind(1, now - 3_000_000, now, 300_000, window),
+            PassKind::Feed {
+                from_ms: now - 3_300_000
+            }
         );
     }
 

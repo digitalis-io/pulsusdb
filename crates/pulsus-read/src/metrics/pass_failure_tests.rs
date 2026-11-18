@@ -50,6 +50,8 @@ pub(crate) fn cache_config() -> LabelCacheConfig {
         staleness_multiplier: crate::DEFAULT_STALENESS_MULTIPLIER,
         read_max_memory_bytes: 1 << 30,
         skip_unavailable_shards: false,
+        landing_table: "metric_landing".to_string(),
+        feed_overlap_ms: 300_000,
     }
 }
 
@@ -133,6 +135,60 @@ async fn a_label_pass_whose_two_attempts_fail_keeps_both_old_snapshots() {
     );
     assert_eq!(a.answered(), 2, "A: {:?}", a.requests());
     assert_eq!(b.answered(), 4, "B: {:?}", b.requests());
+}
+
+/// **T7 (issue #880).** Pass 1 builds; both attempts of pass 2, a feed,
+/// meet 210; pass 3 feeds again. The failed feed leaves the header as it
+/// was, so pass 3 reads from pass 1's watermark less the overlap.
+///
+/// - `refresh()` 1, attempt 1, bound `B`: empty → generation 1.
+/// - `refresh()` 2, attempt 1, bound `A`: 210 → `A` demoted; attempt 2,
+///   bound `B`: 210.
+/// - `refresh()` 3: whichever stub it binds answers empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_feed_keeps_the_header_and_the_next_feed_reads_from_the_old_watermark() {
+    let a = StubServer::start(Mode::Script(vec![Reply::Code(210), e_series()]));
+    let b = StubServer::start(Mode::Script(vec![
+        e_series(),
+        Reply::Code(210),
+        e_series(),
+    ]));
+    let config = cache_config();
+    let overlap_ms = config.feed_overlap_ms;
+    let cache = LabelCache::new(stub_client(&[&a, &b]).await, config);
+    let t = Tenant::from_header(None, false).expect("the empty tenant");
+
+    cache.refresh().await.expect("pass 1, the build");
+    let (generation_1, sweep_1, watermark) = cache.header_for_test(&t);
+    assert_eq!(generation_1, 1, "pass 1 committed");
+
+    let second = cache.refresh().await;
+    assert!(second.is_err(), "both attempts of pass 2 failed: {second:?}");
+    assert_eq!(
+        cache.header_for_test(&t),
+        (1, sweep_1, watermark),
+        "a failed feed keeps the generation, the anchor and the watermark"
+    );
+
+    let (seen_a, seen_b) = (a.answered(), b.answered());
+    cache.refresh().await.expect("pass 3, the feed");
+    assert_eq!(cache.header_for_test(&t).0, 2, "pass 3 committed");
+    let third: Vec<String> = a.requests()[seen_a..]
+        .iter()
+        .chain(&b.requests()[seen_b..])
+        .cloned()
+        .collect();
+    assert_eq!(third.len(), 1, "one statement in pass 3: {third:?}");
+    assert!(
+        third[0].contains("FROM metric_landing"),
+        "pass 3 reads the landing table: {}",
+        third[0]
+    );
+    assert!(
+        third[0].contains(&format!("received_ms >= {}", watermark - overlap_ms)),
+        "pass 3 reads from pass 1's watermark less the overlap: {}",
+        third[0]
+    );
 }
 
 fn l0() -> Levels {
