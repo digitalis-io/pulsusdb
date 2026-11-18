@@ -913,6 +913,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
         .await
         .expect("widen metric_series");
 
+    let anchor = cache.sweep_time_ms(&no_tenant());
     let err = cache
         .refresh()
         .await
@@ -925,16 +926,24 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
         other => panic!("expected a server 241, got {other:?}"),
     }
 
-    // Behaviour deliberately unchanged: the last good snapshot is still
-    // resident, not blanked — a blanked cache would mass-false-empty every
-    // in-window query.
+    // The cache is not blanked — a blanked cache would mass-false-empty
+    // every in-window query. Issue #880: the pass is a feed applied in
+    // batches, so the batches it applied before the breach stay (each a
+    // registration the store holds), and its recency anchor does not move.
     let after = cache.tsdb_snapshot(
         &no_tenant(),
         pulsus_read::metrics::labels::TSDB_TOP_METRIC_NAMES,
     );
+    assert!(
+        after.num_series >= good.num_series,
+        "a failed sweep must never clobber the last good snapshot: {} of {}",
+        after.num_series,
+        good.num_series
+    );
     assert_eq!(
-        after.num_series, good.num_series,
-        "a failed sweep must never clobber the last good snapshot"
+        cache.sweep_time_ms(&no_tenant()),
+        anchor,
+        "a failed sweep keeps its recency anchor"
     );
     assert!(cache.is_warm(), "a failed sweep must not un-warm the cache");
 
