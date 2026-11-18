@@ -7,8 +7,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::fmt;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasher, Hasher};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -16,15 +17,39 @@ use regex::Regex;
 const CHUNK_HEADER_SIZE: usize = 68;
 const CHUNK_MAGIC: u32 = 0x464c_5200;
 
-/// A hasher for the small integer keys of the pools and the builders: one
-/// multiply per word, as the compiler's own hash tables use.
-#[derive(Default, Clone, Copy)]
+/// The process's secret hash seed, drawn from the standard library's
+/// random keys.
+static SEED: LazyLock<u64> = LazyLock::new(|| RandomState::new().hash_one(0x819u64));
+
+/// A hash for the ids and names the body chooses: each word is mixed with a
+/// secret seed by one folded 128-bit multiply, whose high half reaches the
+/// bucket bits, so a body cannot pick keys that share a bucket.
+#[derive(Clone, Copy)]
+pub(crate) struct IdState(u64);
+
+impl Default for IdState {
+    fn default() -> Self {
+        IdState(*SEED)
+    }
+}
+
+impl BuildHasher for IdState {
+    type Hasher = IdHasher;
+
+    fn build_hasher(&self) -> IdHasher {
+        IdHasher(self.0)
+    }
+}
+
 pub(crate) struct IdHasher(u64);
+
+const MIX: u64 = 0x5851_f42d_4c95_7f2d;
 
 impl IdHasher {
     #[inline]
     fn add(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        let x = u128::from(self.0 ^ n) * u128::from(MIX);
+        self.0 = (x as u64) ^ (x >> 64) as u64;
     }
 }
 
@@ -38,11 +63,13 @@ impl Hasher for IdHasher {
     fn write(&mut self, bytes: &[u8]) {
         let mut chunks = bytes.chunks_exact(8);
         for c in &mut chunks {
-            self.add(u64::from_le_bytes(c.try_into().unwrap_or_default()));
+            let mut w = [0u8; 8];
+            w.copy_from_slice(c);
+            self.add(u64::from_le_bytes(w));
         }
-        for &b in chunks.remainder() {
-            self.add(u64::from(b));
-        }
+        let mut w = [0u8; 8];
+        w[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
+        self.add(u64::from_le_bytes(w) ^ (bytes.len() as u64) << 56);
     }
 
     #[inline]
@@ -66,8 +93,8 @@ impl Hasher for IdHasher {
     }
 }
 
-/// A hash map keyed by pool ids.
-pub(crate) type IdMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+/// A hash map keyed by ids or names the body chooses.
+pub(crate) type IdMap<K, V> = HashMap<K, V, IdState>;
 
 /// One frame of a stack trace: its method's pool id and its line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +290,16 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// A count of things each at least one byte long: more than the bytes
+    /// left is a read past the end, refused before anything is read or held.
+    fn count(&mut self) -> Read<usize> {
+        let n = self.varint32()? as usize;
+        if n > self.buf.len().saturating_sub(self.pos) {
+            return Err(ReadError::Eof);
+        }
+        Ok(n)
+    }
+
     fn bytes(&mut self) -> Read<&'a [u8]> {
         let n = self.varint32()? as usize;
         if self.pos + n > self.buf.len() {
@@ -275,8 +312,8 @@ impl<'a> Cursor<'a> {
 
     /// A UTF-16 string: a count, then each code unit as a varint.
     fn chars(&mut self) -> Read<String> {
-        let n = self.varint32()? as usize;
-        let mut out = String::with_capacity(n.min(self.buf.len() - self.pos));
+        let n = self.count()?;
+        let mut out = String::with_capacity(n);
         for _ in 0..n {
             let c = self.varint32()?;
             out.push(char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER));
@@ -395,7 +432,7 @@ fn read_element(cur: &mut Cursor<'_>, strings: usize, with_attrs: bool) -> Read<
         Ok(i)
     };
     let name = index()?;
-    let count = cur.varint32()?;
+    let count = cur.count()?;
     let mut attrs = Vec::new();
     for _ in 0..count {
         let k = {
@@ -416,7 +453,7 @@ fn read_element(cur: &mut Cursor<'_>, strings: usize, with_attrs: bool) -> Read<
             attrs.push((k, v));
         }
     }
-    let children = cur.varint32()?;
+    let children = cur.count()? as u32;
     Ok(Element {
         name,
         attrs,
@@ -435,8 +472,8 @@ fn read_metadata<'a>(buf: &'a [u8], pos: i64) -> Read<Vec<ClassDef<'a>>> {
     cur.varlong()?;
     cur.varlong()?;
     cur.varlong()?;
-    let n = cur.varint32()? as usize;
-    let mut strings = Vec::with_capacity(n.min(buf.len()));
+    let n = cur.count()?;
+    let mut strings = Vec::with_capacity(n);
     for _ in 0..n {
         strings.push(cur.meta_string()?);
     }
@@ -870,9 +907,14 @@ impl<'a> Meta<'a> {
     ) -> Read<()> {
         for p in plans {
             let n = if p.array {
-                let n = cur.varint32()?;
+                let n = cur.count()?;
+                if matches!(p.kind, Kind::Frames) && n > 0 && self.frame_plans.is_empty() {
+                    return Err(message(
+                        "a stack frame type with no field reads no byte".to_string(),
+                    ));
+                }
                 if p.slot == Slot::Frames {
-                    out.frames = Vec::with_capacity((n as usize).min(cur.buf.len() - cur.pos));
+                    out.frames = Vec::with_capacity(n);
                 }
                 n
             } else {
@@ -921,7 +963,7 @@ impl<'a> Meta<'a> {
                         }
                     }
                     Kind::Nested(c) => {
-                        let k = if p.array { cur.varint32()? } else { 1 };
+                        let k = if p.array { cur.count()? } else { 1 };
                         for _ in 0..k {
                             self.skip_nested(cur, base, c)?;
                         }
@@ -1111,10 +1153,15 @@ impl<'a> Reader<'a> {
                 self.cur.pos = end;
                 continue;
             };
+            // The event's fields are read inside the event.
             let base = self.cur.pos;
+            let mut event = Cursor {
+                buf: &self.cur.buf[..end.min(self.cur.buf.len())],
+                pos: base,
+            };
             let v = &mut self.values;
             v.reset();
-            meta.read_object(&mut self.cur, base, &meta.events[kind].1, v)?;
+            meta.read_object(&mut event, base, &meta.events[kind].1, v)?;
             self.cur.pos = end;
             let n = v.num;
             let correlation = Correlation {
@@ -1176,14 +1223,23 @@ impl<'a> Reader<'a> {
         let (size, cp, meta) = self
             .read_header(pos)
             .map_err(|e| message(format!("error reading chunk header: {e}")))?;
-        let classes = read_metadata(self.cur.buf, (pos as i64).wrapping_add(meta))
+        // The metadata and the pools are read inside the chunk, so no
+        // chunk reads another's bytes.
+        let whole = self.cur.buf;
+        let limit = (pos as u64)
+            .saturating_add(size as u64)
+            .min(whole.len() as u64) as usize;
+        let chunk = &whole[..limit];
+        let classes = read_metadata(chunk, (pos as i64).wrapping_add(meta))
             .and_then(Meta::new)
             .map_err(|e| message(format!("error reading metadata: {e}")))?;
         self.meta = Some(classes);
         self.pools.clear();
         let cp_pos = (pos as i64).wrapping_add(cp);
-        self.read_pools(cp_pos)
-            .map_err(|e| message(format!("error reading CP: {e} @ {cp_pos}")))?;
+        self.cur.buf = chunk;
+        let pools = self.read_pools(cp_pos, size as u64);
+        self.cur.buf = whole;
+        pools.map_err(|e| message(format!("error reading CP: {e} @ {cp_pos}")))?;
         for s in self.pools.symbols.values_mut() {
             if let Cow::Owned(n) = merge_generated_class(Cow::Borrowed(s.as_ref())) {
                 *s = Cow::Owned(n);
@@ -1221,24 +1277,34 @@ impl<'a> Reader<'a> {
         if cp <= 0 || meta <= 0 {
             return Err(message(format!("invalid offsets: cp {cp} meta {meta}")));
         }
-        if size <= 0 {
+        if size < CHUNK_HEADER_SIZE as i64 {
             return Err(message(format!("invalid size: {size}")));
         }
         self.ticks_per_second = i64_at(56) as u64;
         Ok((size, cp, meta))
     }
 
-    /// The constant pool events, from the first at `pos` along their deltas.
-    fn read_pools(&mut self, mut pos: i64) -> Read<()> {
+    /// The constant pool events, from the first at `pos` along their deltas,
+    /// all inside the chunk. An event is read once, and together they read
+    /// no more bytes than the chunk holds.
+    fn read_pools(&mut self, mut pos: i64, chunk_size: u64) -> Read<()> {
+        let mut visited = std::collections::HashSet::new();
+        let mut read: u64 = 0;
         loop {
-            self.cur.pos = seek(self.cur.buf, pos)?;
+            if !visited.insert(pos) {
+                return Err(message(format!(
+                    "constant pool event at {pos} is reached twice"
+                )));
+            }
+            let start = seek(self.cur.buf, pos)?;
+            self.cur.pos = start;
             self.cur.varlong()?;
             self.cur.varlong()?;
             self.cur.varlong()?;
             self.cur.varlong()?;
             let delta = self.cur.varlong()? as i64;
             self.cur.varint32()?;
-            let n = self.cur.varint32()?;
+            let n = self.cur.count()?;
             for _ in 0..n {
                 let ty = self.cur.varlong()? as i64;
                 let meta = self.meta.as_mut().ok_or(ReadError::Eof)?;
@@ -1255,6 +1321,12 @@ impl<'a> Reader<'a> {
                     let meta = self.meta.as_ref().expect("read above");
                     message(format!("error reading {} {e}", meta.classes[class]))
                 })?;
+            }
+            read += (self.cur.pos - start) as u64;
+            if read > chunk_size {
+                return Err(message(
+                    "constant pool events read more than their chunk holds".to_string(),
+                ));
             }
             if delta == 0 {
                 return Ok(());
@@ -1276,7 +1348,7 @@ impl<'a> Reader<'a> {
         }
         let cur = &mut self.cur;
         let base = cur.pos;
-        let n = cur.varint32()?;
+        let n = cur.count()?;
         let v = &mut self.values;
         for _ in 0..n {
             let id = cur.varlong()?;

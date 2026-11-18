@@ -137,6 +137,11 @@ struct Builder {
     functions: IdMap<u32, u64>,
     locations: IdMap<(u32, u32), u64>,
     samples: IdMap<(u64, Correlation), usize>,
+    /// A lower bound of the samples' encoded size. Past the model's profile
+    /// size limit no sample is added: the profile is refused for its size
+    /// whatever else it would hold, and the recording cannot grow it
+    /// further.
+    held: u64,
 }
 
 impl Builder {
@@ -157,6 +162,7 @@ impl Builder {
             functions: IdMap::default(),
             locations: IdMap::default(),
             samples: IdMap::default(),
+            held: 0,
         };
         b.intern("");
         for (ty, unit) in kind.sample_types {
@@ -379,6 +385,9 @@ impl Builders {
             }
             return;
         }
+        if b.held > MAX_PROFILE_SIZE_BYTES {
+            return;
+        }
         let mut location_id = Vec::with_capacity(frames.len());
         for f in frames {
             let key = (f.method as u32, f.line);
@@ -420,8 +429,13 @@ impl Builders {
             b.locations.insert(key, id);
             location_id.push(id);
         }
-        let value = values.iter().map(|v| v.wrapping_mul(mul)).collect();
+        let value: Vec<i64> = values.iter().map(|v| v.wrapping_mul(mul)).collect();
         let label = b.sample_labels(labels, correlation);
+        // A sample encodes in at least its tag and length, a byte per
+        // location id and per value, and two bytes per label.
+        b.held = b.held.saturating_add(
+            2 + location_id.len() as u64 + value.len() as u64 + 2 * label.len() as u64,
+        );
         b.samples
             .insert((stack, *correlation), b.profile.sample.len());
         b.profile.sample.push(Sample {
