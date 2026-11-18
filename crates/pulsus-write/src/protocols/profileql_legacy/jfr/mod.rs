@@ -554,10 +554,33 @@ pub fn parse_jfr(
     sample_rate: u32,
 ) -> Result<JfrProfiles, String> {
     let budget = Budget::new(budget_bytes(body.len()));
-    let over = || format!("jfr parser ParseEvent error: {OVER_BUDGET}");
     if !budget.charge(snapshot_bytes(labels)) {
-        return Err(over());
+        return Err(over_budget());
     }
+    parse_with(
+        body,
+        labels,
+        time_nanos,
+        duration_nanos,
+        sample_rate,
+        budget,
+    )
+}
+
+fn over_budget() -> String {
+    format!("jfr parser ParseEvent error: {OVER_BUDGET}")
+}
+
+/// [`parse_jfr`] under `budget`, the labels already charged to it.
+fn parse_with(
+    body: &[u8],
+    labels: &LabelsSnapshot,
+    time_nanos: i64,
+    duration_nanos: i64,
+    sample_rate: u32,
+    budget: Budget,
+) -> Result<JfrProfiles, String> {
+    let over = over_budget;
     let mut reader = Reader::new(body, budget.clone());
     let mut builders = Builders::new(time_nanos, duration_nanos, sample_rate).with_budget(budget);
     while let Some(event) = reader.next_event()? {
@@ -592,10 +615,16 @@ fn decompress(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
 }
 
 /// The form's `jfr` and `labels` parts (`profile.go:93-134`).
+/// The most bytes a decoded labels part holds in memory per byte of it:
+/// its smallest map entry is four bytes and becomes a table slot of a key
+/// and a string, twice over for the table's growth.
+pub const LABELS_BYTES_PER_PART_BYTE: u64 = 32;
+
+/// The form's `jfr` part and its `labels` part, not yet decoded.
 fn read_form<'b>(
     content_type: &str,
     body: &'b [u8],
-) -> Result<(Cow<'b, [u8]>, LabelsSnapshot), String> {
+) -> Result<(Cow<'b, [u8]>, Option<Cow<'b, [u8]>>), String> {
     let boundary = boundary_of(content_type).ok_or("malformed multipart content type header")?;
     let parts = file_parts(body, &boundary)?;
     let field = |name: &str| {
@@ -608,13 +637,21 @@ fn read_form<'b>(
     let jfr = field("jfr").ok_or("jfr field is required")?;
     let jfr =
         decompress(jfr).map_err(|e| format!("loadJFRFromForm failed to decompress jfr: {e}"))?;
-    let mut labels = LabelsSnapshot::default();
-    if let Some(part) = field("labels") {
-        let part = decompress(part)
-            .map_err(|e| format!("loadJFRFromForm failed to decompress labels: {e}"))?;
-        labels = LabelsSnapshot::decode(part.as_ref())
-            .map_err(|e| format!("failed to parse labels form field: {e}"))?;
-    }
+    let labels = match field("labels") {
+        Some(part) => {
+            let part = decompress(part)
+                .map_err(|e| format!("loadJFRFromForm failed to decompress labels: {e}"))?;
+            // A part sent as it is has the gzipped part's limit too.
+            if part.len() as u64 > MAX_PROFILE_SIZE_BYTES {
+                return Err(format!(
+                    "loadJFRFromForm failed to decompress labels: decompressed size exceeds \
+                     maximum allowed size of {MAX_PROFILE_SIZE_BYTES} bytes"
+                ));
+            }
+            Some(part)
+        }
+        None => None,
+    };
     Ok((jfr, labels))
 }
 
@@ -627,14 +664,32 @@ pub fn jfr_inputs(
     body: &[u8],
     now_ns: i64,
 ) -> Result<Vec<ProfileInput>, String> {
-    let (jfr, labels) = if content_type.contains("multipart/form-data") {
+    let (jfr, part) = if content_type.contains("multipart/form-data") {
         read_form(content_type, body)?
     } else {
-        (Cow::Borrowed(body), LabelsSnapshot::default())
+        (Cow::Borrowed(body), None)
     };
+    let part_len = part.as_ref().map_or(0, |p| p.len());
+    let budget = Budget::new(budget_bytes(jfr.len().saturating_add(part_len)));
+    let mut labels = LabelsSnapshot::default();
+    if let Some(part) = part {
+        // Charged at the most it can decode to, before it is decoded.
+        if !budget.charge(part_len as u64 * LABELS_BYTES_PER_PART_BYTE) {
+            return Err(over_budget());
+        }
+        labels = LabelsSnapshot::decode(part.as_ref())
+            .map_err(|e| format!("failed to parse labels form field: {e}"))?;
+    }
     let time_nanos = query.from_ns.unwrap_or(now_ns);
     let duration_nanos = query.until_ns.unwrap_or(now_ns).wrapping_sub(time_nanos);
-    let out = parse_jfr(&jfr, &labels, time_nanos, duration_nanos, query.sample_rate)?;
+    let out = parse_with(
+        &jfr,
+        &labels,
+        time_nanos,
+        duration_nanos,
+        query.sample_rate,
+        budget,
+    )?;
 
     let service = query
         .name
