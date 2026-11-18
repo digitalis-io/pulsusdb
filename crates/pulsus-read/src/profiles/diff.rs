@@ -1,6 +1,7 @@
 //! Issue #827: `Diff` planned as one statement (S7) — both selections'
 //! merged trees side by side, one row per node of their union, computed in
-//! ClickHouse. `super::flamegraph_diff` trims each side and combines them.
+//! ClickHouse. `super::flamegraph_diff` trims each side with its own
+//! `max_nodes` and combines them.
 //!
 //! Each side is one branch that sums its own samples per stack; the
 //! branches are `UNION ALL`-ed and summed per stack into `vl` and `vr`,
@@ -16,12 +17,12 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
 use super::tree::{self, TreeRequest};
 
-/// A planned `Diff`: S7's text and the resolved `max_nodes` both sides and
-/// the diff use.
+/// A planned `Diff`: S7's text and each side's resolved `max_nodes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     pub sql: String,
-    pub max_nodes: i64,
+    pub left_max_nodes: i64,
+    pub right_max_nodes: i64,
 }
 
 /// One node of the union of the two merged trees, as S7 returns it. A
@@ -40,8 +41,8 @@ pub struct DiffRow {
 
 /// Plans `left` against `right` for `tenant`: `Ok(None)` when both windows
 /// end before the lookback floor, so nothing is read. In the order: the
-/// larger `max_nodes` of the two, then the left side, then the right
-/// ([`tree::side`]). A side whose window ends before the floor has no
+/// left side's `max_nodes`, then the right's, then the left side, then the
+/// right ([`tree::side`]). A side whose window ends before the floor has no
 /// branch, and its sums are 0.
 pub fn plan(
     tenant: &Tenant,
@@ -50,11 +51,8 @@ pub fn plan(
     right: &TreeRequest<'_>,
     now_ms: i64,
 ) -> Result<Option<Planned>, ProfilesReadError> {
-    let raw = left
-        .max_nodes
-        .unwrap_or(0)
-        .max(right.max_nodes.unwrap_or(0));
-    let max_nodes = tree::resolve_max_nodes(raw, config)?;
+    let left_max_nodes = tree::resolve_max_nodes(left.max_nodes.unwrap_or(0), config)?;
+    let right_max_nodes = tree::resolve_max_nodes(right.max_nodes.unwrap_or(0), config)?;
     let sides = [
         tree::side(tenant, config, left, now_ms)?,
         tree::side(tenant, config, right, now_ms)?,
@@ -149,7 +147,11 @@ ARRAY JOIN arrayEnumerate(node_ids) AS i
 GROUP BY node",
         branches = branches.join("\n      UNION ALL\n"),
     );
-    Ok(Some(Planned { sql, max_nodes }))
+    Ok(Some(Planned {
+        sql,
+        left_max_nodes,
+        right_max_nodes,
+    }))
 }
 
 #[cfg(test)]
@@ -381,10 +383,10 @@ GROUP BY node";
         assert!(!sql.contains("arraySlice"), "{sql}");
     }
 
-    /// D6: the larger of the two `max_nodes` applies, resolved and refused
-    /// as the flame graph's.
+    /// D6: each side resolves its own `max_nodes`, as its flame graph does,
+    /// the left first; each is refused as the flame graph's.
     #[test]
-    fn d6_the_larger_max_nodes_applies() {
+    fn d6_each_side_resolves_its_own_max_nodes() {
         let with = |l: Option<i64>, r: Option<i64>| {
             plan(
                 &tenant("t1"),
@@ -399,12 +401,10 @@ GROUP BY node";
                 },
                 END,
             )
-            .map(|p| p.map(|p| p.max_nodes))
+            .map(|p| p.map(|p| (p.left_max_nodes, p.right_max_nodes)))
         };
-        assert_eq!(with(Some(4), None), Ok(Some(4)));
-        assert_eq!(with(None, None), Ok(Some(8_192)));
-        assert_eq!(with(Some(0), Some(0)), Ok(Some(8_192)));
-        assert_eq!(with(Some(-1), Some(5)), Ok(Some(5)));
+        assert_eq!(with(Some(4), None), Ok(Some((4, 8_192))));
+        assert_eq!(with(None, None), Ok(Some((8_192, 8_192))));
         assert_eq!(
             with(Some(1_048_577), Some(1)),
             Err(ProfilesReadError::InvalidArgument(
@@ -412,9 +412,9 @@ GROUP BY node";
             ))
         );
         assert_eq!(
-            with(Some(-1), Some(-2)),
+            with(Some(1), Some(1_048_577)),
             Err(ProfilesReadError::InvalidArgument(
-                "max flamegraph nodes limit must be set (max allowed 1048576)".to_string()
+                "max flamegraph nodes limit 1048577 is greater than allowed 1048576".to_string()
             ))
         );
     }

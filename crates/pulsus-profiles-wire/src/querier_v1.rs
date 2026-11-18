@@ -161,14 +161,22 @@ pub struct SelectMergeStacktracesRequest {
     pub span_selector: Vec<String>,
 }
 
-/// `SelectMergeStacktraces`' response: the flame graph, field 1. The
-/// tree, DOT and pprof fields are later parts' (#828, #829).
+/// `SelectMergeStacktraces`' response: the flame graph, field 1, and the
+/// trimmed tree's bytes, field 2. The DOT and pprof fields are later
+/// parts' (#828, #829).
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeStacktracesResponse {
     #[prost(message, optional, tag = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flamegraph: Option<FlameGraph>,
+    #[prost(bytes = "vec", tag = "2")]
+    #[serde(
+        serialize_with = "crate::json::bytes_ser",
+        deserialize_with = "crate::json::bytes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tree: Vec<u8>,
 }
 
 /// A flame graph: the names, and per level the nodes as

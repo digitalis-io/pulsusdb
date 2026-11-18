@@ -2,7 +2,9 @@
 //! every receiver to the `pulsusdb` binary and to the pinned reference build,
 //! under two tenants, and every request the datasource and the exploration
 //! app send is compared between the two, and against what the fixture says
-//! the answer must be.
+//! the answer must be. Part B of issues #823, #824, #825 and #827 adds
+//! the flame graph, the series, the heatmap and the diff (C15–C30) over a
+//! second pair of tenants holding the query fixture.
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -45,11 +47,14 @@ use prost::Message;
 use pulsus_profiles_wire::google_v1;
 use pulsus_profiles_wire::push_v1::{PushRequest, PushResponse, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
-    FlameGraph, ProfileTypesRequest, ProfileTypesResponse, SelectMergeStacktracesRequest,
-    SelectMergeStacktracesResponse, SeriesRequest, SeriesResponse,
+    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileTypesRequest,
+    ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
+    SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest, LabelValuesResponse,
+    HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
+    LabelValuesRequest, LabelValuesResponse, Point, Series,
 };
 use serde_json::{Value, json};
 
@@ -74,9 +79,14 @@ const LEDGER_PHRASE: &str = "the profiles differential's ledger";
 const HOUR_MS: i64 = 3_600_000;
 
 /// Every row's `rx` value, sorted.
-const RX: [&str; 10] = [
+const RX: [&str; 15] = [
+    "ingest-folded",
+    "ingest-lines",
     "ingest-multipart",
     "ingest-pprof",
+    "ingest-speedscope",
+    "ingest-tree",
+    "ingest-trie",
     "only",
     "otlp-grpc",
     "otlp-json",
@@ -88,9 +98,14 @@ const RX: [&str; 10] = [
 ];
 
 /// The `service_name` values the fixture stores under either tenant.
-const SERVICES: [&str; 10] = [
+const SERVICES: [&str; 15] = [
+    "svc-ingest-folded",
+    "svc-ingest-lines",
     "svc-ingest-multipart.cpu",
     "svc-ingest-pprof.cpu",
+    "svc-ingest-speedscope",
+    "svc-ingest-tree",
+    "svc-ingest-trie",
     "svc-only",
     "svc-otlp-grpc",
     "svc-otlp-json",
@@ -100,6 +115,32 @@ const SERVICES: [&str; 10] = [
     "unknown_service",
     "unknown_service:fixture-exe",
 ];
+
+/// The query fixture's `rx` values (§3.2), sorted.
+const Q_RX: [&str; 15] = [
+    "q-allother",
+    "q-d4l",
+    "q-d4r",
+    "q-d5l",
+    "q-d5r",
+    "q-d7",
+    "q-other",
+    "q-span",
+    "q-trim",
+    "q-ts-1",
+    "q-ts-2",
+    "q-ts-3",
+    "q-ts-4",
+    "q-ts-5",
+    "q-ts2",
+];
+
+/// `q-span`'s two span ids (§3.2).
+const SPAN_1: &str = "0102030405060708";
+const SPAN_2: &str = "1112131415161718";
+
+/// The `cpu` value of one count under `q1`; `q2` holds 100 times it.
+const Q1_UNIT: i64 = 10_000_000;
 
 // ---------------------------------------------------------------------
 // The case table
@@ -117,6 +158,8 @@ enum Tenancy {
     Both,
     /// Run once, with no `X-Scope-OrgID`.
     Absent,
+    /// Run under `q1-<run>` and `q2-<run>`, the query fixture's pair.
+    Query,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +179,31 @@ enum Method {
         label_names: &'static [&'static str],
         matchers: &'static [&'static str],
     },
+    /// `SelectMergeStacktraces` of `TYPE_A` over `W`.
+    Merge {
+        selector: &'static str,
+        max_nodes: Option<i64>,
+        span: &'static [&'static str],
+    },
+    /// `SelectSeries` of `TYPE_A` over `Q`, step 15 s.
+    SelectSeries {
+        selector: &'static str,
+        group_by: &'static [&'static str],
+    },
+    /// `SelectHeatmap` of `TYPE_A` over `Q`, `group_by` `[]`; `step` in
+    /// seconds.
+    Heatmap {
+        selector: &'static str,
+        step: i64,
+        query_type: i32,
+    },
+    /// `Diff` of two `TYPE_A` selections over `W`.
+    Diff {
+        left: &'static str,
+        right: &'static str,
+        left_max_nodes: Option<i64>,
+        right_max_nodes: Option<i64>,
+    },
 }
 
 impl Method {
@@ -145,8 +213,61 @@ impl Method {
             Method::LabelNames(_) => "LabelNames",
             Method::LabelValues(..) => "LabelValues",
             Method::Series { .. } => "Series",
+            Method::Merge { .. } => "SelectMergeStacktraces",
+            Method::SelectSeries { .. } => "SelectSeries",
+            Method::Heatmap { .. } => "SelectHeatmap",
+            Method::Diff { .. } => "Diff",
         }
     }
+
+    /// One of #822's four catalogue methods.
+    fn is_catalogue(&self) -> bool {
+        matches!(
+            self,
+            Method::ProfileTypes(_)
+                | Method::LabelNames(_)
+                | Method::LabelValues(..)
+                | Method::Series { .. }
+        )
+    }
+}
+
+/// A flame graph as §4 writes it: every value but the name index is a
+/// multiple of the tenant's unit.
+#[derive(Debug)]
+struct Graph {
+    names: &'static [&'static str],
+    levels: &'static [&'static [i64]],
+    total: i64,
+    max_self: i64,
+}
+
+/// A diff flame graph as §4 writes it, in the tenant's unit.
+#[derive(Debug)]
+struct DiffGraph {
+    names: &'static [&'static str],
+    levels: &'static [&'static [i64]],
+    total: i64,
+    max_self: i64,
+    left_ticks: i64,
+    right_ticks: i64,
+}
+
+/// One series: its labels, and its points as `(seconds after S0, value in
+/// the tenant's unit)`.
+type SeriesPoints = (
+    &'static [(&'static str, &'static str)],
+    &'static [(i64, i64)],
+);
+
+/// A heatmap of one series: its labels, its slots as `(seconds after S0,
+/// [(bucket, count)])`, and its 20 bucket starts as `first + i × step`, both
+/// in tenths of the tenant's unit.
+#[derive(Debug)]
+struct Slots {
+    labels: &'static [(&'static str, &'static str)],
+    slots: &'static [(i64, &'static [(usize, i32)])],
+    y_min: (i64, i64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +301,17 @@ enum Fixture {
     LandingSets,
     /// C14's four sets of row 5.
     PushProtoSets,
+    /// C15's flame graph: V's nodes at the sum of the tenant's `TYPE_A`
+    /// values.
+    Merged,
+    /// This flame graph.
+    Graph(&'static Graph),
+    /// This diff flame graph.
+    DiffGraph(&'static DiffGraph),
+    /// Exactly these series, in this order.
+    Points(&'static [SeriesPoints]),
+    /// Exactly this heatmap series.
+    Slots(&'static Slots),
 }
 
 /// One pinned answer of a ledger case: its status, and its body when the
@@ -197,6 +329,13 @@ enum Expect {
         row: &'static str,
         ours: Pin,
         theirs: Pin,
+    },
+    /// A ledger case on a flame graph (R3): each server's decoded graph is
+    /// its own, and the bodies differ.
+    LedgerGraph {
+        row: &'static str,
+        ours: &'static Graph,
+        theirs: &'static Graph,
     },
 }
 
@@ -225,6 +364,192 @@ const fn json_utf8(method: Method) -> Request {
         tenancy: Tenancy::Both,
     }
 }
+
+/// A proto request under the query fixture's pair.
+const fn query(method: Method) -> Request {
+    Request {
+        method,
+        encoding: Encoding::Proto,
+        utf8: false,
+        tenancy: Tenancy::Query,
+    }
+}
+
+const fn merge(selector: &'static str, max_nodes: Option<i64>) -> Method {
+    Method::Merge {
+        selector,
+        max_nodes,
+        span: &[],
+    }
+}
+
+const fn diff(
+    left: &'static str,
+    right: &'static str,
+    left_max_nodes: Option<i64>,
+    right_max_nodes: Option<i64>,
+) -> Method {
+    Method::Diff {
+        left,
+        right,
+        left_max_nodes,
+        right_max_nodes,
+    }
+}
+
+/// C16's and C18's graph: `q-trim` uncut.
+static Q_TRIM: Graph = Graph {
+    names: &["total", "main", "other", "e", "f", "d", "a", "c", "b"],
+    levels: &[
+        &[0, 32, 0, 0],
+        &[0, 32, 0, 1],
+        &[0, 24, 2, 6, 0, 3, 3, 5, 0, 1, 0, 3, 0, 4, 4, 2],
+        &[2, 17, 17, 8, 0, 5, 5, 7, 3, 1, 1, 4],
+    ],
+    total: 32,
+    max_self: 17,
+};
+
+/// C17's graph (§0): `q-trim` at `max_nodes` 4.
+static Q_TRIM_4: Graph = Graph {
+    names: &["total", "main", "other", "a", "b"],
+    levels: &[
+        &[0, 32, 0, 0],
+        &[0, 32, 0, 1],
+        &[0, 24, 2, 3, 0, 8, 8, 2],
+        &[2, 17, 17, 4, 0, 5, 5, 2],
+    ],
+    total: 32,
+    max_self: 17,
+};
+
+static Q_ALLOTHER: Graph = Graph {
+    names: &["total", "other"],
+    levels: &[&[0, 5, 0, 0], &[0, 5, 5, 1]],
+    total: 5,
+    max_self: 5,
+};
+
+/// C20, ours: the kept `other` takes the cut `b` (defects entry 41).
+static Q_OTHER_OURS: Graph = Graph {
+    names: &["total", "main", "other", "a"],
+    levels: &[&[0, 16, 0, 0], &[0, 16, 0, 1], &[0, 10, 10, 3, 0, 6, 6, 2]],
+    total: 16,
+    max_self: 10,
+};
+
+/// C20, the reference: the cut `b` is lost.
+static Q_OTHER_THEIRS: Graph = Graph {
+    names: &["total", "main", "other", "a"],
+    levels: &[&[0, 15, 0, 0], &[0, 15, 0, 1], &[0, 10, 10, 3, 0, 5, 5, 2]],
+    total: 15,
+    max_self: 10,
+};
+
+/// C21's graph: `q-span`'s samples in span 1.
+static Q_SPAN_1: Graph = Graph {
+    names: &["total", "main", "a", "c", "b"],
+    levels: &[
+        &[0, 5, 0, 0],
+        &[0, 5, 0, 1],
+        &[0, 5, 0, 2],
+        &[0, 3, 3, 4, 0, 2, 2, 3],
+    ],
+    total: 5,
+    max_self: 3,
+};
+
+static D5: DiffGraph = DiffGraph {
+    names: &["total", "main", "other", "x", "a"],
+    levels: &[
+        &[0, 6, 0, 0, 1, 0, 0],
+        &[0, 6, 0, 0, 1, 0, 1],
+        &[0, 2, 2, 0, 0, 0, 4, 0, 4, 0, 0, 1, 0, 2],
+        &[2, 4, 4, 0, 1, 1, 3],
+    ],
+    total: 7,
+    max_self: 4,
+    left_ticks: 6,
+    right_ticks: 1,
+};
+
+static D4: DiffGraph = DiffGraph {
+    names: &["total", "main", "other", "c", "b", "a"],
+    levels: &[
+        &[0, 9, 0, 0, 10, 0, 0],
+        &[0, 9, 0, 0, 10, 0, 1],
+        &[
+            0, 4, 4, 0, 0, 0, 5, 0, 3, 3, 0, 3, 3, 4, 0, 0, 0, 0, 6, 6, 3, 0, 2, 2, 0, 1, 1, 2,
+        ],
+    ],
+    total: 19,
+    max_self: 6,
+    left_ticks: 9,
+    right_ticks: 10,
+};
+
+static D7: DiffGraph = DiffGraph {
+    names: &["total", "main", "other", "a"],
+    levels: &[
+        &[0, 11, 0, 0, 11, 0, 0],
+        &[0, 11, 0, 0, 11, 0, 1],
+        &[0, 10, 10, 0, 10, 10, 3, 0, 1, 1, 0, 1, 1, 2],
+    ],
+    total: 22,
+    max_self: 10,
+    left_ticks: 11,
+    right_ticks: 11,
+};
+
+/// C29: the left cut (`c` in `other`), the right whole.
+static D4_LEFT_CUT: DiffGraph = DiffGraph {
+    names: &["total", "main", "other", "c", "b", "a"],
+    levels: &[
+        &[0, 9, 0, 0, 10, 0, 0],
+        &[0, 9, 0, 0, 10, 0, 1],
+        &[
+            0, 4, 4, 0, 1, 1, 5, 0, 3, 3, 0, 3, 3, 4, 0, 0, 0, 0, 6, 6, 3, 0, 2, 2, 0, 0, 0, 2,
+        ],
+    ],
+    total: 19,
+    max_self: 6,
+    left_ticks: 9,
+    right_ticks: 10,
+};
+
+/// C30: the left whole, the right cut (`a` in `other`).
+static D4_RIGHT_CUT: DiffGraph = DiffGraph {
+    names: &["total", "main", "other", "c", "b", "a"],
+    levels: &[
+        &[0, 9, 0, 0, 10, 0, 0],
+        &[0, 9, 0, 0, 10, 0, 1],
+        &[
+            0, 4, 4, 0, 0, 0, 5, 0, 3, 3, 0, 3, 3, 4, 0, 2, 2, 0, 6, 6, 3, 0, 0, 0, 0, 1, 1, 2,
+        ],
+    ],
+    total: 19,
+    max_self: 6,
+    left_ticks: 9,
+    right_ticks: 10,
+};
+
+static Q_TS_POINTS: &[(i64, i64)] = &[(0, 6), (15, 12), (30, 42)];
+
+static C24_SLOTS: Slots = Slots {
+    labels: &[],
+    slots: &[
+        (0, &[(0, 1)]),
+        (15, &[(0, 1), (5, 1), (19, 1)]),
+        (30, &[(10, 1), (15, 1)]),
+    ],
+    y_min: (60, 12),
+};
+
+static C25_SLOTS: Slots = Slots {
+    labels: &[],
+    slots: &[(5, &[(0, 1), (19, 1)])],
+    y_min: (10, 2),
+};
 
 static CASES: &[Case] = &[
     Case {
@@ -326,6 +651,11 @@ static CASES: &[Case] = &[
         request: proto(Method::LabelValues("rx", &[r#"{env=~"prod"}"#]), false),
         expect: Expect::Parity(Fixture::Exactly {
             t1: &[
+                "ingest-folded",
+                "ingest-lines",
+                "ingest-speedscope",
+                "ingest-tree",
+                "ingest-trie",
                 "otlp-grpc",
                 "otlp-json",
                 "otlp-noservice",
@@ -334,6 +664,11 @@ static CASES: &[Case] = &[
                 "push-proto",
             ],
             t2: &[
+                "ingest-folded",
+                "ingest-lines",
+                "ingest-speedscope",
+                "ingest-tree",
+                "ingest-trie",
                 "otlp-grpc",
                 "otlp-json",
                 "otlp-noservice",
@@ -377,6 +712,158 @@ static CASES: &[Case] = &[
             matchers: &[r#"{env="prod"}"#, r#"{rx="push-proto"}"#],
         }),
         expect: Expect::Parity(Fixture::PushProtoSets),
+    },
+    Case {
+        id: "C15",
+        client: "datasource, default query",
+        request: proto(merge("{}", None), false),
+        expect: Expect::Parity(Fixture::Merged),
+    },
+    Case {
+        id: "C16",
+        client: "datasource",
+        request: query(merge(r#"{service_name="q-trim"}"#, None)),
+        expect: Expect::Parity(Fixture::Graph(&Q_TRIM)),
+    },
+    Case {
+        id: "C17",
+        client: "datasource, max nodes set",
+        request: query(merge(r#"{service_name="q-trim"}"#, Some(4))),
+        expect: Expect::Parity(Fixture::Graph(&Q_TRIM_4)),
+    },
+    Case {
+        id: "C18",
+        client: "datasource, max nodes set",
+        request: query(merge(r#"{service_name="q-trim"}"#, Some(9))),
+        expect: Expect::Parity(Fixture::Graph(&Q_TRIM)),
+    },
+    Case {
+        id: "C19",
+        client: "datasource",
+        request: query(merge(r#"{service_name="q-allother"}"#, None)),
+        expect: Expect::Parity(Fixture::Graph(&Q_ALLOTHER)),
+    },
+    Case {
+        id: "C20",
+        client: "datasource, max nodes set",
+        request: query(merge(r#"{service_name="q-other"}"#, Some(3))),
+        expect: Expect::LedgerGraph {
+            row: "flamegraph-named-other-keeps-cut-values",
+            ours: &Q_OTHER_OURS,
+            theirs: &Q_OTHER_THEIRS,
+        },
+    },
+    Case {
+        id: "C21",
+        client: "datasource, trace to profile",
+        request: query(Method::Merge {
+            selector: r#"{service_name="q-span"}"#,
+            max_nodes: None,
+            span: &[SPAN_1],
+        }),
+        expect: Expect::Parity(Fixture::Graph(&Q_SPAN_1)),
+    },
+    Case {
+        id: "C22",
+        client: "datasource, one service",
+        request: query(Method::SelectSeries {
+            selector: r#"{service_name="q-ts"}"#,
+            group_by: &[],
+        }),
+        expect: Expect::Parity(Fixture::Points(&[(&[], Q_TS_POINTS)])),
+    },
+    Case {
+        id: "C23",
+        client: "datasource, by service",
+        request: query(Method::SelectSeries {
+            selector: "{}",
+            group_by: &["service_name"],
+        }),
+        expect: Expect::Parity(Fixture::Points(&[
+            (&[("service_name", "q-ts")], Q_TS_POINTS),
+            (&[("service_name", "q-ts2")], &[(15, 30)]),
+            (&[("service_name", "q-span")], &[(15, 6)]),
+        ])),
+    },
+    Case {
+        id: "C24",
+        client: "datasource, heatmap",
+        request: query(Method::Heatmap {
+            selector: "{}",
+            step: 15,
+            query_type: 1,
+        }),
+        expect: Expect::Parity(Fixture::Slots(&C24_SLOTS)),
+    },
+    Case {
+        id: "C25",
+        client: "exploration app, span heatmap",
+        request: Request {
+            method: Method::Heatmap {
+                selector: r#"{service_name="q-span"}"#,
+                step: 1,
+                query_type: 2,
+            },
+            encoding: Encoding::Json,
+            utf8: true,
+            tenancy: Tenancy::Query,
+        },
+        expect: Expect::Parity(Fixture::Slots(&C25_SLOTS)),
+    },
+    Case {
+        id: "C26",
+        client: "the diff, issue #827",
+        request: query(diff(
+            r#"{service_name="q-d5l"}"#,
+            r#"{service_name="q-d5r"}"#,
+            None,
+            None,
+        )),
+        expect: Expect::Parity(Fixture::DiffGraph(&D5)),
+    },
+    Case {
+        id: "C27",
+        client: "the diff, issue #827",
+        request: query(diff(
+            r#"{service_name="q-d4l"}"#,
+            r#"{service_name="q-d4r"}"#,
+            Some(3),
+            Some(3),
+        )),
+        expect: Expect::Parity(Fixture::DiffGraph(&D4)),
+    },
+    Case {
+        id: "C28",
+        client: "the diff, issue #827",
+        request: query(diff(
+            r#"{service_name="q-d7"}"#,
+            r#"{service_name="q-d7"}"#,
+            Some(2),
+            Some(2),
+        )),
+        expect: Expect::Parity(Fixture::DiffGraph(&D7)),
+    },
+    Case {
+        id: "C29",
+        client: "the diff, a limit on the left only",
+        request: query(diff(
+            r#"{service_name="q-d4l"}"#,
+            r#"{service_name="q-d4r"}"#,
+            Some(3),
+            None,
+        )),
+        expect: Expect::Parity(Fixture::DiffGraph(&D4_LEFT_CUT)),
+    },
+    Case {
+        id: "C30",
+        client: "the diff, a limit on the right only",
+        request: query(diff(
+            r#"{service_name="q-d4l"}"#,
+            r#"{service_name="q-d4r"}"#,
+            None,
+            Some(3),
+        )),
+        expect: Expect::Parity(Fixture::DiffGraph(&D4_RIGHT_CUT)),
     },
 ];
 
@@ -452,7 +939,7 @@ fn the_ledger_and_the_cases_name_each_other() {
     let mut problems: Vec<String> = Vec::new();
 
     for case in CASES {
-        if let Expect::Ledger { row, .. } = case.expect
+        if let Expect::Ledger { row, .. } | Expect::LedgerGraph { row, .. } = case.expect
             && !headings.contains(row)
         {
             problems.push(format!(
@@ -471,7 +958,7 @@ fn the_ledger_and_the_cases_name_each_other() {
         };
         match CASES.iter().find(|c| c.id == case_id) {
             Some(Case {
-                expect: Expect::Ledger { row, .. },
+                expect: Expect::Ledger { row, .. } | Expect::LedgerGraph { row, .. },
                 ..
             }) if row == id => {}
             Some(_) => problems.push(format!(
@@ -770,9 +1257,21 @@ const COUNTS: [i64; 3] = [3, 2, 1];
 
 const CPU_PERIOD: i64 = 10_000_000;
 
-/// Profile P, or row 10's memory profile under `t2`, timed `time_ns`, every
-/// value times `scale`.
-fn pprof(time_ns: i64, scale: i64, memory: bool) -> google_v1::Profile {
+/// Which of profile P's forms [`pprof`] builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// P itself.
+    Cpu,
+    /// Row 10's memory profile under `t2`.
+    Memory,
+    /// `q-span`'s (§3.2): P with a sample label `span_id` in place of P's
+    /// labels.
+    Span,
+}
+
+/// Profile P in `form`, timed `time_ns`, every value times `scale`.
+fn pprof(time_ns: i64, scale: i64, form: Form) -> google_v1::Profile {
+    let memory = form == Form::Memory;
     let mut t = vec![String::new()];
     let types: &[(&str, &str)] = if memory {
         &[("alloc_space", "bytes")]
@@ -816,10 +1315,17 @@ fn pprof(time_ns: i64, scale: i64, memory: bool) -> google_v1::Profile {
         })
         .collect();
     let id_of = |n: &str| names.iter().position(|x| *x == n).expect("a function") as u64 + 1;
+    let spans = [
+        Some(("span_id", SPAN_1)),
+        Some(("span_id", SPAN_1)),
+        Some(("span_id", SPAN_2)),
+    ];
     let sample = STACKS
         .iter()
         .zip(COUNTS)
-        .map(|((stack, label), count)| {
+        .zip(spans)
+        .map(|(((stack, label), count), span)| {
+            let label = if form == Form::Span { span } else { *label };
             let value = if memory {
                 vec![count * 1000 * scale]
             } else {
@@ -1097,7 +1603,7 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
         }
         r
     };
-    let p = |i: i64| gzip(&pprof(at(i), scale, false).encode_to_vec());
+    let p = |i: i64| gzip(&pprof(at(i), scale, Form::Cpu).encode_to_vec());
     let mut out = vec![
         Push {
             rx: "otlp-proto",
@@ -1259,7 +1765,7 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
                 ("env", "t2-only"),
             ],
             // Already times 100: 3000, 2000, 1000.
-            gzip(&pprof(at(10), 1, true).encode_to_vec()),
+            gzip(&pprof(at(10), 1, Form::Memory).encode_to_vec()),
         )
     };
     out.push(Push {
@@ -1268,6 +1774,185 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
             path: "/push.v1.PusherService/Push".to_string(),
             headers: vec![("Content-Type", "application/proto".to_string())],
             body: push_request(&only_labels, only_profile).encode_to_vec(),
+            answer: PushAnswer::Connect,
+        },
+    });
+    // Rows 11–15 (§3.1): P's three stacks in each `/ingest` format.
+    let stacks = [
+        ("main;a;b", 3 * scale),
+        ("main;a;c", 2 * scale),
+        ("main", scale),
+    ];
+    let folded: String = stacks.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
+    let lines: String = stacks
+        .iter()
+        .map(|(k, v)| format!("{k}\n").repeat(*v as usize))
+        .collect();
+    let mut trie = Vec::new();
+    uvarint(&mut trie, 0);
+    uvarint(&mut trie, 0);
+    uvarint(&mut trie, 3);
+    for (k, v) in stacks {
+        uvarint(&mut trie, k.len() as u64);
+        trie.extend_from_slice(k.as_bytes());
+        uvarint(&mut trie, v as u64);
+        uvarint(&mut trie, 0);
+    }
+    let mut tree = Vec::new();
+    for (name, self_value, children) in [
+        ("", 0, 1),
+        ("main", scale, 1),
+        ("a", 0, 2),
+        ("b", 3 * scale, 0),
+        ("c", 2 * scale, 0),
+    ] {
+        uvarint(&mut tree, name.len() as u64);
+        tree.extend_from_slice(name.as_bytes());
+        uvarint(&mut tree, self_value as u64);
+        uvarint(&mut tree, children);
+    }
+    let speedscope = json!({
+        "$schema": "https://www.speedscope.app/file-format-schema.json",
+        "shared": {"frames": [{"name": "main"}, {"name": "a"}, {"name": "b"}, {"name": "c"}]},
+        "profiles": [{
+            "type": "sampled", "name": "", "unit": "milliseconds",
+            "startValue": 0, "endValue": 6,
+            "samples": [[0, 1, 2], [0, 1, 3], [0]],
+            "weights": [3 * scale, 2 * scale, scale],
+        }],
+    })
+    .to_string()
+    .into_bytes();
+    for (i, (rx, format, body)) in [
+        ("ingest-folded", "", folded.into_bytes()),
+        ("ingest-lines", "&format=lines", lines.into_bytes()),
+        ("ingest-trie", "&format=trie", trie),
+        ("ingest-tree", "&format=tree", tree),
+        ("ingest-speedscope", "&format=speedscope", speedscope),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let from = t0_s + 11 + i as i64;
+        out.push(Push {
+            rx,
+            transport: Transport::Http {
+                path: format!(
+                    "/ingest?name={}&from={from}&until={}{format}",
+                    encode_query(&format!("svc-{rx}.cpu{{rx={rx},env=prod}}")),
+                    from + 10
+                ),
+                headers: Vec::new(),
+                body,
+                answer: PushAnswer::Ingest,
+            },
+        });
+    }
+    out
+}
+
+fn uvarint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// The query fixture (§3.2): every count times 1 under `q1`, 100 under
+/// `q2`. Every push has its own `rx`.
+fn query_pushes(t0_s: i64, s0_s: i64, q1: bool) -> Vec<Push> {
+    let scale = if q1 { 1 } else { 100 };
+    let folded = |rx: &'static str, service: &str, at: i64, rows: &[(&str, i64)]| -> Push {
+        let body: String = rows
+            .iter()
+            .map(|(k, v)| format!("{k} {}\n", v * scale))
+            .collect();
+        Push {
+            rx,
+            transport: Transport::Http {
+                path: format!(
+                    "/ingest?name={}&from={at}&until={}",
+                    encode_query(&format!("{service}.cpu{{rx={rx}}}")),
+                    at + 10
+                ),
+                headers: Vec::new(),
+                body: body.into_bytes(),
+                answer: PushAnswer::Ingest,
+            },
+        }
+    };
+    let g4_left: &[(&str, i64)] = &[("main;a", 4), ("main;b", 3), ("main;c", 2)];
+    let g4_right: &[(&str, i64)] = &[("main;a", 1), ("main;b", 3), ("main;c", 6)];
+    let p = |k: i64| -> Vec<(&'static str, i64)> {
+        vec![("main;a;b", 3 * k), ("main;a;c", 2 * k), ("main", k)]
+    };
+    let mut out = vec![
+        folded(
+            "q-trim",
+            "q-trim",
+            t0_s + 1,
+            &[
+                ("main;a;b", 17),
+                ("main;a;c", 5),
+                ("main;d", 3),
+                ("main;a", 2),
+                ("main;e;f", 1),
+                ("main;other;x", 4),
+            ],
+        ),
+        folded(
+            "q-other",
+            "q-other",
+            t0_s + 2,
+            &[("main;a", 10), ("main;b", 1), ("main;other", 5)],
+        ),
+        folded(
+            "q-allother",
+            "q-allother",
+            t0_s + 3,
+            &[("other;x", 3), ("other;y", 2)],
+        ),
+        folded("q-d4l", "q-d4l", t0_s + 4, g4_left),
+        folded("q-d4r", "q-d4r", t0_s + 5, g4_right),
+        folded(
+            "q-d5l",
+            "q-d5l",
+            t0_s + 6,
+            &[("main;other;x", 4), ("main;a", 2)],
+        ),
+        folded("q-d5r", "q-d5r", t0_s + 7, &[("main;other;x", 1)]),
+        folded(
+            "q-d7",
+            "q-d7",
+            t0_s + 8,
+            &[("main;a", 10), ("main;other;x", 1)],
+        ),
+    ];
+    for (rx, at, k) in [
+        ("q-ts-1", s0_s - 15, 1),
+        ("q-ts-2", s0_s + 15, 2),
+        ("q-ts-3", s0_s + 20, 3),
+        ("q-ts-4", s0_s + 25, 4),
+        ("q-ts-5", s0_s + 61, 8),
+    ] {
+        out.push(folded(rx, "q-ts", at, &p(k)));
+    }
+    out.push(folded("q-ts2", "q-ts2", s0_s + 15, &p(5)));
+    out.push(Push {
+        rx: "q-span",
+        transport: Transport::Http {
+            path: "/push.v1.PusherService/Push".to_string(),
+            headers: vec![("Content-Type", "application/proto".to_string())],
+            body: push_request(
+                &[
+                    ("__name__", "process_cpu"),
+                    ("service_name", "q-span"),
+                    ("rx", "q-span"),
+                ],
+                gzip(&pprof((s0_s + 5) * 1_000_000_000, scale, Form::Span).encode_to_vec()),
+            )
+            .encode_to_vec(),
             answer: PushAnswer::Connect,
         },
     });
@@ -1293,8 +1978,16 @@ fn decoded(method: &str, encoding: Encoding, body: &[u8]) -> String {
         }),
         "LabelNames" => LabelNamesResponse::decode(body).map(|r| r.names.join(", ")),
         "LabelValues" => LabelValuesResponse::decode(body).map(|r| r.names.join(", ")),
-        "SelectMergeStacktraces" => SelectMergeStacktracesResponse::decode(body)
-            .map(|r| format!("{:?}", r.flamegraph.as_ref().map(nodes))),
+        "SelectMergeStacktraces" => SelectMergeStacktracesResponse::decode(body).map(|r| {
+            format!(
+                "{:?}, tree {} bytes",
+                r.flamegraph.as_ref().map(nodes),
+                r.tree.len()
+            )
+        }),
+        "SelectSeries" => SelectSeriesResponse::decode(body).map(|r| format!("{:?}", r.series)),
+        "SelectHeatmap" => SelectHeatmapResponse::decode(body).map(|r| format!("{:?}", r.series)),
+        "Diff" => DiffResponse::decode(body).map(|r| format!("{:?}", r.flamegraph)),
         "Push" => PushResponse::decode(body).map(|r| format!("{r:?}")),
         "Export" => ExportProfilesServiceResponse::decode(body).map(|r| format!("{r:?}")),
         _ => return String::from_utf8_lossy(body).into_owned(),
@@ -1342,7 +2035,63 @@ fn values(method: &Method, encoding: Encoding, body: &[u8]) -> Result<Vec<String
                 .map_err(|x| e(&x))
         }
         (Method::Series { .. }, _) => Err("a Series answer has label sets".to_string()),
+        _ => Err(format!("{} is not a catalogue method", method.name())),
     }
+}
+
+/// An answer decoded as `T` in `encoding`.
+fn decode_as<T>(encoding: Encoding, body: &[u8]) -> Result<T, String>
+where
+    T: Message + Default + serde::de::DeserializeOwned,
+{
+    match encoding {
+        Encoding::Proto => T::decode(body).map_err(|e| e.to_string()),
+        Encoding::Json => serde_json::from_slice(body).map_err(|e| e.to_string()),
+    }
+}
+
+/// The tenant's unit under the query fixture: `q1` (`first`) or `q2`.
+fn unit(first: bool) -> i64 {
+    if first { Q1_UNIT } else { 100 * Q1_UNIT }
+}
+
+/// `graph` in the unit `b`, as the wire message.
+fn flame_graph_of(graph: &Graph, b: i64) -> FlameGraph {
+    FlameGraph {
+        names: graph.names.iter().map(|n| n.to_string()).collect(),
+        levels: graph
+            .levels
+            .iter()
+            .map(|l| Level {
+                values: l
+                    .chunks(4)
+                    .flat_map(|c| [c[0] * b, c[1] * b, c[2] * b, c[3]])
+                    .collect(),
+            })
+            .collect(),
+        total: graph.total * b,
+        max_self: graph.max_self * b,
+    }
+}
+
+/// A flame-graph answer's decoded graph, against `graph` in the unit `b`.
+fn graph_failure(graph: &Graph, b: i64, encoding: Encoding, body: &[u8]) -> Option<String> {
+    let want = flame_graph_of(graph, b);
+    match decode_as::<SelectMergeStacktracesResponse>(encoding, body) {
+        Ok(r) if r.flamegraph.as_ref() == Some(&want) => None,
+        Ok(r) => Some(format!("flame graph {:?}, want {want:?}", r.flamegraph)),
+        Err(e) => Some(format!("undecodable: {e}")),
+    }
+}
+
+fn label_pairs(labels: &[(&str, &str)]) -> Vec<LabelPair> {
+    labels
+        .iter()
+        .map(|(n, v)| LabelPair {
+            name: n.to_string(),
+            value: v.to_string(),
+        })
+        .collect()
 }
 
 type LabelSet = BTreeSet<(String, String)>;
@@ -1397,23 +2146,148 @@ fn landing_sets(t1: bool) -> BTreeSet<LabelSet> {
     } else {
         out.insert(pair("svc-only", TYPE_M));
     }
+    for s in [
+        "svc-ingest-folded",
+        "svc-ingest-lines",
+        "svc-ingest-speedscope",
+        "svc-ingest-tree",
+        "svc-ingest-trie",
+    ] {
+        out.insert(pair(s, TYPE_A));
+    }
     out
 }
 
 /// Checks one server's answer to a fixture case, `None` when it holds.
 /// Every fixture case is a success: an error status fails here, whatever
-/// its body decodes as.
-fn fixture_failure(fixture: Fixture, case: &Case, t1: bool, res: &Res) -> Option<String> {
+/// its body decodes as. `t1` is the pair's first tenant; `s0_ms` is S0.
+fn fixture_failure(
+    fixture: Fixture,
+    case: &Case,
+    t1: bool,
+    s0_ms: i64,
+    res: &Res,
+) -> Option<String> {
     if res.status != 200 {
         return Some(format!("status {}, want 200", res.status));
     }
-    check_fixture(fixture, case, t1, &res.body)
+    check_fixture(fixture, case, t1, s0_ms, &res.body)
 }
 
 /// Checks a decoded answer against `fixture`, `None` when it holds.
-fn check_fixture(fixture: Fixture, case: &Case, t1: bool, body: &[u8]) -> Option<String> {
+fn check_fixture(
+    fixture: Fixture,
+    case: &Case,
+    t1: bool,
+    s0_ms: i64,
+    body: &[u8],
+) -> Option<String> {
     let method = &case.request.method;
     let encoding = case.request.encoding;
+    let b = unit(t1);
+    match fixture {
+        Fixture::Merged => {
+            let sum: i64 = value_checks(t1)
+                .iter()
+                .filter(|(_, ty, _)| *ty == TYPE_A)
+                .map(|(_, _, v)| v)
+                .sum();
+            let want = expected_nodes(sum);
+            return match decode_as::<SelectMergeStacktracesResponse>(encoding, body) {
+                Ok(r) => {
+                    let got = r.flamegraph.as_ref().map(nodes).unwrap_or_default();
+                    (got != want).then(|| format!("flame graph {got:?}, want {want:?}"))
+                }
+                Err(e) => Some(format!("undecodable: {e}")),
+            };
+        }
+        Fixture::Graph(graph) => return graph_failure(graph, b, encoding, body),
+        Fixture::DiffGraph(g) => {
+            let want = FlameGraphDiff {
+                names: g.names.iter().map(|n| n.to_string()).collect(),
+                levels: g
+                    .levels
+                    .iter()
+                    .map(|l| Level {
+                        values: l
+                            .chunks(7)
+                            .flat_map(|c| {
+                                [
+                                    c[0] * b,
+                                    c[1] * b,
+                                    c[2] * b,
+                                    c[3] * b,
+                                    c[4] * b,
+                                    c[5] * b,
+                                    c[6],
+                                ]
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                total: g.total * b,
+                max_self: g.max_self * b,
+                left_ticks: g.left_ticks * b,
+                right_ticks: g.right_ticks * b,
+            };
+            return match decode_as::<DiffResponse>(encoding, body) {
+                Ok(r) if r.flamegraph.as_ref() == Some(&want) => None,
+                Ok(r) => Some(format!("diff {:?}, want {want:?}", r.flamegraph)),
+                Err(e) => Some(format!("undecodable: {e}")),
+            };
+        }
+        Fixture::Points(series) => {
+            let want: Vec<Series> = series
+                .iter()
+                .map(|(labels, points)| Series {
+                    labels: label_pairs(labels),
+                    points: points
+                        .iter()
+                        .map(|(after_s, v)| Point {
+                            value: (v * b) as f64,
+                            timestamp: s0_ms + after_s * 1000,
+                            annotations: Vec::new(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            return match decode_as::<SelectSeriesResponse>(encoding, body) {
+                Ok(r) if r.series == want => None,
+                Ok(r) => Some(format!("series {:?}, want {want:?}", r.series)),
+                Err(e) => Some(format!("undecodable: {e}")),
+            };
+        }
+        Fixture::Slots(slots) => {
+            let (first, step) = slots.y_min;
+            let y_min: Vec<f64> = (0..20)
+                .map(|i| ((first + i * step) * b / 10) as f64)
+                .collect();
+            let want = vec![HeatmapSeries {
+                labels: label_pairs(slots.labels),
+                slots: slots
+                    .slots
+                    .iter()
+                    .map(|(after_s, counts)| {
+                        let mut all = vec![0; 20];
+                        for (bucket, count) in counts.iter() {
+                            all[*bucket] = *count;
+                        }
+                        HeatmapSlot {
+                            timestamp: s0_ms + after_s * 1000,
+                            y_min: y_min.clone(),
+                            counts: all,
+                        }
+                    })
+                    .collect(),
+            }];
+            return match decode_as::<SelectHeatmapResponse>(encoding, body) {
+                Ok(r) if r.series == want => None,
+                Ok(r) => Some(format!("heatmap {:?}, want {want:?}", r.series)),
+                Err(e) => Some(format!("undecodable: {e}")),
+            };
+        }
+        _ => {}
+    }
     let want_sets = |sets: Result<BTreeSet<LabelSet>, String>, want: BTreeSet<LabelSet>| match sets
     {
         Ok(got) if got == want => None,
@@ -1460,7 +2334,13 @@ fn check_fixture(fixture: Fixture, case: &Case, t1: bool, body: &[u8]) -> Option
             let want = if t1 { a } else { b };
             (got != want).then(|| format!("got {got:?}, want {want:?}"))
         }
-        Fixture::LandingSets | Fixture::PushProtoSets => None,
+        Fixture::LandingSets
+        | Fixture::PushProtoSets
+        | Fixture::Merged
+        | Fixture::Graph(_)
+        | Fixture::DiffGraph(_)
+        | Fixture::Points(_)
+        | Fixture::Slots(_) => None,
     }
 }
 
@@ -1544,6 +2424,16 @@ fn value_checks(t1: bool) -> Vec<(&'static str, &'static str, i64)> {
     } else {
         out.push(("only", TYPE_M, 1_000));
     }
+    for rx in [
+        "ingest-folded",
+        "ingest-lines",
+        "ingest-trie",
+        "ingest-tree",
+    ] {
+        out.push((rx, TYPE_A, a));
+    }
+    // Speedscope's unit is the millisecond, 10^6 ns.
+    out.push(("ingest-speedscope", TYPE_A, a / 10));
     out
 }
 
@@ -1551,10 +2441,109 @@ fn value_checks(t1: bool) -> Vec<(&'static str, &'static str, i64)> {
 // Requests
 // ---------------------------------------------------------------------
 
-/// The request body of `method` in `encoding` over window `w`.
-fn request_body(method: &Method, encoding: Encoding, w: (i64, i64)) -> Vec<u8> {
+/// The run's two windows, in milliseconds: `W` and `Q` (§3, D6).
+#[derive(Debug, Clone, Copy)]
+struct Windows {
+    w: (i64, i64),
+    q: (i64, i64),
+}
+
+/// `msg` in `encoding`.
+fn encoded<T: Message + serde::Serialize>(msg: &T, encoding: Encoding) -> Vec<u8> {
+    match encoding {
+        Encoding::Proto => msg.encode_to_vec(),
+        Encoding::Json => serde_json::to_vec(msg).expect("JSON"),
+    }
+}
+
+/// The request body of `method` in `encoding`.
+fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
     let strings = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let w = win.w;
+    let (q0, q1) = win.q;
+    let side = |selector: &str, max_nodes: Option<i64>| SelectMergeStacktracesRequest {
+        profile_type_id: TYPE_A.to_string(),
+        label_selector: selector.to_string(),
+        start: w.0,
+        end: w.1,
+        max_nodes,
+        ..SelectMergeStacktracesRequest::default()
+    };
     match (method, encoding) {
+        (
+            Method::Merge {
+                selector,
+                max_nodes,
+                span,
+            },
+            _,
+        ) => {
+            let msg = SelectMergeStacktracesRequest {
+                span_selector: strings(span),
+                ..side(selector, *max_nodes)
+            };
+            encoded(&msg, encoding)
+        }
+        (Method::SelectSeries { selector, group_by }, _) => {
+            let msg = SelectSeriesRequest {
+                profile_type_id: TYPE_A.to_string(),
+                label_selector: selector.to_string(),
+                start: q0,
+                end: q1,
+                group_by: strings(group_by),
+                step: 15.0,
+                ..SelectSeriesRequest::default()
+            };
+            encoded(&msg, encoding)
+        }
+        (
+            Method::Heatmap {
+                selector,
+                step,
+                query_type,
+            },
+            Encoding::Proto,
+        ) => SelectHeatmapRequest {
+            profile_type_id: TYPE_A.to_string(),
+            label_selector: selector.to_string(),
+            start: q0,
+            end: q1,
+            step: *step as f64,
+            query_type: *query_type,
+            // `EXEMPLAR_TYPE_NONE`.
+            exemplar_type: 1,
+            ..SelectHeatmapRequest::default()
+        }
+        .encode_to_vec(),
+        // The exploration app's body, numbers as it writes them (C25).
+        (
+            Method::Heatmap {
+                selector,
+                step,
+                query_type,
+            },
+            Encoding::Json,
+        ) => json!({
+            "profileTypeID": TYPE_A, "labelSelector": selector, "start": q0, "end": q1,
+            "step": step, "groupBy": [], "queryType": query_type, "exemplarType": 0
+        })
+        .to_string()
+        .into_bytes(),
+        (
+            Method::Diff {
+                left,
+                right,
+                left_max_nodes,
+                right_max_nodes,
+            },
+            _,
+        ) => {
+            let msg = DiffRequest {
+                left: Some(side(left, *left_max_nodes)),
+                right: Some(side(right, *right_max_nodes)),
+            };
+            encoded(&msg, encoding)
+        }
         (Method::ProfileTypes(window), Encoding::Proto) => {
             let (start, end) = match window {
                 Window::Default => w,
@@ -1623,8 +2612,8 @@ fn request_body(method: &Method, encoding: Encoding, w: (i64, i64)) -> Vec<u8> {
 }
 
 /// Sends `request` to `server` as `tenant` (`None`: no header).
-fn send(server: &Server, request: &Request, tenant: Option<&str>, w: (i64, i64)) -> Res {
-    let body = request_body(&request.method, request.encoding, w);
+fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) -> Res {
+    let body = request_body(&request.method, request.encoding, win);
     let (content_type, accept) = match (request.encoding, request.utf8) {
         (Encoding::Proto, false) => ("application/proto", None),
         (Encoding::Proto, true) => ("application/proto", Some("*/*; allow-utf8-labelnames=true")),
@@ -1656,7 +2645,7 @@ fn send(server: &Server, request: &Request, tenant: Option<&str>, w: (i64, i64))
 /// `LabelValues` proto for `rx` over `w`, as `tenant`.
 fn rx_values(server: &Server, tenant: &str, w: (i64, i64)) -> Option<Vec<String>> {
     let request = proto(Method::LabelValues("rx", &["{}"]), false);
-    let res = send(server, &request, Some(tenant), w);
+    let res = send(server, &request, Some(tenant), Windows { w, q: w });
     if res.status != 200 {
         return None;
     }
@@ -1963,7 +2952,7 @@ fn assert_reference_identity(reference: &Server, tenant: &str) {
     );
 }
 
-/// **L1.** Pushes the fixture to both servers under both tenants, then
+/// **L1.** Pushes the fixture to both servers under both pairs of tenants, then
 /// compares every case and checks every fixture expectation, the stored
 /// values and isolation; every difference is reported at once.
 #[tokio::test(flavor = "multi_thread")]
@@ -1995,6 +2984,8 @@ async fn profileql_matches_the_reference() {
     let run = run_id();
     let t1 = format!("t1-{run}");
     let t2 = format!("t2-{run}");
+    let q1 = format!("q1-{run}");
+    let q2 = format!("q2-{run}");
     wait_ready(&reference);
     assert_reference_identity(&reference, &t1);
 
@@ -2009,14 +3000,26 @@ async fn profileql_matches_the_reference() {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let t0_s = (now_ms - 5 * 60_000).div_euclid(1000);
     let w = (now_ms - HOUR_MS, now_ms + HOUR_MS);
+    let s0_s = t0_s + 180;
+    let s0_ms = s0_s * 1000;
+    let win = Windows {
+        w,
+        q: (s0_ms, s0_ms + 60_500),
+    };
     let mut mismatches = Mismatches::default();
 
-    // Push §3 to both servers under both tenants.
-    for (tenant, is_t1) in [(&t1, true), (&t2, false)] {
-        for push in pushes(t0_s, &run, is_t1) {
+    // Push §3 to both servers under both pairs of tenants.
+    let all_pushes = [
+        (&t1, pushes(t0_s, &run, true)),
+        (&t2, pushes(t0_s, &run, false)),
+        (&q1, query_pushes(t0_s, s0_s, true)),
+        (&q2, query_pushes(t0_s, s0_s, false)),
+    ];
+    for (tenant, tenant_pushes) in &all_pushes {
+        for push in tenant_pushes {
             let key = format!("k-{}-{run}", push.rx);
-            let a = send_push(&ours, &push, tenant, &key).await;
-            let b = send_push(&reference, &push, tenant, &key).await;
+            let a = send_push(&ours, push, tenant, &key).await;
+            let b = send_push(&reference, push, tenant, &key).await;
             let what = format!("push {} under {tenant}", push.rx);
             let (method, why) = match &push.transport {
                 Transport::Http { answer, .. } => {
@@ -2056,24 +3059,25 @@ async fn profileql_matches_the_reference() {
     // Visible before compared, with the filler writer running.
     let filler = Filler::start(reference.clone(), format!("filler-{run}"));
     let deadline = Instant::now() + Duration::from_secs(240);
-    for tenant in [&t1, &t2] {
+    for (tenant, rx) in [(&t1, &RX), (&t2, &RX), (&q1, &Q_RX), (&q2, &Q_RX)] {
         for server in [&ours, &reference] {
             pulsus_testkit::settle_by(
                 deadline,
                 Duration::from_secs(2),
                 &format!("{} rx values under {tenant}", server.name),
-                || rx_values(server, tenant, w).filter(|names| names == &RX),
+                || rx_values(server, tenant, w).filter(|names| names == rx),
             );
         }
     }
     drop(filler);
 
-    // §4: C0–C14.
+    // §4: C0–C30.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {
             Tenancy::Both => vec![(Some(t1.as_str()), true), (Some(t2.as_str()), false)],
             Tenancy::Absent => vec![(None, true)],
+            Tenancy::Query => vec![(Some(q1.as_str()), true), (Some(q2.as_str()), false)],
         };
         let method = case.request.method.name();
         let enc = case.request.encoding;
@@ -2084,9 +3088,52 @@ async fn profileql_matches_the_reference() {
                 case.client,
                 tenant.unwrap_or("no tenant")
             );
-            let a = send(&ours, &case.request, tenant, w);
-            let b = send(&reference, &case.request, tenant, w);
+            let a = send(&ours, &case.request, tenant, win);
+            let b = send(&reference, &case.request, tenant, win);
             match case.expect {
+                Expect::LedgerGraph {
+                    row,
+                    ours: go,
+                    theirs: gt,
+                } => {
+                    let unit = unit(is_t1);
+                    let failures: Vec<String> = [(&a, go, &ours), (&b, gt, &reference)]
+                        .into_iter()
+                        .filter_map(|(res, graph, server)| {
+                            let why = if res.status != 200 {
+                                Some(format!("status {}, want 200", res.status))
+                            } else {
+                                graph_failure(graph, unit, enc, &res.body)
+                            };
+                            why.map(|w| format!("{}: {w}", server.name))
+                        })
+                        .collect();
+                    if !failures.is_empty() {
+                        mismatches.both(
+                            &what,
+                            &format!(
+                                "ledger row `{row}`: an answer is not its pin: {}",
+                                failures.join("; ")
+                            ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    } else if a.body == b.body {
+                        mismatches.both(
+                            &what,
+                            &format!(
+                                "ledger row `{row}`: the two agree, so the reference changed \
+                                 and the row is retired"
+                            ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    }
+                }
                 Expect::Ledger {
                     row,
                     ours: po,
@@ -2120,13 +3167,17 @@ async fn profileql_matches_the_reference() {
                         mismatches.both(&what, why, &a, &b, method, enc);
                     }
                     for (res, server) in [(&a, &ours), (&b, &reference)] {
-                        if let Some(why) = fixture_failure(fixture, case, is_t1, res) {
+                        if let Some(why) = fixture_failure(fixture, case, is_t1, s0_ms, res) {
                             mismatches.one(
                                 &what,
                                 &format!("{}: not what the fixture says: {why}", server.name),
                             );
                         }
-                        let banned: &[&str] = if is_t1 {
+                        // The Query cases' isolation is their expectation:
+                        // the other tenant's data is 101 or 1.01 times it.
+                        let banned: &[&str] = if !case.request.method.is_catalogue() {
+                            &[]
+                        } else if is_t1 {
                             &["t2-only", "alloc_space"]
                         } else {
                             &["t1-only"]
@@ -2181,6 +3232,8 @@ async fn profileql_matches_the_reference() {
                 ..SelectMergeStacktracesRequest::default()
             }
             .encode_to_vec();
+            let what = format!("V {rx} {ty} under {tenant}");
+            let mut answers: Vec<Res> = Vec::new();
             for server in [&ours, &reference] {
                 let res = call(
                     server,
@@ -2193,7 +3246,6 @@ async fn profileql_matches_the_reference() {
                     ],
                     &body,
                 );
-                let what = format!("V {rx} {ty} under {tenant}");
                 let got = (res.status == 200)
                     .then(|| SelectMergeStacktracesResponse::decode(&res.body[..]).ok())
                     .flatten()
@@ -2209,6 +3261,21 @@ async fn profileql_matches_the_reference() {
                         ),
                     );
                 }
+                answers.push(res);
+            }
+            // R1's parity: status, `Content-Type` and body bytes.
+            let (a, b) = (&answers[0], &answers[1]);
+            let why = if a.status != b.status {
+                Some("status differs")
+            } else if a.content_type != b.content_type {
+                Some("Content-Type differs")
+            } else if a.body != b.body {
+                Some("bodies differ")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                mismatches.both(&what, why, a, b, "SelectMergeStacktraces", Encoding::Proto);
             }
         }
     }
@@ -2240,7 +3307,7 @@ fn a_fixture_case_needs_its_success_status() {
         body: Vec::new(),
     };
     assert!(
-        fixture_failure(fixture, c1, true, &error).is_some(),
+        fixture_failure(fixture, c1, true, 0, &error).is_some(),
         "a 500 with an empty body passed C1's fixture check"
     );
     let ok = Res {
@@ -2248,7 +3315,7 @@ fn a_fixture_case_needs_its_success_status() {
         content_type: Some("application/proto".to_string()),
         body: Vec::new(),
     };
-    assert_eq!(fixture_failure(fixture, c1, true, &ok), None);
+    assert_eq!(fixture_failure(fixture, c1, true, 0, &ok), None);
 }
 
 /// A gRPC push to a server that accepts the connection and never answers

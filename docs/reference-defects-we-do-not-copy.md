@@ -100,7 +100,6 @@ replaces one.
 | [44](#44-a-push-whose-name-carries-profile_id-stores-nothing-and-answers-200) | profiles reference | ingest | C | `name=app{profile_id=p1}` with folded stacks answers `200` and stores nothing. |
 | [45](#45-speedscope-values-are-truncated-before-they-are-scaled) | profiles reference | ingest | A, C | A speedscope weight of `0.5` s stores 0, a parent's self time is 100 times too small, and a `nanoseconds` file stores nothing. |
 | [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
-| [47](#47-a-diff-answers-every-failure-of-either-side-as-an-invalid-argument) | profiles reference | queries | A | A diff that reaches a resource limit is told its request is invalid, where the same selection on its own is told the limit was reached. |
 
 ---
 
@@ -2495,36 +2494,6 @@ No test of its own: the tree reader adds every node to the stack set that every 
 
 ---
 
-## 47. A diff answers every failure of either side as an invalid argument
-
-**The profiles reference · queries · test A**
-
-### What the reference does
-
-`Diff` reads its two sides with the function `SelectMergeStacktraces` uses for its tree, and answers any
-error either side returns as `invalid_argument`
-(`pkg/frontend/readpath/queryfrontend/query_diff.go:65-67`). `SelectMergeStacktraces` returns the same
-function's error with its own code
-(`pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:39-42`).
-
-### Why that is wrong rather than different
-
-One selection that fails one way answers two codes on two routes of the same product (**A**). A client
-told `invalid_argument` treats the request as one to fix, not one that was too large or met a failure.
-
-### What PulsusDB does
-
-A failed statement keeps its own code on `Diff` as on every profiles route: a ceiling reached by either
-side is `resource_exhausted` (`429`), `query_too_broad: <setting>` (`docs/api.md` §5).
-
-### Evidence
-
-Ledger row `diff-side-failure-keeps-its-code` (the profiles differential's ledger, issue #822). Pinned by
-case V7 of `the_diff_answers_both_sides_in_one_statement` in
-`crates/pulsus-read/tests/profileql_diff_live.rs`.
-
----
-
 ## Two mechanisms that produce several of these
 
 Worth stating because a reader meeting one entry will meet the others.
@@ -2614,6 +2583,12 @@ they are named so nobody adds them later.
   nothing at all — so the widened span has no consumer and there is no
   defect to decline. The row was corrected on 2026-09-02 and keeps the
   superseded sentence beside the correction.
+- **`Diff` answering every side failure as `invalid_argument`, examined
+  and rejected.** The function that does so
+  (`pkg/frontend/readpath/queryfrontend/query_diff.go:65-67`) is not the
+  mounted handler; the read-path router's `Diff`
+  (`pkg/frontend/readpath/query_service_handler.go:212-251`) returns a
+  side's error as it is.
 
 ## A claim recorded elsewhere that this file deliberately does not make
 
