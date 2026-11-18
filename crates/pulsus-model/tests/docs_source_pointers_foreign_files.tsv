@@ -117,6 +117,7 @@ pkg/logql/vector.go
 pkg/model/heatmap/merger.go
 pkg/model/heatmap/points_builder.go
 pkg/model/stacktraces.go
+pkg/model/timeseries/exemplar_builder.go
 pkg/model/tree.go
 pkg/og/convert/parser.go
 pkg/og/convert/speedscope/parser.go

@@ -449,6 +449,7 @@ async fn the_time_series_answers_in_one_statement() {
                     value: 3.0,
                     timestamp: s + 2 * STEP_MS,
                     annotations: Vec::new(),
+                    exemplars: Vec::new(),
                 }],
             }],
         },
@@ -505,15 +506,35 @@ async fn the_time_series_answers_in_one_statement() {
     assert_eq!(got, "{}", "R6");
     counted.push(("R6".to_string(), id, 0));
 
-    // R7: the exemplar types not served, and an unknown one.
-    for (ctx, value, status, code, message) in [
+    // R7 (issue #826): `INDIVIDUAL` exemplars, one per point, its largest
+    // profile, with all its series' labels; R7b the same under `AVERAGE`:
+    // the point is the mean, the exemplar still the largest profile.
+    let b = r#"{pod="b"}"#;
+    let r7 = |value: i64| {
+        format!(
+            r#"{{"series":[{{"points":[{{"value":{value},"timestamp":"{t}","exemplars":[{{"timestamp":"{t}","profileId":"{PROFILE}","value":"4","labels":[{{"name":"__profile_type__","value":"{CPU}"}},{{"name":"pod","value":"b"}},{{"name":"service_name","value":"x"}}]}}]}}]}}]}}"#,
+            t = s + 2 * STEP_MS,
+        )
+    };
+    for (ctx, extra, value) in [
         (
-            "R7 individual",
-            json!("EXEMPLAR_TYPE_INDIVIDUAL"),
-            501,
-            "unimplemented",
-            "exemplars are not served yet",
+            "R7",
+            json!({"groupBy": [], "exemplarType": "EXEMPLAR_TYPE_INDIVIDUAL"}),
+            6,
         ),
+        (
+            "R7b",
+            json!({"groupBy": [], "exemplarType": "EXEMPLAR_TYPE_INDIVIDUAL",
+                   "aggregation": "TIME_SERIES_AGGREGATION_TYPE_AVERAGE"}),
+            3,
+        ),
+    ] {
+        let (got, id) = answer(&connect(a, native_path(), "t1", &body(b, extra)), ctx);
+        assert_eq!(got, r7(value), "{ctx}");
+        counted.push((ctx.to_string(), id, 1));
+    }
+    // The exemplar type not served, and an unknown one.
+    for (ctx, value, status, code, message) in [
         (
             "R7 span",
             json!("EXEMPLAR_TYPE_SPAN"),

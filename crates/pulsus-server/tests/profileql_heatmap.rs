@@ -533,6 +533,7 @@ async fn the_heatmap_answers_in_one_statement() {
                         .map(|v| v as f64)
                         .collect(),
                     counts: counts(&[(2, 1), (11, 1), (17, 1), (19, 1)]),
+                    exemplars: Vec::new(),
                 }],
             }],
         },
@@ -606,32 +607,123 @@ async fn the_heatmap_answers_in_one_statement() {
         counted.push((ctx.to_string(), id, 0));
     }
 
-    // R6: the exemplar types not served, and an unknown one.
-    for (ctx, value, status, code, message) in [
+    // R6 (issue #826): exemplars of the query's own type, one per cell, with
+    // all their series' labels; an exemplar type unlike the query type is
+    // refused on every window, and an unknown one.
+    let labels = |pod: &str, service: &str| {
+        format!(
+            r#""labels":[{{"name":"__profile_type__","value":"{CPU}"}},{{"name":"pod","value":"{pod}"}},{{"name":"service_name","value":"{service}"}}]"#
+        )
+    };
+    let a_labels = labels("a", "x");
+    let individual = |t: i64, value: &str| {
+        format!(r#"{{"timestamp":"{t}","profileId":"{PROFILE}",{value}{a_labels}}}"#)
+    };
+    let r6 = format!(
+        r#"{{"series":[{{"slots":[{{"timestamp":"{t}","yMin":[{y}],"counts":[{c}],"exemplars":[{e}]}}]}}]}}"#,
+        t = s + STEP_MS,
+        y = starts(|i| i)
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        c = counts(&[(0, 1), (10, 1), (19, 1)])
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        e = [
+            individual(s + 5 * SECOND_MS, ""),
+            individual(s + 10 * SECOND_MS, r#""value":"10","#),
+            individual(s + STEP_MS, r#""value":"20","#),
+        ]
+        .join(","),
+    );
+    let (got, id) = answer(
+        &connect(
+            pa,
+            native_path(),
+            "t1",
+            &body(a, json!({"exemplarType": "EXEMPLAR_TYPE_INDIVIDUAL"})),
+        ),
+        "R6 individual",
+    );
+    assert_eq!(got, r6, "R6 individual");
+    counted.push(("R6 individual".to_string(), id, 1));
+    let z_labels = labels("d", "z");
+    let span = |value: i64, span: &str, trace: &str| {
+        format!(
+            r#"{{"timestamp":"{t}","spanId":"{span}","value":"{value}",{z_labels},"traceId":"{trace}"}}"#,
+            t = s + 5 * SECOND_MS,
+        )
+    };
+    let (got, id) = answer(
+        &connect(
+            pa,
+            native_path(),
+            "t1",
+            &body(
+                r#"{service_name="z"}"#,
+                json!({"queryType": "HEATMAP_QUERY_TYPE_SPAN", "exemplarType": "EXEMPLAR_TYPE_SPAN"}),
+            ),
+        ),
+        "R6 span",
+    );
+    let got: Value = serde_json::from_str(&got).expect("R6 span JSON");
+    let exemplars = &got["series"][0]["slots"][0]["exemplars"];
+    let want: Value = serde_json::from_str(&format!(
+        "[{}]",
+        [
+            span(2, "0a00000000000000", T1),
+            span(5, "0b00000000000000", T1),
+            span(7, "0a00000000000000", T1),
+            span(9, "0a00000000000000", T2),
+        ]
+        .join(",")
+    ))
+    .expect("R6 span want");
+    assert_eq!(exemplars, &want, "R6 span");
+    counted.push(("R6 span".to_string(), id, 1));
+    let old_window = json!({"start": (now - 9 * DAY_MS).to_string(),
+                            "end": (now - 8 * DAY_MS).to_string()});
+    for (ctx, request, message) in [
         (
-            "R6 individual",
-            json!("EXEMPLAR_TYPE_INDIVIDUAL"),
-            501,
-            "unimplemented",
-            "exemplars are not served yet",
+            "R6 individual with span",
+            body(
+                a,
+                json!({"queryType": "HEATMAP_QUERY_TYPE_SPAN", "exemplarType": "EXEMPLAR_TYPE_INDIVIDUAL"}),
+            ),
+            "individual exemplars only available for individual query type",
+        ),
+        (
+            "R6 span with individual",
+            body(a, json!({"exemplarType": "EXEMPLAR_TYPE_SPAN"})),
+            "span exemplars only available for span query type",
+        ),
+        (
+            "R6 individual with span, old window",
+            {
+                let mut v = body(
+                    a,
+                    json!({"queryType": "HEATMAP_QUERY_TYPE_SPAN", "exemplarType": "EXEMPLAR_TYPE_INDIVIDUAL"}),
+                );
+                if let (Some(o), Value::Object(w)) = (v.as_object_mut(), old_window.clone()) {
+                    o.extend(w);
+                }
+                v
+            },
+            "individual exemplars only available for individual query type",
         ),
         (
             "R6 unknown",
-            json!(9),
-            400,
-            "invalid_argument",
+            body(a, json!({"exemplarType": 9})),
             "unknown exemplar type: 9",
         ),
     ] {
         let id = refused(
-            &connect(
-                pa,
-                native_path(),
-                "t1",
-                &body(a, json!({"exemplarType": value})),
-            ),
-            status,
-            code,
+            &connect(pa, native_path(), "t1", &request),
+            400,
+            "invalid_argument",
             message,
             ctx,
         );

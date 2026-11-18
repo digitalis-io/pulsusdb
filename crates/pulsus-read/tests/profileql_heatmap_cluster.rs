@@ -24,6 +24,7 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_model::Tenant;
 use pulsus_read::profiles::heatmap::{self, HeatmapRequest, QUERY_TYPE_INDIVIDUAL};
 use pulsus_read::profiles::selector::WindowLimits;
+use pulsus_read::profiles::series::Exemplar;
 use pulsus_read::profiles::{ProfilesEngine, ProfilesReadConfig};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -233,6 +234,7 @@ async fn the_heatmap_merges_both_shards_in_one_statement() {
         group_by: &by_pod,
         query_type: QUERY_TYPE_INDIVIDUAL,
         limit: None,
+        exemplars: false,
     };
     let sql = match heatmap::plan(&tenant("t1"), &config, &req, now) {
         Ok(Some(sql)) => sql,
@@ -241,7 +243,7 @@ async fn the_heatmap_merges_both_shards_in_one_statement() {
     let comment = format!("{db}-k1-{now}");
     let rows = ProfilesEngine::new(
         ChClient::new(shard1_config(&db)).await.expect("shard1"),
-        config,
+        config.clone(),
         tenant("t1"),
     )
     .with_query_log_comment(comment.clone())
@@ -304,6 +306,117 @@ async fn the_heatmap_merges_both_shards_in_one_statement() {
         .await
         .expect("query_log");
     assert_eq!(n, ["1"], "K2");
+
+    // K3 (issue #826): with `INDIVIDUAL` exemplars, K1's slots, each
+    // cell's largest value, labelled from both shards' series rows; one
+    // statement, the exemplar statement.
+    let with = HeatmapRequest {
+        exemplars: true,
+        ..req
+    };
+    let sql = match heatmap::plan(&tenant("t1"), &config, &with, now) {
+        Ok(Some(sql)) => sql,
+        other => panic!("K3: expected a plan, got {other:?}"),
+    };
+    let comment = format!("{db}-k3-{now}");
+    let rows = ProfilesEngine::new(
+        ChClient::new(shard1_config(&db)).await.expect("shard1"),
+        config,
+        tenant("t1"),
+    )
+    .with_query_log_comment(comment.clone())
+    .read_heatmap_exemplars(&sql)
+    .await
+    .unwrap_or_else(|err| panic!("K3: {err:?}\n{sql}"));
+    let labels = vec![
+        ("__profile_type__".to_string(), CPU.to_string()),
+        ("service_name".to_string(), "x".to_string()),
+    ];
+    let exemplar = |timestamp: i64, value: i64| Exemplar {
+        timestamp,
+        profile_id: PROFILE.to_string(),
+        span_id: String::new(),
+        trace_id: String::new(),
+        value,
+        labels: labels.clone(),
+    };
+    type Slots = Vec<(i64, BTreeMap<usize, i32>, Vec<Exemplar>)>;
+    let got: Vec<(Vec<(String, String)>, Slots)> = heatmap::heatmap_exemplars(rows, &by_pod, None)
+        .into_iter()
+        .map(|x| {
+            let slots = x
+                .slots
+                .into_iter()
+                .map(|slot| {
+                    let c = slot
+                        .counts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| **c != 0)
+                        .map(|(i, c)| (i, *c))
+                        .collect();
+                    (slot.timestamp, c, slot.exemplars)
+                })
+                .collect();
+            (x.labels, slots)
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                vec![],
+                vec![(e, counts(&[(5, 1)]), vec![exemplar(s + 50 * SECOND_MS, 10)])]
+            ),
+            (
+                pod("a"),
+                vec![(
+                    s + STEP_MS,
+                    counts(&[(0, 1), (5, 1), (10, 1)]),
+                    vec![
+                        exemplar(s + 5 * SECOND_MS, 0),
+                        exemplar(s + 10 * SECOND_MS, 10),
+                        exemplar(s + STEP_MS, 20),
+                    ]
+                )]
+            ),
+            (
+                pod("b"),
+                vec![
+                    (s, counts(&[(15, 1)]), vec![exemplar(s - STEP_MS, 30)]),
+                    (
+                        e + STEP_MS,
+                        counts(&[(19, 1)]),
+                        vec![exemplar(e + 5 * SECOND_MS, 40)]
+                    ),
+                ]
+            ),
+        ],
+        "K3"
+    );
+    let filter = format!("is_initial_query AND log_comment = '{comment}'");
+    settle_query_log(&[&shard1], &filter, 1).await;
+    let sent = shard1
+        .query_strings(
+            &format!(
+                "SELECT query AS s FROM system.query_log \
+                 WHERE {filter} AND type = 'QueryFinish'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    assert_eq!(sent.len(), 1, "K3 statements: {sent:?}");
+    for expected in [
+        "groupArray((e.total, e.timestamp_ns, e.profile_id, e.fingerprint))",
+        "UNION ALL",
+    ] {
+        assert!(
+            sent[0].contains(expected),
+            "K3: {expected:?} missing from {}",
+            sent[0]
+        );
+    }
 
     exec(
         &bootstrap,
