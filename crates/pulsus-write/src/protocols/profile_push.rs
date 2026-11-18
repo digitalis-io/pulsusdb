@@ -143,6 +143,8 @@ pub struct LegacyQuery {
     pub name: Labels,
     /// `from`, in nanoseconds, when given.
     pub from_ns: Option<i64>,
+    /// `until`, in nanoseconds, when given; read on the JFR path only.
+    pub until_ns: Option<i64>,
     /// `spyName`, `unknown` when absent.
     pub spy_name: String,
     /// `format`, when given.
@@ -197,6 +199,7 @@ pub fn parse_legacy_query(raw: Option<&str>, now_ns: i64) -> Result<LegacyQuery,
     Ok(LegacyQuery {
         name,
         from_ns: get("from").map(|f| parse_at_time(f, now_ns)),
+        until_ns: None,
         spy_name: get("spyName").unwrap_or("unknown").to_string(),
         format: get("format").map(str::to_string),
         sample_rate: get("sampleRate")
@@ -933,6 +936,7 @@ mod tests {
         LegacyQuery {
             name: parse_name(name).expect("a valid name"),
             from_ns,
+            until_ns: None,
             spy_name: spy.to_string(),
             format: None,
             sample_rate: 100,

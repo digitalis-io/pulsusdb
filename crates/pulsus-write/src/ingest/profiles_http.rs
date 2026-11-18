@@ -1029,13 +1029,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h13_ingest_refuses_the_formats_not_served_yet() {
+    async fn h13_a_body_that_is_not_a_recording_is_refused() {
         let sink = MockProfileSink::new(Outcome::Ok);
         let res = send(&sink, "/ingest?name=app&format=jfr", &[], b"JFR".to_vec()).await;
         assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(nosniff(&res));
         assert_eq!(
             res.text(),
-            "{\"code\":\"unknown\",\"message\":\"format jfr is not supported\"}\n"
+            "{\"code\":\"unknown\",\"message\":\"parsing IngestInput-pprof failed jfr parser \
+             ParseEvent error: error reading chunk header: unexpected EOF\"}\n"
         );
         assert!(sink.landings().is_empty());
     }
@@ -1259,5 +1261,191 @@ mod tests {
         assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(res.text(), format!("{message}\n"));
         assert!(nosniff(&res));
+    }
+
+    const JFR_FORM: (&str, &str) = ("content-type", "multipart/form-data; boundary=b0undary");
+
+    /// §0's push of issue #819: `example.jfr`, gzipped, as the form's `jfr`
+    /// part, its window ending now unless `from` is given.
+    fn jfr_push(from: Option<&str>) -> (String, Vec<u8>) {
+        use crate::protocols::profileql_legacy::jfr::test_support::fixture as jfr_file;
+        let now_s = fixture::now_ns() / 1_000_000_000;
+        let from = from.map_or_else(|| (now_s - 10).to_string(), str::to_string);
+        let uri = format!(
+            "/ingest?name=checkout%7Benv%3Dprod%7D&format=jfr&spyName=javaspy&sampleRate=100\
+             &from={from}&until={now_s}"
+        );
+        let body = fixture::multipart(
+            "b0undary",
+            &[("jfr", Some("jfr"), &jfr_file("example.jfr.gz"))],
+        );
+        (uri, body)
+    }
+
+    /// Each series' type id and the sum of its entries' totals.
+    fn totals(landing: &ParsedProfileLanding) -> std::collections::BTreeMap<String, i64> {
+        let mut out = std::collections::BTreeMap::new();
+        for e in &landing.entries {
+            let id = landing.series[e.series as usize].type_id.to_string();
+            *out.entry(id).or_insert(0) += e.total;
+        }
+        out
+    }
+
+    /// §0's push: one insert of the seven series the reference stores, the
+    /// lock delay in nanoseconds.
+    #[tokio::test]
+    async fn h21_a_jfr_push_is_stored_as_the_references_series() {
+        let sink = MockProfileSink::new(Outcome::Ok);
+        let (uri, body) = jfr_push(None);
+        let res = send(&sink, &uri, &[("x-scope-orgid", "t1"), JFR_FORM], body).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        assert!(res.body.is_empty());
+        let landings = sink.landings();
+        assert_eq!(landings.len(), 1);
+        let (landing, mode) = &landings[0];
+        assert_eq!(*mode, Mode::AdmitFlush);
+        let mut totals = totals(landing);
+        let delay = totals.remove("mutex:delay:nanoseconds:mutex:count");
+        assert!(
+            delay.is_some_and(|d| (8_005_192_299..=8_005_192_311).contains(&d)),
+            "{delay:?}"
+        );
+        let want: std::collections::BTreeMap<String, i64> = [
+            (
+                "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+                10_310_000_000,
+            ),
+            ("memory:alloc_in_new_tlab_objects:count:space:bytes", 30),
+            (
+                "memory:alloc_in_new_tlab_bytes:bytes:space:bytes",
+                27_650_544,
+            ),
+            ("memory:alloc_outside_tlab_objects:count:space:bytes", 260),
+            (
+                "memory:alloc_outside_tlab_bytes:bytes:space:bytes",
+                139_855_503_616,
+            ),
+            ("mutex:contentions:count:mutex:count", 13),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+        assert_eq!(totals, want);
+        assert_eq!(landing.stacks.len(), 258);
+        assert_eq!(landing.locations.len(), 756);
+        let cpu = landing
+            .series
+            .iter()
+            .find(|s| &*s.type_id == "process_cpu:cpu:nanoseconds:cpu:nanoseconds")
+            .map(|s| s.labels.as_str());
+        assert_eq!(
+            cpu,
+            Some(
+                r#"{"__name__":"process_cpu","__period_type__":"cpu","__period_unit__":"nanoseconds","__profile_type__":"process_cpu:cpu:nanoseconds:cpu:nanoseconds","__service_name__":"checkout","__type__":"cpu","__unit__":"nanoseconds","env":"prod","jfr_event":"cpu","pyroscope_spy":"javaspy","service_name":"checkout"}"#
+            )
+        );
+    }
+
+    /// The reference's own labelled push (`ingest_jfr_test.go:105-113`): the
+    /// form's `labels` part names each sample's thread.
+    #[tokio::test]
+    async fn h22_the_labels_part_splits_the_series_by_thread() {
+        use crate::protocols::profileql_legacy::jfr::test_support::fixture as jfr_file;
+        let sink = MockProfileSink::new(Outcome::Ok);
+        let body = fixture::multipart(
+            "b0undary",
+            &[
+                ("jfr", Some("jfr"), &jfr_file("dump1.jfr.gz")),
+                ("labels", Some("labels"), &jfr_file("dump1.labels.pb.gz")),
+            ],
+        );
+        let uri = "/ingest?name=javaapp&format=jfr&spyName=javaspy";
+        let res = send(&sink, uri, &[JFR_FORM], body).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        let landings = sink.landings();
+        assert_eq!(landings.len(), 1);
+        let landing = &landings[0].0;
+        assert_eq!(landing.series.len(), 5, "{:?}", landing.series);
+        assert!(
+            landing
+                .series
+                .iter()
+                .all(|s| &*s.type_id == "process_cpu:cpu:nanoseconds:cpu:nanoseconds")
+        );
+        let threads: std::collections::BTreeSet<&str> = landing
+            .series
+            .iter()
+            .filter_map(|s| {
+                let at = s.labels.find(r#""thread_name":""#)?;
+                let rest = &s.labels[at + 15..];
+                rest.split('"').next()
+            })
+            .collect();
+        assert_eq!(threads.len(), 4, "{threads:?}");
+        assert_eq!(
+            landing.entries.iter().map(|e| e.total).sum::<i64>(),
+            21_880_000_000
+        );
+        for s in &landing.series {
+            for part in [r#""jfr_event":"itimer""#, r#""service_name":"javaapp""#] {
+                assert!(s.labels.contains(part), "{part} in {}", s.labels);
+            }
+            assert!(!s.labels.contains("app_name"), "{}", s.labels);
+        }
+    }
+
+    #[tokio::test]
+    async fn h23_jfr_refusals_answer_in_the_legacy_form() {
+        use crate::protocols::profileql_legacy::jfr::test_support::unzipped;
+        let sink = MockProfileSink::new(Outcome::Ok);
+        let cut = unzipped("example.jfr.gz")[..1000].to_vec();
+        let res = send(&sink, "/ingest?name=app&format=jfr", &[], cut).await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(nosniff(&res));
+        assert_eq!(
+            res.text(),
+            "{\"code\":\"unknown\",\"message\":\"parsing IngestInput-pprof failed jfr parser \
+             ParseEvent error: error reading metadata: unexpected EOF\"}\n"
+        );
+
+        let body = fixture::multipart("b0undary", &[("other", Some("x"), b"x")]);
+        let res = send(&sink, "/ingest?name=app&format=jfr", &[JFR_FORM], body).await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            res.text(),
+            "{\"code\":\"unknown\",\"message\":\"parsing IngestInput-pprof failed jfr field is \
+             required\"}\n"
+        );
+
+        let (uri, body) = jfr_push(Some("now-2h"));
+        let res = send(&sink, &uri, &[JFR_FORM], body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            res.text()
+        );
+        assert!(nosniff(&res));
+        assert!(
+            res.text().starts_with(
+                "{\"code\":\"unknown\",\"message\":\"pushing IngestInput-pprof failed push series \
+                 with index 0 and id  failed: invalid_argument: profile with labels '"
+            ),
+            "{}",
+            res.text()
+        );
+        assert!(sink.landings().is_empty());
+
+        let sink = MockProfileSink::new(Outcome::Backpressure);
+        let (uri, body) = jfr_push(None);
+        let res = send(&sink, &uri, &[JFR_FORM], body).await;
+        assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(nosniff(&res));
+        assert_eq!(
+            res.text(),
+            "{\"code\":\"resource_exhausted\",\"message\":\"sink is applying backpressure: \
+             buffers are full\"}\n"
+        );
     }
 }
