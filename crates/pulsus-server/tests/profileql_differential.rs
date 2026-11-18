@@ -74,7 +74,8 @@ const LEDGER_PHRASE: &str = "the profiles differential's ledger";
 const HOUR_MS: i64 = 3_600_000;
 
 /// Every row's `rx` value, sorted.
-const RX: [&str; 10] = [
+const RX: [&str; 11] = [
+    "ingest-jfr",
     "ingest-multipart",
     "ingest-pprof",
     "only",
@@ -88,7 +89,8 @@ const RX: [&str; 10] = [
 ];
 
 /// The `service_name` values the fixture stores under either tenant.
-const SERVICES: [&str; 10] = [
+const SERVICES: [&str; 11] = [
+    "svc-ingest-jfr",
     "svc-ingest-multipart.cpu",
     "svc-ingest-pprof.cpu",
     "svc-only",
@@ -326,6 +328,7 @@ static CASES: &[Case] = &[
         request: proto(Method::LabelValues("rx", &[r#"{env=~"prod"}"#]), false),
         expect: Expect::Parity(Fixture::Exactly {
             t1: &[
+                "ingest-jfr",
                 "otlp-grpc",
                 "otlp-json",
                 "otlp-noservice",
@@ -334,6 +337,7 @@ static CASES: &[Case] = &[
                 "push-proto",
             ],
             t2: &[
+                "ingest-jfr",
                 "otlp-grpc",
                 "otlp-json",
                 "otlp-noservice",
@@ -481,6 +485,11 @@ fn the_ledger_and_the_cases_name_each_other() {
                 "ledger row `{id}` names case {case_id}, not a case"
             )),
         }
+    }
+    if !headings.contains(JFR_DELAY_ROW) {
+        problems.push(format!(
+            "VJ names ledger row `{JFR_DELAY_ROW}`, not a heading"
+        ));
     }
     let attributed = attributed_ids(&defects);
     assert!(
@@ -1053,6 +1062,98 @@ fn multipart(boundary: &str, profile: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Issue #819: a form whose `jfr` part is `recording`, as the common Java
+/// agent sends it.
+fn jfr_multipart(boundary: &str, recording: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"jfr\"; \
+             filename=\"jfr\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(recording);
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    out
+}
+
+/// One of the JFR library's files vendored for issue #819, as stored.
+fn jfr_file(name: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/../pulsus-write/tests/fixtures/profileql_jfr/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// The sum of each value column of one of the library's expected
+/// collapsed outputs.
+fn jfr_column_sums(name: &str) -> Vec<i64> {
+    let mut text = String::new();
+    flate2::read::MultiGzDecoder::new(&jfr_file(name)[..])
+        .read_to_string(&mut text)
+        .expect("a gzip text file");
+    let mut sums: Vec<i64> = Vec::new();
+    for line in text.lines() {
+        let (_, values) = line.rsplit_once(" [").expect("a collapsed line");
+        for (i, v) in values.trim_end_matches(']').split(' ').enumerate() {
+            let v: i64 = v.parse().expect("a value");
+            if sums.len() <= i {
+                sums.push(0);
+            }
+            sums[i] += v;
+        }
+    }
+    sums
+}
+
+/// The ledger row the JFR lock delay's pins name (`VJ`).
+const JFR_DELAY_ROW: &str = "ingest-jfr-delay-in-nanoseconds";
+
+/// The type id the JFR lock delay is stored under.
+const JFR_DELAY_TYPE: &str = "mutex:delay:nanoseconds:mutex:count";
+
+/// `example.jfr`'s ticks per second, from its chunk header.
+const JFR_TICKS_PER_SECOND: i128 = 2_303_974_730;
+
+/// `VJ`'s parity rows: each type `example.jfr` stores but the lock delay,
+/// and its total from the library's own expected outputs.
+fn jfr_totals() -> Vec<(&'static str, i64)> {
+    let cpu = jfr_column_sums("example.cpu.txt.gz");
+    let tlab = jfr_column_sums("example.alloc_in.txt.gz");
+    let outside = jfr_column_sums("example.alloc_out.txt.gz");
+    let mutex = jfr_column_sums("example.mutex.txt.gz");
+    vec![
+        (TYPE_A, cpu[0]),
+        (
+            "memory:alloc_in_new_tlab_objects:count:space:bytes",
+            tlab[0],
+        ),
+        ("memory:alloc_in_new_tlab_bytes:bytes:space:bytes", tlab[1]),
+        (
+            "memory:alloc_outside_tlab_objects:count:space:bytes",
+            outside[0],
+        ),
+        (
+            "memory:alloc_outside_tlab_bytes:bytes:space:bytes",
+            outside[1],
+        ),
+        ("mutex:contentions:count:mutex:count", mutex[0]),
+        (JFR_DELAY_TYPE, mutex[1]),
+    ]
+}
+
+/// `VJ`'s ledger pins for the lock delay (defects entry 48): the reference
+/// stores the library's tick total, and ours that total in nanoseconds, each
+/// of its events truncated, so within one nanosecond per event below it.
+fn jfr_delay_pins() -> (i64, std::ops::RangeInclusive<i64>) {
+    let mutex = jfr_column_sums("example.mutex.txt.gz");
+    let (count, ticks) = (mutex[0], mutex[1]);
+    let whole = (i128::from(ticks) * 1_000_000_000 / JFR_TICKS_PER_SECOND) as i64;
+    (ticks, whole - count + 1..=whole)
+}
+
 /// How a push reaches a server.
 enum Transport {
     /// An HTTP request: path, headers beyond the tenant and the key, body.
@@ -1240,6 +1341,23 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
             },
         },
     ];
+    out.push(Push {
+        rx: "ingest-jfr",
+        transport: Transport::Http {
+            path: format!(
+                "/ingest?name={}&format=jfr&spyName=javaspy&sampleRate=100&from={}&until={}",
+                encode_query("svc-ingest-jfr{rx=ingest-jfr,env=prod}"),
+                t0_s + 11,
+                t0_s + 21
+            ),
+            headers: vec![(
+                "Content-Type",
+                format!("multipart/form-data; boundary=b819-{run}"),
+            )],
+            body: jfr_multipart(&format!("b819-{run}"), &jfr_file("example.jfr.gz")),
+            answer: PushAnswer::Ingest,
+        },
+    });
     let (only_labels, only_profile) = if t1 {
         (
             [
@@ -1390,6 +1508,9 @@ fn landing_sets(t1: bool) -> BTreeSet<LabelSet> {
     ] {
         out.insert(pair(s, TYPE_A));
         out.insert(pair(s, TYPE_B));
+    }
+    for (ty, _) in jfr_totals() {
+        out.insert(pair("svc-ingest-jfr", ty));
     }
     if t1 {
         out.insert(pair("svc-only", TYPE_A));
@@ -2206,6 +2327,76 @@ async fn profileql_matches_the_reference() {
                             "{}: flame graph {got:?}, want {want:?} ({})",
                             server.name,
                             describe(&res, "SelectMergeStacktraces", Encoding::Proto)
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // VJ (issue #819): the JFR row's stored totals, per tenant, server and
+    // type, against the library's own expected outputs; the lock delay is
+    // the ledger's, pinned on both sides.
+    let (delay_theirs, delay_ours) = jfr_delay_pins();
+    for (tenant, _) in [(&t1, true), (&t2, false)] {
+        for (ty, want) in jfr_totals() {
+            let body = SelectMergeStacktracesRequest {
+                profile_type_id: ty.to_string(),
+                label_selector: "{rx=\"ingest-jfr\"}".to_string(),
+                start: w.0,
+                end: w.1,
+                ..SelectMergeStacktracesRequest::default()
+            }
+            .encode_to_vec();
+            let mut totals = Vec::new();
+            for server in [&ours, &reference] {
+                let res = call(
+                    server,
+                    "POST",
+                    "/querier.v1.QuerierService/SelectMergeStacktraces",
+                    &[
+                        ("Content-Type", "application/proto"),
+                        ("Connect-Protocol-Version", "1"),
+                        ("X-Scope-OrgID", tenant),
+                    ],
+                    &body,
+                );
+                let total = (res.status == 200)
+                    .then(|| SelectMergeStacktracesResponse::decode(&res.body[..]).ok())
+                    .flatten()
+                    .and_then(|r| r.flamegraph.as_ref().map(|fg| fg.total));
+                totals.push((server.name, total, res));
+            }
+            let what = format!("VJ ingest-jfr {ty} under {tenant}");
+            if ty == JFR_DELAY_TYPE {
+                let (o, r) = (totals[0].1, totals[1].1);
+                let held = o.is_some_and(|o| delay_ours.contains(&o)) && r == Some(delay_theirs);
+                if !held {
+                    mismatches.one(
+                        &what,
+                        &format!(
+                            "ledger row `{JFR_DELAY_ROW}`: an answer is not its pin: ours {o:?}, \
+                             want {delay_ours:?}; reference {r:?}, want {delay_theirs}"
+                        ),
+                    );
+                } else if o == r {
+                    mismatches.one(
+                        &what,
+                        &format!(
+                            "ledger row `{JFR_DELAY_ROW}`: the two agree, so the reference \
+                             changed and the row is retired"
+                        ),
+                    );
+                }
+                continue;
+            }
+            for (name, total, res) in &totals {
+                if *total != Some(want) {
+                    mismatches.one(
+                        &what,
+                        &format!(
+                            "{name}: total {total:?}, want {want} ({})",
+                            describe(res, "SelectMergeStacktraces", Encoding::Proto)
                         ),
                     );
                 }

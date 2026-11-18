@@ -171,7 +171,8 @@ that is not a row here fails the suite.
   ticks per second: the library's `example.jfr` stores about 8,005,192,311.
 - **Reference:** the tick count is stored as nanoseconds: 18,443,760,794.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 48.
-- **Case:** #823 part B.
+- **Case:** `VJ` in `crates/pulsus-server/tests/profileql_differential.rs`
+  (#819), which pins both totals.
 
 ### `ingest-jfr-event-count-not-carried`
 
@@ -181,7 +182,9 @@ that is not a row here fails the suite.
 - **PulsusDB:** each of those later events counts once.
 - **Reference:** each counts as the last wall-clock sample's count.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 49.
-- **Case:** #823 part B.
+- **Case:** `none` (#819): the fixture's `example.jfr` holds no wall-clock
+  sample, so the two count each event once there; our side is pinned by J6
+  in `crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
 
 ### `ingest-jfr-series-stored-together`
 
@@ -192,7 +195,8 @@ that is not a row here fails the suite.
 - **Reference:** each series is pushed on its own, so the others are stored,
   and the refusal names the refused series' position.
 - **Why:** atomic writes; #819 plan E6 and E7.
-- **Case:** #823 part B.
+- **Case:** `none` (#819): it needs a series the checks refuse, which the
+  fixture does not push.
 
 ### `otlp-multiple-values-are-summed`
 
