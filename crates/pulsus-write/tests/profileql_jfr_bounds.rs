@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use pulsus_write::protocols::profile_push::parse_legacy_query;
 use pulsus_write::protocols::profileql_legacy::jfr::{
-    JfrProfiles, LabelsSnapshot, budget_bytes, parse_jfr,
+    JfrProfiles, LabelsSnapshot, budget_bytes, jfr_inputs, parse_jfr,
 };
 
 /// The answer to a body over its allocation budget.
@@ -756,4 +757,98 @@ fn r9_an_error_describing_a_class_stays_short() {
     let out = parse_within("an error naming a long field many times", body);
     let e = out.map(|o| o.profiles.len()).expect_err("a pool cut short");
     assert!(e.len() < 64 * 1024, "an error of {} bytes", e.len());
+}
+
+/// A form of the gzipped `example.jfr` as `jfr` and `labels` as it is.
+fn form_with_labels(labels: &[u8]) -> Vec<u8> {
+    let gz = std::fs::read(format!(
+        "{}/tests/fixtures/profileql_jfr/example.jfr.gz",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("the vendored recording");
+    let mut out = Vec::new();
+    for (name, bytes) in [("jfr", &gz[..]), ("labels", labels)] {
+        out.extend_from_slice(
+            format!(
+                "--b0\r\nContent-Disposition: form-data; name=\"{name}\"; \
+                 filename=\"{name}\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"--b0--\r\n");
+    out
+}
+
+/// A labels part of `n` strings-map entries with distinct keys and empty
+/// values: five or six bytes each on the wire, a table slot each in memory.
+fn many_labels(n: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    for k in 1..=n {
+        let mut entry = vec![0x08];
+        varint(&mut entry, k);
+        out.push(0x12);
+        varint(&mut out, entry.len() as u64);
+        out.extend(entry);
+    }
+    out
+}
+
+fn inputs(body: &[u8]) -> Result<usize, String> {
+    let q = parse_legacy_query(Some("name=app&format=jfr"), 0).expect("a valid query");
+    jfr_inputs(&q, "multipart/form-data; boundary=b0", body, 0).map(|i| i.len())
+}
+
+/// Code review r4: a labels part sent as it is, not gzipped, has the
+/// gzipped part's 4 MiB limit.
+#[test]
+fn r10_a_labels_part_sent_as_it_is_has_the_size_limit() {
+    let labels = many_labels(900_000);
+    assert!(labels.len() > 4 * 1024 * 1024, "{}", labels.len());
+    assert_eq!(
+        inputs(&form_with_labels(&labels)),
+        Err(
+            "loadJFRFromForm failed to decompress labels: decompressed size exceeds maximum \
+             allowed size of 4194304 bytes"
+                .to_string()
+        )
+    );
+}
+
+/// Code review r4: a labels part is charged at the most it can decode to
+/// before it is decoded, so one over the budget is refused undecoded.
+#[test]
+fn r11_a_labels_part_over_the_budget_is_refused_before_it_is_decoded() {
+    let labels = many_labels(600_000);
+    let body = form_with_labels(&labels);
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+    let out = inputs(&body);
+    let held = PEAK.load(Ordering::Relaxed).saturating_sub(base);
+    assert_eq!(out, Err(OVER_BUDGET.to_string()));
+    assert!(
+        held < 2 * labels.len(),
+        "{held} bytes held for a labels part of {}",
+        labels.len()
+    );
+}
+
+/// A labels part under the budget is decoded, and the push holds no more
+/// than its budget, so the charge per part byte covers the decode.
+#[test]
+fn r12_a_labels_part_inside_the_budget_decodes_inside_it() {
+    let labels = many_labels(20_000);
+    let body = form_with_labels(&labels);
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+    let out = inputs(&body);
+    let held = PEAK.load(Ordering::Relaxed).saturating_sub(base) as u64;
+    assert!(out.is_ok(), "{out:?}");
+    assert!(
+        held <= budget_bytes(body.len()),
+        "{held} bytes held, over the budget of {}",
+        budget_bytes(body.len())
+    );
 }
