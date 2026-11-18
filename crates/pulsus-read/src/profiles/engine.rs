@@ -11,9 +11,9 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::catalogue::{Read, compat_sets};
 use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
-use super::heatmap::HeatmapRow;
+use super::heatmap::{HeatmapExemplarRow, HeatmapRow};
 use super::selector::WindowLimits;
-use super::series::TimeSeriesRow;
+use super::series::{TimeSeriesExemplarRow, TimeSeriesRow};
 use super::tree::TreeRow;
 
 /// ClickHouse's `TOO_MANY_ROWS` (`max_rows_to_read`).
@@ -253,6 +253,55 @@ impl ProfilesEngine {
     pub async fn read_heatmap(&self, sql: &str) -> Result<Vec<HeatmapRow>, ProfilesReadError> {
         let settings = read_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #826: stub.
+    pub async fn read_series_exemplars(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<TimeSeriesExemplarRow>, ProfilesReadError> {
+        Ok(self
+            .read_series(sql)
+            .await?
+            .into_iter()
+            .map(|r| TimeSeriesExemplarRow {
+                kind: 0,
+                g: r.g,
+                series_total: r.series_total,
+                points: r
+                    .points
+                    .into_iter()
+                    .map(|(t, v)| (t, v, 0, String::new(), 0, 0))
+                    .collect(),
+                fingerprint: 0,
+                labels: Vec::new(),
+            })
+            .collect())
+    }
+
+    /// Issue #826: stub.
+    pub async fn read_heatmap_exemplars(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<HeatmapExemplarRow>, ProfilesReadError> {
+        Ok(self
+            .read_heatmap(sql)
+            .await?
+            .into_iter()
+            .map(|r| HeatmapExemplarRow {
+                kind: 0,
+                g: r.g,
+                n: r.n,
+                slots: r
+                    .slots
+                    .into_iter()
+                    .map(|(t, c)| (t, c, Vec::new()))
+                    .collect(),
+                y_min: r.y_min,
+                fingerprint: 0,
+                labels: Vec::new(),
+            })
+            .collect())
     }
 }
 

@@ -36,6 +36,8 @@ pub struct SeriesRequest<'a> {
     pub call_site: &'a [String],
     /// The request's `limit`, `None` when absent.
     pub limit: Option<i64>,
+    /// Issue #826: stub.
+    pub exemplars: bool,
 }
 
 /// One series as S6 returns it: its `group_by` values, the sum of its
@@ -47,11 +49,34 @@ pub struct TimeSeriesRow {
     pub points: Vec<(i64, f64)>,
 }
 
+/// Issue #826: stub.
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, Serialize, Deserialize)]
+pub struct TimeSeriesExemplarRow {
+    pub kind: u8,
+    pub g: Vec<String>,
+    pub series_total: f64,
+    pub points: Vec<(i64, f64, i64, String, i64, u128)>,
+    pub fingerprint: u128,
+    pub labels: Vec<(String, String)>,
+}
+
+/// Issue #826: stub.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Exemplar {
+    pub timestamp: i64,
+    pub profile_id: String,
+    pub span_id: String,
+    pub trace_id: String,
+    pub value: i64,
+    pub labels: Vec<(String, String)>,
+}
+
 /// One point of a series.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Point {
     pub timestamp: i64,
     pub value: f64,
+    pub exemplar: Option<Exemplar>,
 }
 
 /// One series of the answer: its labels in `group_by` order, a missing one
@@ -251,7 +276,11 @@ pub fn series(rows: Vec<TimeSeriesRow>, group_by: &[String], limit: Option<i64>)
             let points: Vec<Point> = row
                 .points
                 .into_iter()
-                .map(|(timestamp, value)| Point { timestamp, value })
+                .map(|(timestamp, value)| Point {
+                    timestamp,
+                    value,
+                    exemplar: None,
+                })
                 .collect();
             let sum = points.iter().fold(0.0, |acc, p| acc + p.value);
             (sum, Series { labels, points })
@@ -268,6 +297,24 @@ pub fn series(rows: Vec<TimeSeriesRow>, group_by: &[String], limit: Option<i64>)
         out.truncate(usize::try_from(k).unwrap_or(usize::MAX));
     }
     out
+}
+
+/// Issue #826: stub.
+pub fn series_exemplars(
+    rows: Vec<TimeSeriesExemplarRow>,
+    group_by: &[String],
+    limit: Option<i64>,
+) -> Vec<Series> {
+    let rows = rows
+        .into_iter()
+        .filter(|r| r.kind == 0)
+        .map(|r| TimeSeriesRow {
+            g: r.g,
+            series_total: r.series_total,
+            points: r.points.into_iter().map(|p| (p.0, p.1)).collect(),
+        })
+        .collect();
+    series(rows, group_by, limit)
 }
 
 /// Two label sets compared pairwise, name then value, in byte order; when
@@ -327,6 +374,42 @@ WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
 )
 GROUP BY g
 ORDER BY series_total DESC, g";
+
+    /// Plan §0's statement with exemplars (issue #826).
+    const EXAMPLE_EXEMPLARS: &str = "SELECT 0 AS kind, g, sum(v) AS series_total, arraySort(groupArray((ts, v, m, toString(x.1), intDiv(x.2, 1000000), x.3))) AS points, toUInt128(0) AS fingerprint, CAST([] AS Array(Tuple(String, String))) AS labels
+FROM (
+  SELECT s.g AS g,
+         1794819600000 + intDiv(intDiv(e.timestamp_ns, 1000000) - 1794819600000 + 14999, 15000) * 15000 AS ts,
+         toFloat64(sum(e.total)) AS v,
+         max(e.total) AS m,
+         argMax((e.profile_id, e.timestamp_ns, e.fingerprint), e.total) AS x
+  FROM profile_entries AS e
+  INNER JOIN (
+    SELECT fingerprint, any([JSONExtractString(labels, 'service_name')]) AS g
+FROM profile_series
+WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
+  AND bitAnd(hours, multiIf(day = '2026-11-16' AND day = '2026-11-16', 1792, day = '2026-11-16', 16776960, day = '2026-11-16', 2047, 16777215)) != 0
+  AND type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+    GROUP BY fingerprint
+  ) AS s ON e.fingerprint = s.fingerprint
+  WHERE org_id = 't1' AND e.type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+      AND e.fingerprint IN (SELECT fingerprint
+FROM profile_series
+WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
+  AND bitAnd(hours, multiIf(day = '2026-11-16' AND day = '2026-11-16', 1792, day = '2026-11-16', 16776960, day = '2026-11-16', 2047, 16777215)) != 0
+  AND type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds')
+      AND e.timestamp_ns >= 1794819585000000000 AND e.timestamp_ns <= 1794823200000000000
+  GROUP BY g, ts
+)
+GROUP BY g
+ORDER BY series_total DESC, g
+UNION ALL
+SELECT 1, CAST([] AS Array(String)), 0, [], fingerprint, arrayFilter(p -> NOT has(['service_name'], p.1), JSONExtractKeysAndValues(any(labels), 'String'))
+FROM profile_series
+WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
+  AND bitAnd(hours, multiIf(day = '2026-11-16' AND day = '2026-11-16', 1792, day = '2026-11-16', 16776960, day = '2026-11-16', 2047, 16777215)) != 0
+  AND type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+GROUP BY fingerprint";
 
     fn tenant(name: &str) -> Tenant {
         let value = http::HeaderValue::from_str(name).expect("a header value");
@@ -679,11 +762,13 @@ ORDER BY series_total DESC, g";
             vec![
                 Point {
                     timestamp: 1,
-                    value: 1.0
+                    value: 1.0,
+                    exemplar: None,
                 },
                 Point {
                     timestamp: 2,
-                    value: 2.0
+                    value: 2.0,
+                    exemplar: None,
                 }
             ]
         );
@@ -691,6 +776,227 @@ ORDER BY series_total DESC, g";
         let tied = vec![row("b", &[(1, 3.0)]), row("a", &[(1, 3.0)])];
         assert_eq!(
             labels(&series(tied, &group_by, None)),
+            vec![pod("a"), pod("b")]
+        );
+    }
+
+    /// S14 (issue #826): plan §0's request with exemplars renders plan §0's
+    /// statement, byte for byte.
+    #[test]
+    fn s14_exemplars_render_the_example_statement() {
+        let g = by_service();
+        let req = SeriesRequest {
+            exemplars: true,
+            ..example(&g)
+        };
+        assert_eq!(planned(&single(), &req, END), EXAMPLE_EXEMPLARS);
+        // Off, the statement is #824's.
+        assert_eq!(planned(&single(), &example(&g), END), EXAMPLE);
+    }
+
+    /// S15 (issue #826): the tenant check accepts Form E with and without
+    /// the join, and Form C, with exemplars, for two tenants, single node
+    /// and clustered; the labels branch is there and scoped.
+    #[test]
+    fn s15_the_tenant_check_accepts_the_exemplar_forms() {
+        let g = by_service();
+        let call_site = strings(&["main", "f"]);
+        for name in ["t1", "t2"] {
+            let term = TenantTerm::of(&tenant(name));
+            for (config, dist) in [(single(), ""), (clustered(), "_dist")] {
+                for req in [
+                    example(&g),
+                    example(&[]),
+                    SeriesRequest {
+                        call_site: &call_site,
+                        ..example(&g)
+                    },
+                ] {
+                    let req = SeriesRequest {
+                        exemplars: true,
+                        ..req
+                    };
+                    let sql = match plan(&tenant(name), &config, &req, END) {
+                        Ok(Some(sql)) => sql,
+                        other => panic!("expected a plan, got {other:?}"),
+                    };
+                    assert!(
+                        sql.contains(
+                            "\nUNION ALL\nSELECT 1, CAST([] AS Array(String)), 0, [], fingerprint, "
+                        ),
+                        "{sql}"
+                    );
+                    assert_eq!(
+                        tenant_scope::check(&sql, &term, &tenant_scope::tables(dist)),
+                        Ok(()),
+                        "{sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// S16 (issue #826): the exemplar's labels drop the `group_by` names;
+    /// without `group_by`, every stored label.
+    #[test]
+    fn s16_exemplar_labels_drop_the_group_by() {
+        let g = strings(&["pod", "service_name"]);
+        let sql = planned(
+            &single(),
+            &SeriesRequest {
+                exemplars: true,
+                ..example(&g)
+            },
+            END,
+        );
+        assert!(
+            sql.contains(
+                "arrayFilter(p -> NOT has(['pod', 'service_name'], p.1), \
+                 JSONExtractKeysAndValues(any(labels), 'String'))"
+            ),
+            "{sql}"
+        );
+        let sql = planned(
+            &single(),
+            &SeriesRequest {
+                exemplars: true,
+                ..example(&[])
+            },
+            END,
+        );
+        assert!(
+            sql.contains("0, [], fingerprint, JSONExtractKeysAndValues(any(labels), 'String')\n"),
+            "{sql}"
+        );
+        assert!(!sql.contains("arrayFilter"), "{sql}");
+    }
+
+    /// S17 (issue #826): with a call site and exemplars, Form C's subquery
+    /// returns each profile's id; off, it is #824's.
+    #[test]
+    fn s17_form_c_carries_the_profile() {
+        let g = by_service();
+        let call_site = strings(&["main", "f"]);
+        let req = SeriesRequest {
+            call_site: &call_site,
+            ..example(&g)
+        };
+        let sql = planned(
+            &single(),
+            &SeriesRequest {
+                exemplars: true,
+                ..req
+            },
+            END,
+        );
+        assert!(
+            sql.contains(
+                "\n    SELECT fingerprint, timestamp_ns, profile_id, sum(value) AS total\n"
+            ),
+            "{sql}"
+        );
+        let sql = planned(&single(), &req, END);
+        assert!(
+            sql.contains("\n    SELECT fingerprint, timestamp_ns, sum(value) AS total\n"),
+            "{sql}"
+        );
+    }
+
+    /// S18 (issue #826): the limit binds the series branch, not the labels
+    /// branch.
+    #[test]
+    fn s18_the_limit_binds_the_series_branch() {
+        let g = by_service();
+        let sql = planned(
+            &single(),
+            &SeriesRequest {
+                exemplars: true,
+                limit: Some(3),
+                ..example(&g)
+            },
+            END,
+        );
+        assert!(
+            sql.contains("ORDER BY series_total DESC, g\nLIMIT 3\nUNION ALL\nSELECT 1,"),
+            "{sql}"
+        );
+    }
+
+    fn exemplar_row(g: &str, points: &[(i64, f64)]) -> TimeSeriesExemplarRow {
+        TimeSeriesExemplarRow {
+            kind: 0,
+            g: vec![g.to_string()],
+            series_total: points.iter().map(|(_, v)| v).sum(),
+            points: points
+                .iter()
+                .map(|(t, v)| (*t, *v, 1, "p".to_string(), *t, 1))
+                .collect(),
+            fingerprint: 0,
+            labels: Vec::new(),
+        }
+    }
+
+    /// S19 (issue #826): each point carries its exemplar, labelled from the
+    /// labels row of its fingerprint; the series are ordered and cut as
+    /// S13's.
+    #[test]
+    fn s19_rows_become_points_with_exemplars() {
+        let x = vec![("x".to_string(), "1".to_string())];
+        let rows = vec![
+            TimeSeriesExemplarRow {
+                kind: 0,
+                g: vec!["a".to_string()],
+                series_total: 3.0,
+                points: vec![(1, 3.0, 3, "p".to_string(), 7, 9)],
+                fingerprint: 0,
+                labels: Vec::new(),
+            },
+            TimeSeriesExemplarRow {
+                kind: 1,
+                g: Vec::new(),
+                series_total: 0.0,
+                points: Vec::new(),
+                fingerprint: 9,
+                labels: x.clone(),
+            },
+        ];
+        let out = series_exemplars(rows, &strings(&["pod"]), None);
+        assert_eq!(
+            out,
+            vec![Series {
+                labels: pod("a"),
+                points: vec![Point {
+                    timestamp: 1,
+                    value: 3.0,
+                    exemplar: Some(Exemplar {
+                        timestamp: 7,
+                        profile_id: "p".to_string(),
+                        span_id: String::new(),
+                        trace_id: String::new(),
+                        value: 3,
+                        labels: x,
+                    }),
+                }],
+            }]
+        );
+        let group_by = strings(&["pod"]);
+        let rows = vec![
+            exemplar_row("a", &[(1, 1.0), (2, 2.0)]),
+            exemplar_row("b", &[(3, 6.0)]),
+            exemplar_row("", &[(4, 5.0)]),
+        ];
+        let out = series_exemplars(rows.clone(), &group_by, None);
+        assert_eq!(labels(&out), vec![pod("b"), vec![], pod("a")]);
+        assert_eq!(
+            labels(&series_exemplars(rows, &group_by, Some(1))),
+            vec![pod("b")]
+        );
+        let tied = vec![
+            exemplar_row("b", &[(1, 3.0)]),
+            exemplar_row("a", &[(1, 3.0)]),
+        ];
+        assert_eq!(
+            labels(&series_exemplars(tied, &group_by, None)),
             vec![pod("a"), pod("b")]
         );
     }

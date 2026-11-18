@@ -6,6 +6,7 @@
 //! series' messages, a `double` written as the reference writes it. W8
 //! (issue #827): the diff's messages. W9 and W10 (issue #825): the
 //! heatmap's messages. W11 (#823 part B): the flame graph's tree bytes.
+//! W11 (issue #826): an exemplar.
 
 use pulsus_profiles_wire::querier_v1::{
     DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
@@ -14,8 +15,8 @@ use pulsus_profiles_wire::querier_v1::{
     SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    GoPgo, HeatmapSeries, HeatmapSlot, LabelPair, Labels, Location, Point, ProfileType, Series,
-    StackTraceSelector,
+    Exemplar, GoPgo, HeatmapSeries, HeatmapSlot, LabelPair, Labels, Location, Point, ProfileType,
+    Series, StackTraceSelector,
 };
 
 fn split(id: &str) -> ProfileType {
@@ -265,6 +266,7 @@ fn w7_a_point_value_is_written_as_the_reference_writes_it() {
         value,
         timestamp: 1_794_819_600_000,
         annotations: Vec::new(),
+        exemplars: Vec::new(),
     };
     assert_eq!(
         serde_json::to_string(&point(28_885_319_484.0)).expect("encode"),
@@ -394,6 +396,7 @@ fn w10_a_slot_is_written_as_the_reference_writes_it() {
         timestamp: 1_794_819_600_000,
         y_min: vec![0.0, 2.5],
         counts: vec![1, 0],
+        exemplars: Vec::new(),
     };
     let text = r#"{"timestamp":"1794819600000","yMin":[0,2.5],"counts":[1,0]}"#;
     assert_eq!(serde_json::to_string(&slot).expect("encode"), text);
@@ -421,4 +424,34 @@ fn w10_a_slot_is_written_as_the_reference_writes_it() {
         serde_json::to_string(&SelectHeatmapResponse::default()).expect("encode"),
         "{}"
     );
+}
+
+/// W11 (issue #826): an exemplar is written as the reference writes it,
+/// read back by either name, and a value of 0 has no `value`.
+#[test]
+fn w11_an_exemplar_is_written_as_the_reference_writes_it() {
+    let exemplar = Exemplar {
+        timestamp: 1_794_819_625_000,
+        profile_id: "00000000-0000-0000-0000-0000000000c2".to_string(),
+        span_id: "0a00000000000000".to_string(),
+        value: 5,
+        labels: vec![LabelPair {
+            name: "pod".to_string(),
+            value: "e".to_string(),
+        }],
+        trace_id: "00000000000000000000000000000002".to_string(),
+    };
+    let text = r#"{"timestamp":"1794819625000","profileId":"00000000-0000-0000-0000-0000000000c2","spanId":"0a00000000000000","value":"5","labels":[{"name":"pod","value":"e"}],"traceId":"00000000000000000000000000000002"}"#;
+    assert_eq!(serde_json::to_string(&exemplar).expect("encode"), text);
+    let back: Exemplar = serde_json::from_str(text).expect("decode");
+    assert_eq!(back, exemplar);
+    let snake = r#"{"timestamp":"1794819625000","profile_id":"00000000-0000-0000-0000-0000000000c2","span_id":"0a00000000000000","value":"5","labels":[{"name":"pod","value":"e"}],"trace_id":"00000000000000000000000000000002"}"#;
+    let back: Exemplar = serde_json::from_str(snake).expect("decode");
+    assert_eq!(back, exemplar);
+    let zero = Exemplar {
+        value: 0,
+        ..exemplar
+    };
+    let text = serde_json::to_string(&zero).expect("encode");
+    assert!(!text.contains(r#""value""#), "{text}");
 }

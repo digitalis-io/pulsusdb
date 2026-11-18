@@ -236,6 +236,27 @@ pub struct Point {
     #[prost(message, repeated, tag = "3")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<ProfileAnnotation>,
+    #[prost(message, repeated, tag = "14")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exemplars: Vec<Exemplar>,
+}
+
+/// Issue #826: stub.
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Exemplar {
+    #[prost(int64, tag = "11")]
+    pub timestamp: i64,
+    #[prost(string, tag = "12")]
+    pub profile_id: String,
+    #[prost(string, tag = "13")]
+    pub span_id: String,
+    #[prost(int64, tag = "14")]
+    pub value: i64,
+    #[prost(message, repeated, tag = "15")]
+    pub labels: Vec<LabelPair>,
+    #[prost(string, tag = "16")]
+    pub trace_id: String,
 }
 
 /// Issue #824: how a time series' step combines its profiles.
@@ -336,4 +357,7 @@ pub struct HeatmapSlot {
     #[prost(int32, repeated, tag = "3")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub counts: Vec<i32>,
+    #[prost(message, repeated, tag = "14")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exemplars: Vec<Exemplar>,
 }

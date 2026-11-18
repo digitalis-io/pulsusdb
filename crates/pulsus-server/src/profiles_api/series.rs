@@ -67,6 +67,7 @@ async fn time_series(
         average: msg.aggregation == Some(TimeSeriesAggregationType::Average as i32),
         call_site: &call_site,
         limit: msg.limit,
+        exemplars: false,
     };
     let Some(sql) = series::plan(tenant, &config, &req, now_ms())? else {
         return Ok(SelectSeriesResponse::default());
@@ -97,6 +98,7 @@ fn wire(series: Vec<series::Series>) -> SelectSeriesResponse {
                         value: p.value,
                         timestamp: p.timestamp,
                         annotations: Vec::new(),
+                        exemplars: Vec::new(),
                     })
                     .collect(),
             })
@@ -239,15 +241,14 @@ mod tests {
         }
     }
 
-    /// D9: unspecified and `NONE` are served; `INDIVIDUAL` and `SPAN` are
-    /// not; another number is refused.
+    /// D9, E7 (issue #826): unspecified, `NONE` and `INDIVIDUAL` are
+    /// served; `SPAN` is not; another number is refused.
     #[test]
     fn the_exemplar_type_is_checked() {
-        for v in [0, 1] {
+        for v in [0, 1, 2] {
             assert!(check_exemplar_type(v).is_ok(), "{v}");
         }
         for (v, code, text) in [
-            (2, Code::Unimplemented, "exemplars are not served yet"),
             (
                 3,
                 Code::Unimplemented,

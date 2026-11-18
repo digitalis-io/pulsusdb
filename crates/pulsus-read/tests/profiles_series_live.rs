@@ -32,6 +32,9 @@ const NO_TRACE: &str = "00000000000000000000000000000000";
 const PROFILE: &str = "00000000-0000-0000-0000-0000000000a0";
 const PROFILE_A: &str = "00000000-0000-0000-0000-0000000000a1";
 const PROFILE_B: &str = "00000000-0000-0000-0000-0000000000b1";
+const C1: &str = "00000000-0000-0000-0000-0000000000c1";
+const C2: &str = "00000000-0000-0000-0000-0000000000c2";
+const C3: &str = "00000000-0000-0000-0000-0000000000c3";
 
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
@@ -90,9 +93,22 @@ fn series_row(org: &str, s: i64, service: &str, fp: u128, pod: Option<&str>) -> 
 
 /// A kind-3 row: one profile's total.
 fn entry_row(org: &str, s: i64, service: &str, fp: u128, ts_ms: i64, total: i64) -> String {
+    profile_entry_row(org, s, service, fp, ts_ms, total, PROFILE)
+}
+
+/// A kind-3 row: `profile`'s total.
+fn profile_entry_row(
+    org: &str,
+    s: i64,
+    service: &str,
+    fp: u128,
+    ts_ms: i64,
+    total: i64,
+    profile: &str,
+) -> String {
     format!(
         "('{org}', {s}, 3, '{CPU}', '{service}', {fp}, {}, 0, {total}, 0, unhex('{NO_TRACE}'), \
-         [], [], '', '{PROFILE}')",
+         [], [], '', '{profile}')",
         ts_ms * 1_000_000
     )
 }
@@ -188,7 +204,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let db = pulsus_testkit::test_db("pulsus_read_it_profiles_series");
+        Self::in_database("pulsus_read_it_profiles_series").await
+    }
+
+    /// The fixture in a database of its own, `name`.
+    async fn in_database(name: &str) -> Self {
+        let db = pulsus_testkit::test_db(name);
         let bootstrap = ChClient::new(test_config("default"))
             .await
             .expect("connect (bootstrap)");
@@ -248,6 +269,26 @@ impl Fixture {
                 )
             })
             .collect())
+    }
+
+    /// Issue #826: plans `req` with exemplars for `org`, reads its rows
+    /// and orders them.
+    async fn exemplars(&self, org: &str, req: &SeriesRequest<'_>) -> Vec<series::Series> {
+        let req = SeriesRequest {
+            exemplars: true,
+            ..*req
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let sql = match series::plan(&tenant(org), &config(), &req, now) {
+            Ok(Some(sql)) => sql,
+            other => panic!("expected a plan for {req:?}, got {other:?}"),
+        };
+        let client = ChClient::new(test_config(&self.db)).await.expect("connect");
+        let rows = ProfilesEngine::new(client, config(), tenant(org))
+            .read_series_exemplars(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{req:?}: {e:?}\n{sql}"));
+        series::series_exemplars(rows, req.group_by, req.limit)
     }
 
     async fn got(&self, org: &str, req: &SeriesRequest<'_>) -> Vec<Got> {
@@ -391,6 +432,172 @@ async fn the_time_series_answers_its_tenants_totals() {
             "query_too_broad: PULSUS_PROFILES_SCAN_BUDGET_ROWS".to_string()
         )),
         "L6"
+    );
+
+    fx.finish().await;
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+/// A series of one point carrying one exemplar.
+fn one_point(
+    labels: Vec<(String, String)>,
+    (timestamp, value): (i64, f64),
+    (at, profile, total): (i64, &str, i64),
+    exemplar_labels: Vec<(String, String)>,
+) -> series::Series {
+    series::Series {
+        labels,
+        points: vec![series::Point {
+            timestamp,
+            value,
+            exemplar: Some(series::Exemplar {
+                timestamp: at,
+                profile_id: profile.to_string(),
+                span_id: String::new(),
+                trace_id: String::new(),
+                value: total,
+                labels: exemplar_labels,
+            }),
+        }],
+    }
+}
+
+/// Issue #826, E1–E6: each point's exemplar is its largest profile,
+/// labelled with its series' stored labels less the `group_by` names.
+#[tokio::test]
+async fn exemplars_name_each_points_largest_profile() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let fx = Fixture::in_database("pulsus_read_it_profiles_series_exemplars").await;
+    let s = fx.s;
+    let client = ChClient::new(test_config(&fx.db)).await.expect("connect");
+    exec(
+        &client,
+        &insert(&[
+            series_row("t1", s, "v", 9, Some("e")),
+            profile_entry_row("t1", s, "v", 9, s + 20_000, 3, C1),
+            profile_entry_row("t1", s, "v", 9, s + 25_000, 5, C2),
+            series_row("t1", s, "v", 10, Some("f")),
+            profile_entry_row("t1", s, "v", 10, s + 28_000, 4, C3),
+        ]),
+    )
+    .await;
+    let l = pairs(&[
+        ("__profile_type__", CPU),
+        ("pod", "e"),
+        ("service_name", "v"),
+    ]);
+    let v = r#"{service_name="v"}"#;
+
+    // E1: the point's largest profile, with all its series' labels.
+    let e1 = fx.exemplars("t1", &fx.request(v)).await;
+    assert_eq!(
+        e1,
+        vec![one_point(
+            vec![],
+            (s + 2 * STEP_MS, 12.0),
+            (s + 25_000, C2, 5),
+            l.clone()
+        )],
+        "E1"
+    );
+
+    // E2: grouped by `pod`, one pick per series, the labels without `pod`.
+    let by_pod = vec!["pod".to_string()];
+    let rest = pairs(&[("__profile_type__", CPU), ("service_name", "v")]);
+    assert_eq!(
+        fx.exemplars(
+            "t1",
+            &SeriesRequest {
+                group_by: &by_pod,
+                ..fx.request(v)
+            }
+        )
+        .await,
+        vec![
+            one_point(
+                pod("e"),
+                (s + 2 * STEP_MS, 8.0),
+                (s + 25_000, C2, 5),
+                rest.clone()
+            ),
+            one_point(pod("f"), (s + 2 * STEP_MS, 4.0), (s + 28_000, C3, 4), rest),
+        ],
+        "E2"
+    );
+
+    // E3: with a call site, the exemplar's value is the profile's
+    // call-site total.
+    let call_site = vec!["main".to_string(), "f".to_string()];
+    assert_eq!(
+        fx.exemplars(
+            "t1",
+            &SeriesRequest {
+                call_site: &call_site,
+                ..fx.request(r#"{service_name="y"}"#)
+            }
+        )
+        .await,
+        vec![one_point(
+            vec![],
+            (s + STEP_MS, 6.0),
+            (s + STEP_MS, PROFILE_B, 4),
+            pairs(&[
+                ("__profile_type__", CPU),
+                ("pod", "c"),
+                ("service_name", "y")
+            ])
+        )],
+        "E3"
+    );
+
+    // E4: another tenant reads none of it.
+    assert_eq!(fx.exemplars("t2", &fx.request(v)).await, vec![], "E4");
+
+    // E5: off, no point carries an exemplar.
+    let now = chrono::Utc::now().timestamp_millis();
+    let sql = match series::plan(&tenant("t1"), &config(), &fx.request(v), now) {
+        Ok(Some(sql)) => sql,
+        other => panic!("E5: expected a plan, got {other:?}"),
+    };
+    let rows = ProfilesEngine::new(client, config(), tenant("t1"))
+        .read_series(&sql)
+        .await
+        .expect("E5");
+    let off = series::series(rows, &[], None);
+    assert_eq!(off.len(), 1, "E5: {off:?}");
+    assert!(
+        off.iter()
+            .flat_map(|s| &s.points)
+            .all(|p| p.exemplar.is_none()),
+        "E5: {off:?}"
+    );
+
+    // E6: `AVERAGE`: the point is the mean, the exemplar the largest
+    // profile.
+    assert_eq!(
+        fx.exemplars(
+            "t1",
+            &SeriesRequest {
+                average: true,
+                ..fx.request(r#"{pod="e"}"#)
+            }
+        )
+        .await,
+        vec![one_point(
+            vec![],
+            (s + 2 * STEP_MS, 4.0),
+            (s + 25_000, C2, 5),
+            l
+        )],
+        "E6"
     );
 
     fx.finish().await;

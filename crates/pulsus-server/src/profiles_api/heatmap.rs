@@ -24,7 +24,7 @@ use super::engine::with_engine;
 use super::routes::{finish, now_ms, prelude};
 
 /// The exemplar types served: none yet. Exemplars are #826's.
-fn check_exemplar_type(v: i32) -> Result<(), ConnectError> {
+fn check_exemplar_type(v: i32, _query_type: i32) -> Result<(), ConnectError> {
     match ExemplarType::try_from(v) {
         Ok(ExemplarType::Unspecified | ExemplarType::None) => Ok(()),
         Ok(ExemplarType::Individual | ExemplarType::Span) => Err(ConnectError::new(
@@ -55,11 +55,12 @@ async fn select(
         group_by: &msg.group_by,
         query_type: msg.query_type,
         limit: msg.limit,
+        exemplars: false,
     };
     let Some(sql) = heatmap::plan(tenant, &config, &req, now_ms())? else {
         return Ok(SelectHeatmapResponse::default());
     };
-    check_exemplar_type(msg.exemplar_type)?;
+    check_exemplar_type(msg.exemplar_type, msg.query_type)?;
     let sql = sql.as_str();
     let rows = with_engine(state, tenant, |engine| async move {
         Ok(engine.read_heatmap(sql).await?)
@@ -85,6 +86,7 @@ fn wire(series: Vec<heatmap::Series>) -> SelectHeatmapResponse {
                         timestamp: slot.timestamp,
                         y_min: slot.y_min,
                         counts: slot.counts,
+                        exemplars: Vec::new(),
                     })
                     .collect(),
             })
@@ -106,4 +108,47 @@ pub(crate) async fn select_heatmap(
             Err(refused) => return refused.into_response(),
         };
     finish(codec, select(&state, &tenant, msg).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsus_read::profiles::heatmap::{QUERY_TYPE_INDIVIDUAL, QUERY_TYPE_SPAN};
+
+    /// E8 (issue #826): an exemplar type is served with its own query
+    /// type, unspecified and `NONE` with either; a mismatch and an unknown
+    /// number are `invalid_argument`.
+    #[test]
+    fn the_exemplar_type_matches_the_query_type() {
+        let both = [QUERY_TYPE_INDIVIDUAL, QUERY_TYPE_SPAN];
+        for (v, q) in [(2, QUERY_TYPE_INDIVIDUAL), (3, QUERY_TYPE_SPAN)]
+            .into_iter()
+            .chain(both.into_iter().flat_map(|q| [(0, q), (1, q)]))
+        {
+            assert!(check_exemplar_type(v, q).is_ok(), "({v}, {q})");
+        }
+        let mut refused = vec![
+            (
+                2,
+                QUERY_TYPE_SPAN,
+                "individual exemplars only available for individual query type",
+            ),
+            (
+                3,
+                QUERY_TYPE_INDIVIDUAL,
+                "span exemplars only available for span query type",
+            ),
+        ];
+        for q in both {
+            refused.push((9, q, "unknown exemplar type: 9"));
+        }
+        for (v, q, text) in refused {
+            let e = check_exemplar_type(v, q).expect_err("refused");
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (Code::InvalidArgument, text),
+                "({v}, {q})"
+            );
+        }
+    }
 }
