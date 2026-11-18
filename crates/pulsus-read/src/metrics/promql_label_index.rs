@@ -560,7 +560,8 @@ impl LabelIndex {
 
     /// Removes every series whose newest hour starts before
     /// `lower_bound_ms`, compacting in place and renumbering the rest in
-    /// order. Returns how many were removed.
+    /// order, and shrinks every list to its length. Returns how many were
+    /// removed.
     pub(crate) fn age_out(&mut self, lower_bound_ms: i64) -> usize {
         let n = self.len();
         let mut remap: Vec<u32> = vec![u32::MAX; n];
@@ -624,9 +625,6 @@ impl LabelIndex {
             w += 1;
         }
         let removed = n - w;
-        if removed == 0 {
-            return 0;
-        }
         self.fps.truncate(w);
         self.metric.truncate(w);
         self.last_hour.truncate(w);

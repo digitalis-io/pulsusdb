@@ -902,8 +902,8 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
-                 SELECT 2, 'up', number + 1000, {recent}, \
+                "INSERT INTO {db}.metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels) \
+                 SELECT {now_ms}, 2, 'up', number + 1000, {recent}, \
                         concat('{{\"job\":\"w', toString(number), '\"}}') \
                  FROM numbers(200000)"
             ),

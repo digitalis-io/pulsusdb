@@ -122,6 +122,8 @@ async fn a_new_series_reaches_the_cache_through_the_feed() {
     let client = ChClient::new(test_config(db)).await.expect("connect");
 
     register(&client, "feed_a_metric", 101, "a").await;
+    // The query log outlives the database; only this run's statements count.
+    let started = now_ms();
     let cache = LabelCache::new(
         ChClient::new(test_config(db))
             .await
@@ -152,6 +154,7 @@ async fn a_new_series_reaches_the_cache_through_the_feed() {
          WHERE type = 'QueryFinish' AND is_initial_query \
            AND log_comment = 'background:label-cache-sweep' \
            AND has(databases, '{db}') \
+           AND query_start_time_microseconds >= fromUnixTimestamp64Milli(toInt64({started})) \
          ORDER BY event_time_microseconds"
     );
     let mut stream = bootstrap
