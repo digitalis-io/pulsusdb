@@ -2952,7 +2952,7 @@ fn assert_reference_identity(reference: &Server, tenant: &str) {
     );
 }
 
-/// **L1.** Pushes the fixture to both servers under both tenants, then
+/// **L1.** Pushes the fixture to both servers under both pairs of tenants, then
 /// compares every case and checks every fixture expectation, the stored
 /// values and isolation; every difference is reported at once.
 #[tokio::test(flavor = "multi_thread")]
