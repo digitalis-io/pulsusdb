@@ -6,7 +6,7 @@
 //! `pprof/<reference>/<reference>.go`), which is Apache-2.0, and of the
 //! reference's `pkg/og/convert/jfr/profile.go:31-162`. Two of the library's
 //! results are corrected (`docs/reference-defects-we-do-not-copy.md`
-//! entries 48 and 49). Pure functions, no I/O.
+//! entries 47 and 48). Pure functions, no I/O.
 
 mod reader;
 
@@ -281,7 +281,7 @@ pub(crate) struct Builders {
 }
 
 /// A lock or park duration in nanoseconds: its chunk's ticks scaled, or the
-/// ticks when the chunk names no rate (entry 48).
+/// ticks when the chunk names no rate (entry 47).
 fn delay_nanos(ticks: u64, ticks_per_second: u64) -> i64 {
     if ticks_per_second == 0 {
         return ticks as i64;
@@ -319,7 +319,7 @@ impl Builders {
     }
 
     /// One event. Each counts once, a wall-clock sample as its `samples`
-    /// (entry 49).
+    /// (entry 48).
     pub(crate) fn add(
         &mut self,
         pools: &Pools<'_>,

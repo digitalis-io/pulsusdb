@@ -468,9 +468,11 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
 
     let m = SelectMergeStacktracesResponse {
         flamegraph: Some(flame_graph()),
+        tree: vec![0, 0, 1],
     };
     let mut b = Vec::new();
     nested(1, &flame_graph_bytes(&flame_graph()), &mut b);
+    encoding::bytes::encode(2, &m.tree, &mut b);
     assert_eq!(m.encode_to_vec(), b, "SelectMergeStacktracesResponse");
 
     let m = SelectMergeStacktracesRequest {
