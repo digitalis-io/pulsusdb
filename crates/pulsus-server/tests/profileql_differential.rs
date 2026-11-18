@@ -79,9 +79,8 @@ const LEDGER_PHRASE: &str = "the profiles differential's ledger";
 const HOUR_MS: i64 = 3_600_000;
 
 /// Every row's `rx` value, sorted.
-const RX: [&str; 16] = [
+const RX: [&str; 15] = [
     "ingest-folded",
-    "ingest-jfr",
     "ingest-lines",
     "ingest-multipart",
     "ingest-pprof",
@@ -99,9 +98,8 @@ const RX: [&str; 16] = [
 ];
 
 /// The `service_name` values the fixture stores under either tenant.
-const SERVICES: [&str; 16] = [
+const SERVICES: [&str; 15] = [
     "svc-ingest-folded",
-    "svc-ingest-jfr",
     "svc-ingest-lines",
     "svc-ingest-multipart.cpu",
     "svc-ingest-pprof.cpu",
@@ -654,7 +652,6 @@ static CASES: &[Case] = &[
         expect: Expect::Parity(Fixture::Exactly {
             t1: &[
                 "ingest-folded",
-                "ingest-jfr",
                 "ingest-lines",
                 "ingest-speedscope",
                 "ingest-tree",
@@ -668,7 +665,6 @@ static CASES: &[Case] = &[
             ],
             t2: &[
                 "ingest-folded",
-                "ingest-jfr",
                 "ingest-lines",
                 "ingest-speedscope",
                 "ingest-tree",
@@ -1847,23 +1843,6 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
             },
         },
     ];
-    out.push(Push {
-        rx: "ingest-jfr",
-        transport: Transport::Http {
-            path: format!(
-                "/ingest?name={}&format=jfr&spyName=javaspy&sampleRate=100&from={}&until={}",
-                encode_query("svc-ingest-jfr{rx=ingest-jfr,env=prod}"),
-                t0_s + 11,
-                t0_s + 21
-            ),
-            headers: vec![(
-                "Content-Type",
-                format!("multipart/form-data; boundary=b819-{run}"),
-            )],
-            body: jfr_multipart(&format!("b819-{run}"), &jfr_file("example.jfr.gz")),
-            answer: PushAnswer::Ingest,
-        },
-    });
     let (only_labels, only_profile) = if t1 {
         (
             [
@@ -1975,6 +1954,29 @@ fn uvarint(out: &mut Vec<u8>, mut v: u64) {
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+/// Issue #819's JFR row: `example.jfr`, gzipped, as a form's `jfr` part,
+/// pushed under its own pair of tenants, `j1` and `j2`, so the other
+/// fixtures' answers do not hold its stacks.
+fn jfr_pushes(t0_s: i64, run: &str) -> Vec<Push> {
+    vec![Push {
+        rx: "ingest-jfr",
+        transport: Transport::Http {
+            path: format!(
+                "/ingest?name={}&format=jfr&spyName=javaspy&sampleRate=100&from={}&until={}",
+                encode_query("svc-ingest-jfr{rx=ingest-jfr,env=prod}"),
+                t0_s + 11,
+                t0_s + 21
+            ),
+            headers: vec![(
+                "Content-Type",
+                format!("multipart/form-data; boundary=b819-{run}"),
+            )],
+            body: jfr_multipart(&format!("b819-{run}"), &jfr_file("example.jfr.gz")),
+            answer: PushAnswer::Ingest,
+        },
+    }]
 }
 
 /// The query fixture (§3.2): every count times 1 under `q1`, 100 under
@@ -2257,9 +2259,6 @@ fn landing_sets(t1: bool) -> BTreeSet<LabelSet> {
     ] {
         out.insert(pair(s, TYPE_A));
         out.insert(pair(s, TYPE_B));
-    }
-    for (ty, _) in jfr_totals() {
-        out.insert(pair("svc-ingest-jfr", ty));
     }
     if t1 {
         out.insert(pair("svc-only", TYPE_A));
@@ -3107,6 +3106,8 @@ async fn profileql_matches_the_reference() {
     let t2 = format!("t2-{run}");
     let q1 = format!("q1-{run}");
     let q2 = format!("q2-{run}");
+    let j1 = format!("j1-{run}");
+    let j2 = format!("j2-{run}");
     wait_ready(&reference);
     assert_reference_identity(&reference, &t1);
 
@@ -3135,6 +3136,8 @@ async fn profileql_matches_the_reference() {
         (&t2, pushes(t0_s, &run, false)),
         (&q1, query_pushes(t0_s, s0_s, true)),
         (&q2, query_pushes(t0_s, s0_s, false)),
+        (&j1, jfr_pushes(t0_s, &run)),
+        (&j2, jfr_pushes(t0_s, &run)),
     ];
     for (tenant, tenant_pushes) in &all_pushes {
         for push in tenant_pushes {
@@ -3180,7 +3183,15 @@ async fn profileql_matches_the_reference() {
     // Visible before compared, with the filler writer running.
     let filler = Filler::start(reference.clone(), format!("filler-{run}"));
     let deadline = Instant::now() + Duration::from_secs(240);
-    let all: [(&String, &[&str]); 4] = [(&t1, &RX), (&t2, &RX), (&q1, &Q_RX), (&q2, &Q_RX)];
+    let jfr_rx: &[&str] = &["ingest-jfr"];
+    let all: [(&String, &[&str]); 6] = [
+        (&t1, &RX),
+        (&t2, &RX),
+        (&q1, &Q_RX),
+        (&q2, &Q_RX),
+        (&j1, jfr_rx),
+        (&j2, jfr_rx),
+    ];
     for (tenant, rx) in all {
         for server in [&ours, &reference] {
             pulsus_testkit::settle_by(
@@ -3406,7 +3417,7 @@ async fn profileql_matches_the_reference() {
     // type, against the library's own expected outputs; the lock delay is
     // the ledger's, pinned on both sides.
     let (delay_theirs, delay_ours) = jfr_delay_pins();
-    for (tenant, _) in [(&t1, true), (&t2, false)] {
+    for tenant in [&j1, &j2] {
         for (ty, want) in jfr_totals() {
             let body = SelectMergeStacktracesRequest {
                 profile_type_id: ty.to_string(),
