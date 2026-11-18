@@ -3180,13 +3180,14 @@ async fn profileql_matches_the_reference() {
     // Visible before compared, with the filler writer running.
     let filler = Filler::start(reference.clone(), format!("filler-{run}"));
     let deadline = Instant::now() + Duration::from_secs(240);
-    for (tenant, rx) in [(&t1, &RX), (&t2, &RX), (&q1, &Q_RX), (&q2, &Q_RX)] {
+    let all: [(&String, &[&str]); 4] = [(&t1, &RX), (&t2, &RX), (&q1, &Q_RX), (&q2, &Q_RX)];
+    for (tenant, rx) in all {
         for server in [&ours, &reference] {
             pulsus_testkit::settle_by(
                 deadline,
                 Duration::from_secs(2),
                 &format!("{} rx values under {tenant}", server.name),
-                || rx_values(server, tenant, w).filter(|names| names == rx),
+                || rx_values(server, tenant, w).filter(|names| names.as_slice() == rx),
             );
         }
     }
