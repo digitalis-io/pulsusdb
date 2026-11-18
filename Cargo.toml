@@ -29,6 +29,10 @@ regex = "1"
 # apart from it silently (the tripwire is `pulsus-re2`'s
 # `the_estimate_upper_bounds_the_measured_peak`).
 regex-syntax = "0.8"
+# Issue #880: the PromQL label cache's symbol table and fingerprint shards
+# store `u32` ids hashed by the string or fingerprint they name, which
+# `HashTable` holds without a key copy. Already in the lock at 0.15.5.
+hashbrown = "0.15"
 
 # HTTP server stack (issue #6): axum/tower/tower-http for the router and its
 # middleware layers, tracing/tracing-subscriber for structured logging driven

@@ -33,15 +33,16 @@
 //! `leaf` compiles it. Keeping the accessor's return type `Vec<R>` rather
 //! than a stream is what makes the second half hold.
 //!
-//! The label-cache sweep (`super::refresh`) holds its own client and is
-//! deliberately outside this seal: it issues one fixed, matcher-free
-//! `metric_series` scan, never user text, and its errors are swallowed
-//! into `MetricsCacheStats::sweep_failures` rather than surfaced to a
-//! client. Issue #398 gives that sweep the same `max_memory_usage` ceiling
-//! this path carries (`super::refresh::sweep_settings`) — being outside
-//! the ERROR-MAPPING seal is not a reason to be outside the BUDGET, and
-//! an unbounded sweep would be the one metrics read competing for server
-//! memory with no ceiling at all. Its failure behaviour is unchanged.
+//! The label cache's passes (`super::refresh`) hold their own client and
+//! are deliberately outside this seal: each issues one fixed, matcher-free
+//! statement — the build over `metric_labels` or the feed over
+//! `metric_landing` (issue #880) — never user text, and their errors are
+//! counted in `refresh_failures_total` rather than surfaced to a client.
+//! Issue #398 gives them the same `max_memory_usage` ceiling this path
+//! carries (`super::refresh::sweep_settings`) — being outside the
+//! ERROR-MAPPING seal is not a reason to be outside the BUDGET, and an
+//! unbounded pass would be the one metrics read competing for server
+//! memory with no ceiling at all.
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChError, QuerySettings};

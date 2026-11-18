@@ -106,16 +106,40 @@ fn lookup_tables<'a>(series_table: &'a str, labels_table: &'a str) -> SeriesTabl
     }
 }
 
-/// The sweep's statement (`super::refresh`): statement 2 with no matcher,
-/// every series active in the cache window with its own name and labels.
-pub fn sweep_query(
+/// The label cache's build (issue #880, `super::refresh`): every series
+/// with a registration in `[lower_bound_ms, now_ms]`, from the lookup
+/// table's own first and last registration. No `GROUP BY` and no `FINAL`:
+/// a series appears once per unmerged part, and the index keeps the
+/// newest bucket.
+pub fn label_index_build_query(
     tenant: &Tenant,
-    series_table: &str,
     labels_table: &str,
-    window: DataWindow,
+    lower_bound_ms: i64,
+    now_ms: i64,
 ) -> String {
-    series_read(tenant, window, &[], &[], &[])
-        .with_labels(lookup_tables(series_table, labels_table))
+    format!(
+        "SELECT fingerprint, metric_name, last_seen AS bucket_ms, labels\n\
+         FROM {labels_table}\n\
+         WHERE org_id = {}\n\
+         \x20 AND last_seen >= {lower_bound_ms}\n\
+         \x20 AND first_seen <= {now_ms}",
+        tenant.sql_literal()
+    )
+}
+
+/// The label cache's feed (issue #880, `super::refresh`): the series
+/// registrations — `metric_landing`'s kind-2 rows — received from
+/// `from_ms` on. The landing table is partitioned by `received_ms`'s hour,
+/// so the bound prunes every older part.
+pub fn label_index_feed_query(tenant: &Tenant, landing_table: &str, from_ms: i64) -> String {
+    format!(
+        "SELECT fingerprint, metric_name, unix_milli AS bucket_ms, labels\n\
+         FROM {landing_table}\n\
+         WHERE kind = 2\n\
+         \x20 AND org_id = {}\n\
+         \x20 AND received_ms >= {from_ms}",
+        tenant.sql_literal()
+    )
 }
 
 /// Statement 1 (issue #623): the IDs of `metric_name`'s series that
@@ -2025,7 +2049,8 @@ mod tests {
             s1,
             s2,
             by_names,
-            sweep_query(&no_tenant(), "metric_series", "metric_labels", evening()),
+            label_index_build_query(&no_tenant(), "metric_labels", 0, 1),
+            label_index_feed_query(&no_tenant(), "metric_landing", 0),
         ] {
             assert!(!sql.contains("JOIN"), "{sql}");
         }
@@ -2247,6 +2272,48 @@ WHERE org_id = 'tenant-q'
             );
             for stmt in [&c, &a, &thinned, &h, &two] {
                 assert!(!stmt.contains("JOIN"), "{stmt}");
+            }
+        }
+    }
+
+    /// **T5 (issue #880): the label cache's two statements, byte for
+    /// byte**, for the empty tenant and `t1`, over the bare tables and
+    /// their `_dist` wrappers.
+    #[test]
+    fn label_index_build_and_feed_statements_render_exactly() {
+        let header = http::HeaderValue::from_static("t1");
+        let t1 = Tenant::from_header(Some(&header), false).expect("tenant t1");
+        for (tenant, org) in [(no_tenant(), "''"), (t1, "'t1'")] {
+            for dist in ["", "_dist"] {
+                assert_eq!(
+                    label_index_build_query(
+                        &tenant,
+                        &format!("metric_labels{dist}"),
+                        1_788_818_400_000,
+                        1_788_823_800_000,
+                    ),
+                    format!(
+                        "SELECT fingerprint, metric_name, last_seen AS bucket_ms, labels\n\
+                         FROM metric_labels{dist}\n\
+                         WHERE org_id = {org}\n\
+                         \x20 AND last_seen >= 1788818400000\n\
+                         \x20 AND first_seen <= 1788823800000"
+                    )
+                );
+                assert_eq!(
+                    label_index_feed_query(
+                        &tenant,
+                        &format!("metric_landing{dist}"),
+                        1_788_823_620_000,
+                    ),
+                    format!(
+                        "SELECT fingerprint, metric_name, unix_milli AS bucket_ms, labels\n\
+                         FROM metric_landing{dist}\n\
+                         WHERE kind = 2\n\
+                         \x20 AND org_id = {org}\n\
+                         \x20 AND received_ms >= 1788823620000"
+                    )
+                );
             }
         }
     }

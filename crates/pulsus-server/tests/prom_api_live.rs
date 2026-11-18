@@ -156,121 +156,38 @@ struct SeedSeriesRow {
     labels: String,
 }
 
-/// Issue #623: a series is an activity row in `metric_series` and its label
-/// set, once, in `metric_labels` — what the two views write from one kind-2
-/// landing row.
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedActivityRow {
-    org_id: String,
-    day: u16,
-    fingerprint: u128,
-    metric_name: String,
-    hours: u32,
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedLabelRow {
-    org_id: String,
-    metric_name: String,
-    fingerprint: u128,
-    labels: String,
-    first_seen: i64,
-    last_seen: i64,
-}
-
 trait InsertSeries {
     async fn insert_series(&self, rows: &[SeedSeriesRow]) -> Result<(), ChError>;
 }
 
+/// Each series' registration, as the writer lands it: one kind-2 row in
+/// `metric_landing`, received now, carrying the series' label JSON as given.
+/// The views write its activity row, its lookup row and its label index
+/// rows from it, and the label cache reads it (issue #880).
 impl InsertSeries for ChClient {
     async fn insert_series(&self, rows: &[SeedSeriesRow]) -> Result<(), ChError> {
-        let activity: Vec<SeedActivityRow> = rows
+        let org: std::sync::Arc<str> = std::sync::Arc::from("");
+        let received_ms = now_ms();
+        let landing: Vec<pulsus_write::MetricLandingRow> = rows
             .iter()
-            .map(|r| SeedActivityRow {
-                org_id: String::new(),
-                day: r.unix_milli.div_euclid(86_400_000) as u16,
-                fingerprint: r.fingerprint,
-                metric_name: r.metric_name.clone(),
-                hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+            .map(|r| {
+                let mut row = pulsus_write::MetricLandingRow::series(
+                    &org,
+                    received_ms,
+                    &pulsus_write::SeriesRef {
+                        metric_name: std::sync::Arc::from(r.metric_name.as_str()),
+                        fingerprint: pulsus_model::Fingerprint::from_raw(r.fingerprint),
+                        labels: pulsus_model::LabelSet::default(),
+                    },
+                    r.unix_milli,
+                    0,
+                );
+                row.labels = r.labels.clone();
+                row
             })
             .collect();
-        let labels: Vec<SeedLabelRow> = rows
-            .iter()
-            .map(|r| SeedLabelRow {
-                org_id: String::new(),
-                metric_name: r.metric_name.clone(),
-                fingerprint: r.fingerprint,
-                labels: r.labels.clone(),
-                first_seen: r.unix_milli,
-                last_seen: r.unix_milli,
-            })
-            .collect();
-        self.insert_block("metric_series", &activity).await?;
-        self.insert_block("metric_labels", &labels).await?;
-        // Issue #635: the label index and its values, as the two views
-        // write them from the same kind-2 row.
-        let (index, values) = index_rows(
-            rows.iter()
-                .map(|r| (r.fingerprint, r.labels.as_str(), r.unix_milli)),
-        );
-        self.insert_block("metric_label_index", &index).await?;
-        self.insert_block("metric_label_values", &values).await
+        self.insert_block("metric_landing", &landing).await
     }
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedIndexRow {
-    org_id: String,
-    key: String,
-    value: String,
-    fingerprint: u128,
-    /// Issue #496: the time the view gives a row, its sample's `unix_milli`.
-    last_seen: i64,
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedValueRow {
-    org_id: String,
-    key: String,
-    value: String,
-    /// Issue #496: the latest `unix_milli` of the pair, as the view takes it.
-    last_seen: i64,
-}
-
-/// One index row per label of each series, and one values row per
-/// distinct key and value.
-fn index_rows<'a>(
-    series: impl Iterator<Item = (u128, &'a str, i64)>,
-) -> (Vec<SeedIndexRow>, Vec<SeedValueRow>) {
-    let mut index = Vec::new();
-    let mut pairs: std::collections::BTreeMap<(String, String), i64> = Default::default();
-    for (fingerprint, labels, unix_milli) in series {
-        let map: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(labels).expect("canonical label JSON");
-        for (key, value) in map {
-            let seen = pairs
-                .entry((key.clone(), value.clone()))
-                .or_insert(unix_milli);
-            *seen = (*seen).max(unix_milli);
-            index.push(SeedIndexRow {
-                org_id: String::new(),
-                key,
-                value,
-                fingerprint,
-                last_seen: unix_milli,
-            });
-        }
-    }
-    let values = pairs
-        .into_iter()
-        .map(|((key, value), last_seen)| SeedValueRow {
-            org_id: String::new(),
-            key,
-            value,
-            last_seen,
-        })
-        .collect();
-    (index, values)
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]

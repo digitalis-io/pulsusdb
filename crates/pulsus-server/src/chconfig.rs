@@ -315,10 +315,18 @@ pub(crate) fn profile_writer_tables_from(config: &Config) -> ProfileWriterTables
 }
 
 /// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect
-/// plan): on a cluster the cache reads `metric_series` and `metric_labels`
-/// through their `PULSUS_DIST_SUFFIX` wrappers; the metrics writer inserts
-/// through `metric_landing`'s wrapper on the same key, `cityHash64(fingerprint)`
-/// ([`metric_writer_tables_from`]).
+/// plan): on a cluster the cache reads `metric_series`, `metric_labels` and
+/// `metric_landing` through their `PULSUS_DIST_SUFFIX` wrappers; the metrics
+/// writer inserts through `metric_landing`'s wrapper on the same key,
+/// `cityHash64(fingerprint)` ([`metric_writer_tables_from`]).
+///
+/// `feed_overlap_ms` (issue #880) is the bound on how late a series
+/// registration becomes readable after the writer stamps its
+/// `received_ms`: the writer's landing budget
+/// ([`pulsus_write::writer::CLAIM_INSERT_BOUND`]) for the insert to start,
+/// `PULSUS_QUERY_TIMEOUT` for it to commit on every shard, and 60 s more —
+/// 30 s for a replica the cache's replica guard still reads, 30 s of clock
+/// difference between writer and reader. 300 s at the defaults.
 /// `staleness_multiplier` is the documented constant
 /// ([`pulsus_read::DEFAULT_STALENESS_MULTIPLIER`], task-manager resolution
 /// #2 on issue #30), not yet promoted to a config field.
@@ -328,7 +336,12 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
     } else {
         ""
     };
+    let feed_overlap = pulsus_write::writer::CLAIM_INSERT_BOUND
+        + config.query_timeout.0
+        + std::time::Duration::from_secs(60);
     LabelCacheConfig {
+        landing_table: format!("metric_landing{dist}"),
+        feed_overlap_ms: i64::try_from(feed_overlap.as_millis()).unwrap_or(i64::MAX),
         db: config.clickhouse.database.clone(),
         series_table: format!("metric_series{dist}"),
         labels_table: format!("metric_labels{dist}"),
@@ -336,12 +349,9 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         cache_max_series: config.reader.cache_max_series,
         ttl: config.reader.cache_ttl.0,
         staleness_multiplier: pulsus_read::DEFAULT_STALENESS_MULTIPLIER,
-        // Issue #398: the background refresh sweep carries the same
-        // per-query memory ceiling as the request path; its warn-and-serve-
-        // the-last-good-snapshot failure behaviour is unchanged.
+        // Issue #398: the label cache's statements carry the same
+        // per-query memory ceiling as the request path.
         read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
-        // #603 follow-up: the sweep sends the answer pins too.
-        skip_unavailable_shards: config.skip_unavailable_shards,
     }
 }
 
@@ -487,20 +497,17 @@ mod tests {
         }
     }
 
-    /// S2 (#603 follow-up): the option reaches the metrics engine and the
-    /// label cache's sweep, both ways.
+    /// S2 (#603 follow-up): the option reaches the metrics engine, both
+    /// ways. The label cache's statements always read every shard (issue
+    /// #880), so it does not reach them.
     #[test]
-    fn metrics_and_label_cache_configs_map_skip_unavailable_shards() {
+    fn metrics_config_maps_skip_unavailable_shards() {
         for skip in [true, false] {
             let config = Config {
                 skip_unavailable_shards: skip,
                 ..Config::default()
             };
             assert_eq!(metrics_config_from(&config).skip_unavailable_shards, skip);
-            assert_eq!(
-                label_cache_config_from(&config).skip_unavailable_shards,
-                skip
-            );
         }
     }
 
@@ -812,6 +819,7 @@ mod tests {
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series");
         assert_eq!(cfg.labels_table, "metric_labels");
+        assert_eq!(cfg.landing_table, "metric_landing");
     }
 
     #[test]
@@ -823,6 +831,7 @@ mod tests {
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series_dist");
         assert_eq!(cfg.labels_table, "metric_labels_dist");
+        assert_eq!(cfg.landing_table, "metric_landing_dist");
     }
 
     #[test]
@@ -1002,5 +1011,7 @@ mod tests {
             cfg.staleness_multiplier,
             pulsus_read::DEFAULT_STALENESS_MULTIPLIER
         );
+        // Issue #880: the feed's overlap is 300 s at the defaults.
+        assert_eq!(cfg.feed_overlap_ms, 300_000);
     }
 }
