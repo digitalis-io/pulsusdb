@@ -19,7 +19,8 @@ use pulsus_profiles_wire::google_v1::{
     Function, Label, Line, Location, Mapping, Profile, Sample, ValueType,
 };
 
-use self::reader::{Correlation, Event, IdMap, Pools, Reader};
+pub use self::reader::{BUDGET_CAP, BUDGET_FLOOR, BUDGET_PER_BODY_BYTE, budget_bytes};
+use self::reader::{Budget, Correlation, Event, IdMap, OVER_BUDGET, Pools, Reader};
 use crate::ingest::profiles::ProfileInput;
 use crate::protocols::profile_model::{MAX_PROFILE_SIZE_BYTES, SPY_LABEL};
 use crate::protocols::profile_push::{Labels, LegacyQuery, boundary_of, file_parts};
@@ -137,15 +138,24 @@ struct Builder {
     functions: IdMap<u32, u64>,
     locations: IdMap<(u32, u32), u64>,
     samples: IdMap<(u64, Correlation), usize>,
-    /// A lower bound of the samples' encoded size. Past the model's profile
-    /// size limit no sample is added: the profile is refused for its size
-    /// whatever else it would hold, and the recording cannot grow it
-    /// further.
-    held: u64,
+    /// The push's allocation budget: every string, function, location and
+    /// sample is charged before it is made.
+    budget: Budget,
+    /// Set once a charge failed; nothing more is made.
+    over: bool,
+}
+
+/// A map entry's charge, as the reader's.
+const fn entry<K, V>() -> u64 {
+    2 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) as u64 + 2
+}
+
+const fn twice<T>() -> u64 {
+    2 * std::mem::size_of::<T>() as u64
 }
 
 impl Builder {
-    fn new(kind: &SampleKind, time_nanos: i64, duration_nanos: i64) -> Builder {
+    fn new(kind: &SampleKind, time_nanos: i64, duration_nanos: i64, budget: Budget) -> Builder {
         let mut b = Builder {
             metric: kind.metric,
             profile: Profile {
@@ -162,7 +172,8 @@ impl Builder {
             functions: IdMap::default(),
             locations: IdMap::default(),
             samples: IdMap::default(),
-            held: 0,
+            budget,
+            over: false,
         };
         b.intern("");
         for (ty, unit) in kind.sample_types {
@@ -181,9 +192,23 @@ impl Builder {
         b
     }
 
+    /// `bytes` spent from the budget; `false`, and the builder stopped,
+    /// when they do not fit.
+    fn charge(&mut self, bytes: u64) -> bool {
+        if !self.over && !self.budget.charge(bytes) {
+            self.over = true;
+        }
+        !self.over
+    }
+
+    /// The string's index, the string added when new: its two copies, the
+    /// table's and the map's, charged first.
     fn intern(&mut self, s: &str) -> i64 {
         if let Some(&i) = self.strings.get(s) {
             return i;
+        }
+        if !self.charge(2 * s.len() as u64 + twice::<String>() + entry::<String, i64>()) {
+            return 0;
         }
         let i = self.profile.string_table.len() as i64;
         self.profile.string_table.push(s.to_string());
@@ -197,7 +222,11 @@ impl Builder {
     fn sample_labels(&mut self, labels: &LabelsSnapshot, c: &Correlation) -> Vec<Label> {
         let text = |id: i64| labels.strings.get(&id).map_or("", String::as_str);
         let mut out = Vec::new();
-        if let Some(ctx) = labels.contexts.get(&(c.context_id as i64)) {
+        let ctx = labels.contexts.get(&(c.context_id as i64));
+        if !self.charge((ctx.map_or(0, |x| x.labels.len()) as u64 + 3) * twice::<Label>()) {
+            return out;
+        }
+        if let Some(ctx) = ctx {
             for (&k, &v) in &ctx.labels {
                 let label = Label {
                     key: self.intern(text(k)),
@@ -242,6 +271,9 @@ impl Builder {
 /// `pprof/pprof.go:79-148`).
 pub(crate) struct Builders {
     builders: [Option<Builder>; 9],
+    budget: Budget,
+    /// Set when the `event` setting did not fit the budget.
+    over: bool,
     time_nanos: i64,
     duration_nanos: i64,
     period: i64,
@@ -261,6 +293,8 @@ impl Builders {
     pub(crate) fn new(time_nanos: i64, duration_nanos: i64, sample_rate: u32) -> Builders {
         Builders {
             builders: Default::default(),
+            budget: Budget::new(u64::MAX),
+            over: false,
             time_nanos,
             duration_nanos,
             period: if sample_rate == 0 {
@@ -270,6 +304,18 @@ impl Builders {
             },
             event: String::new(),
         }
+    }
+
+    /// The builders, their allocations charged to `budget`.
+    pub(crate) fn with_budget(mut self, budget: Budget) -> Builders {
+        self.budget = budget;
+        self
+    }
+
+    /// `true` once an allocation did not fit the budget: the push is to be
+    /// refused.
+    pub(crate) fn over_budget(&self) -> bool {
+        self.over || self.builders.iter().flatten().any(|b| b.over)
     }
 
     /// One event. Each counts once, a wall-clock sample as its `samples`
@@ -351,6 +397,10 @@ impl Builders {
             }
             Event::ActiveSetting { name, value } => {
                 if name == "event" {
+                    if !self.budget.charge(value.len() as u64) {
+                        self.over = true;
+                        return;
+                    }
                     self.event = value.to_string();
                 }
             }
@@ -374,8 +424,13 @@ impl Builders {
             1
         };
         let (time_nanos, duration_nanos) = (self.time_nanos, self.duration_nanos);
-        let b = self.builders[kind]
-            .get_or_insert_with(|| Builder::new(&KINDS[kind], time_nanos, duration_nanos));
+        let budget = &self.budget;
+        let b = self.builders[kind].get_or_insert_with(|| {
+            Builder::new(&KINDS[kind], time_nanos, duration_nanos, budget.clone())
+        });
+        if b.over {
+            return;
+        }
         let Some(frames) = pools.stack_traces.get(&stack) else {
             return;
         };
@@ -385,7 +440,11 @@ impl Builders {
             }
             return;
         }
-        if b.held > MAX_PROFILE_SIZE_BYTES {
+        let sample_bytes = frames.len() as u64 * 8
+            + values.len() as u64 * 8
+            + twice::<Sample>()
+            + entry::<(u64, Correlation), usize>();
+        if !b.charge(sample_bytes) {
             return;
         }
         let mut location_id = Vec::with_capacity(frames.len());
@@ -404,8 +463,13 @@ impl Builders {
                     let Some(&class) = pools.classes.get(&method.class) else {
                         continue;
                     };
-                    let name = format!("{}.{}", pools.symbol(class), pools.symbol(method.name));
-                    let name = b.intern(&name);
+                    let (c, m) = (pools.symbol(class), pools.symbol(method.name));
+                    if !b.charge(
+                        (c.len() + 1 + m.len()) as u64 + twice::<Function>() + entry::<u32, u64>(),
+                    ) {
+                        return;
+                    }
+                    let name = b.intern(&format!("{c}.{m}"));
                     let id = b.profile.function.len() as u64 + 1;
                     b.profile.function.push(Function {
                         id,
@@ -416,6 +480,13 @@ impl Builders {
                     id
                 }
             };
+            if !b.charge(
+                twice::<Location>()
+                    + std::mem::size_of::<Line>() as u64
+                    + entry::<(u32, u32), u64>(),
+            ) {
+                return;
+            }
             let id = b.profile.location.len() as u64 + 1;
             b.profile.location.push(Location {
                 id,
@@ -431,11 +502,9 @@ impl Builders {
         }
         let value: Vec<i64> = values.iter().map(|v| v.wrapping_mul(mul)).collect();
         let label = b.sample_labels(labels, correlation);
-        // A sample encodes in at least its tag and length, a byte per
-        // location id and per value, and two bytes per label.
-        b.held = b.held.saturating_add(
-            2 + location_id.len() as u64 + value.len() as u64 + 2 * label.len() as u64,
-        );
+        if b.over {
+            return;
+        }
         b.samples
             .insert((stack, *correlation), b.profile.sample.len());
         b.profile.sample.push(Sample {
@@ -459,6 +528,21 @@ impl Builders {
     }
 }
 
+/// What a decoded labels part holds, charged to the push's budget.
+fn snapshot_bytes(labels: &LabelsSnapshot) -> u64 {
+    let strings: u64 = labels
+        .strings
+        .values()
+        .map(|s| s.len() as u64 + entry::<i64, String>())
+        .sum();
+    let contexts: u64 = labels
+        .contexts
+        .values()
+        .map(|c| entry::<i64, Context>() + c.labels.len() as u64 * 48)
+        .sum();
+    strings + contexts
+}
+
 /// The recording's profiles (§3.2 to §3.4): `time_nanos` and
 /// `duration_nanos` are every profile's, and a `sample_rate` other than 0
 /// scales CPU and wall samples by its period.
@@ -469,10 +553,18 @@ pub fn parse_jfr(
     duration_nanos: i64,
     sample_rate: u32,
 ) -> Result<JfrProfiles, String> {
-    let mut reader = Reader::new(body);
-    let mut builders = Builders::new(time_nanos, duration_nanos, sample_rate);
+    let budget = Budget::new(budget_bytes(body.len()));
+    let over = || format!("jfr parser ParseEvent error: {OVER_BUDGET}");
+    if !budget.charge(snapshot_bytes(labels)) {
+        return Err(over());
+    }
+    let mut reader = Reader::new(body, budget.clone());
+    let mut builders = Builders::new(time_nanos, duration_nanos, sample_rate).with_budget(budget);
     while let Some(event) = reader.next_event()? {
         builders.add(reader.pools(), labels, &event, reader.ticks_per_second());
+        if builders.over_budget() {
+            return Err(over());
+        }
     }
     Ok(builders.finish())
 }
@@ -1025,13 +1117,4 @@ mod tests {
             )
         );
     }
-}
-
-/// Stub until the budget lands: the bytes a body of `len` bytes may have
-/// the reader allocate.
-pub fn budget_bytes(len: usize) -> u64 {
-    (len as u64)
-        .saturating_mul(16)
-        .saturating_add(1 << 20)
-        .min(64 << 20)
 }

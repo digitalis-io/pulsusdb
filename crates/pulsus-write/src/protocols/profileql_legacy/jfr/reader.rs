@@ -6,10 +6,12 @@
 //! `parser/types/`), which is Apache-2.0. Every error text is the library's.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -95,6 +97,73 @@ impl Hasher for IdHasher {
 
 /// A hash map keyed by ids or names the body chooses.
 pub(crate) type IdMap<K, V> = HashMap<K, V, IdState>;
+
+/// What a push's body allocates per byte of it, at most
+/// ([`budget_bytes`]).
+pub const BUDGET_PER_BODY_BYTE: u64 = 16;
+/// What any body may allocate beside that.
+pub const BUDGET_FLOOR: u64 = 1 << 20;
+/// What any body may allocate at all: sixteen times the model's profile
+/// size limit.
+pub const BUDGET_CAP: u64 = 16 * 4 * 1024 * 1024;
+
+/// The bytes a JFR body of `len` bytes may have the reader and the
+/// builders allocate from it: [`BUDGET_PER_BODY_BYTE`] per byte plus
+/// [`BUDGET_FLOOR`], and never more than [`BUDGET_CAP`].
+pub fn budget_bytes(len: usize) -> u64 {
+    (len as u64)
+        .saturating_mul(BUDGET_PER_BODY_BYTE)
+        .saturating_add(BUDGET_FLOOR)
+        .min(BUDGET_CAP)
+}
+
+/// The allocation one push has left. Every allocation made from the body's
+/// data is charged before it is made, at the size it may grow to; past the
+/// budget the push is refused.
+#[derive(Clone, Debug)]
+pub(crate) struct Budget(Rc<Cell<u64>>);
+
+impl Budget {
+    pub(crate) fn new(bytes: u64) -> Budget {
+        Budget(Rc::new(Cell::new(bytes)))
+    }
+
+    /// `true` when `bytes` fit, which are then spent.
+    pub(crate) fn charge(&self, bytes: u64) -> bool {
+        let left = self.0.get();
+        if bytes > left {
+            self.0.set(0);
+            return false;
+        }
+        self.0.set(left - bytes);
+        true
+    }
+
+    fn take(&self, bytes: u64) -> Read<()> {
+        if self.charge(bytes) {
+            Ok(())
+        } else {
+            Err(ReadError::Budget)
+        }
+    }
+}
+
+/// The text a push over its budget is refused with.
+pub(crate) const OVER_BUDGET: &str = "the recording needs more memory than its size allows";
+
+/// A map entry's charge: key and value, twice for the table's growth, and
+/// its control bytes.
+const fn entry<K, V>() -> u64 {
+    2 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) as u64 + 2
+}
+
+/// A string's charge.
+fn text_bytes(s: &Cow<'_, str>) -> u64 {
+    match s {
+        Cow::Borrowed(_) => 0,
+        Cow::Owned(o) => o.len() as u64,
+    }
+}
 
 /// One frame of a stack trace: its method's pool id and its line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +273,7 @@ pub(crate) enum Event<'a> {
 enum ReadError {
     Eof,
     Overflow,
+    Budget,
     Message(String),
 }
 
@@ -212,6 +282,7 @@ impl fmt::Display for ReadError {
         match self {
             ReadError::Eof => f.write_str("unexpected EOF"),
             ReadError::Overflow => f.write_str("int overflow"),
+            ReadError::Budget => f.write_str(OVER_BUDGET),
             ReadError::Message(m) => f.write_str(m),
         }
     }
@@ -357,20 +428,21 @@ fn utf8(bytes: &[u8]) -> Cow<'_, str> {
 // Metadata
 // ---------------------------------------------------------------------------
 
-struct FieldDef<'a> {
-    name: Cow<'a, str>,
+/// A field: its name shares the metadata's copy.
+struct FieldDef {
+    name: Rc<str>,
     ty: i64,
     cp: bool,
     array: bool,
 }
 
-struct ClassDef<'a> {
+struct ClassDef {
     id: i64,
-    name: Cow<'a, str>,
-    fields: Vec<FieldDef<'a>>,
+    name: Rc<str>,
+    fields: Vec<FieldDef>,
 }
 
-impl fmt::Display for ClassDef<'_> {
+impl fmt::Display for ClassDef {
     /// `class{name: N, id: I, fields: [{Name:n Type:t ConstantPool:b Array:b} ...]}`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "class{{name: {}, id: {}, fields: [", self.name, self.id)?;
@@ -390,6 +462,14 @@ impl fmt::Display for ClassDef<'_> {
 
 /// `strconv.Atoi`.
 fn atoi(s: &str) -> Read<i64> {
+    // Twenty characters hold any `i64`: a longer text is refused without
+    // reading it, so a long string named by many classes costs nothing.
+    if s.len() > 20 {
+        return Err(message(format!(
+            "strconv.Atoi: parsing {:?}: invalid syntax",
+            &s[..s.floor_char_boundary(20)]
+        )));
+    }
     let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(message(format!(
@@ -410,20 +490,25 @@ struct Element {
 
 impl Element {
     /// The attribute's last value, `""` when absent (a Go map's read).
-    fn attr<'s>(&self, strings: &'s [Cow<'_, str>], key: &str) -> &'s str {
+    fn attr<'s>(&self, strings: &'s [Rc<str>], key: &str) -> &'s str {
         self.attr_index(strings, key).map_or("", |i| &strings[i])
     }
 
-    fn attr_index(&self, strings: &[Cow<'_, str>], key: &str) -> Option<usize> {
+    fn attr_index(&self, strings: &[Rc<str>], key: &str) -> Option<usize> {
         self.attrs
             .iter()
             .rev()
-            .find(|(k, _)| strings[*k] == key)
+            .find(|(k, _)| &*strings[*k] == key)
             .map(|(_, v)| *v)
     }
 }
 
-fn read_element(cur: &mut Cursor<'_>, strings: usize, with_attrs: bool) -> Read<Element> {
+fn read_element(
+    cur: &mut Cursor<'_>,
+    strings: usize,
+    with_attrs: bool,
+    budget: &Budget,
+) -> Read<Element> {
     let mut index = || -> Read<usize> {
         let i = cur.varint32()? as usize;
         if i >= strings {
@@ -453,6 +538,7 @@ fn read_element(cur: &mut Cursor<'_>, strings: usize, with_attrs: bool) -> Read<
             attrs.push((k, v));
         }
     }
+    budget.take(2 * 16 * attrs.len() as u64 + 64)?;
     let children = cur.count()? as u32;
     Ok(Element {
         name,
@@ -461,37 +547,40 @@ fn read_element(cur: &mut Cursor<'_>, strings: usize, with_attrs: bool) -> Read<
     })
 }
 
-/// The metadata event at `pos`: every class of its `metadata` element.
-fn read_metadata<'a>(buf: &'a [u8], pos: i64) -> Read<Vec<ClassDef<'a>>> {
-    let mut cur = Cursor {
-        buf,
-        pos: seek(buf, pos)?,
-    };
-    cur.varint32()?;
+/// The metadata event at `pos`, inside `buf` from `lo` and inside its own
+/// declared length: every class of its `metadata` element.
+fn read_metadata(buf: &[u8], lo: usize, pos: i64, budget: &Budget) -> Read<Vec<ClassDef>> {
+    let at = seek(buf, lo, pos)?;
+    let mut cur = Cursor { buf, pos: at };
+    let size = cur.varint32()? as usize;
+    cur.buf = &buf[..at.saturating_add(size).min(buf.len())];
     cur.varint32()?;
     cur.varlong()?;
     cur.varlong()?;
     cur.varlong()?;
     let n = cur.count()?;
-    let mut strings = Vec::with_capacity(n);
+    budget.take(n as u64 * 2 * std::mem::size_of::<Rc<str>>() as u64)?;
+    let mut strings: Vec<Rc<str>> = Vec::with_capacity(n);
     for _ in 0..n {
-        strings.push(cur.meta_string()?);
+        let text = cur.meta_string()?;
+        budget.take(text.len() as u64 + 16)?;
+        strings.push(Rc::from(text.as_ref()));
     }
     let s = strings.len();
     let mut classes = Vec::new();
-    let root = read_element(&mut cur, s, false)?;
-    if strings[root.name] != "root" {
+    let root = read_element(&mut cur, s, false, budget)?;
+    if &*strings[root.name] != "root" {
         return Err(message(format!(
             "expected root element, got {}",
             strings[root.name]
         )));
     }
     for _ in 0..root.children {
-        let meta = read_element(&mut cur, s, false)?;
-        match strings[meta.name].as_ref() {
+        let meta = read_element(&mut cur, s, false, budget)?;
+        match &*strings[meta.name] {
             "metadata" => {
                 for _ in 0..meta.children {
-                    let class = read_element(&mut cur, s, true)?;
+                    let class = read_element(&mut cur, s, true, budget)?;
                     let id = atoi(class.attr(&strings, "id"))?;
                     let Some(name) = class
                         .attr_index(&strings, "name")
@@ -501,17 +590,19 @@ fn read_metadata<'a>(buf: &'a [u8], pos: i64) -> Read<Vec<ClassDef<'a>>> {
                     };
                     let mut fields = Vec::new();
                     for _ in 0..class.children {
-                        let child = read_element(&mut cur, s, true)?;
-                        if strings[child.name] == "field" {
+                        let child = read_element(&mut cur, s, true, budget)?;
+                        if &*strings[child.name] == "field" {
+                            budget.take(2 * std::mem::size_of::<FieldDef>() as u64)?;
                             fields.push(field_def(&child, &strings)?);
                         }
                         for _ in 0..child.children {
-                            read_element(&mut cur, s, false)?;
+                            read_element(&mut cur, s, false, budget)?;
                         }
                     }
+                    budget.take(2 * std::mem::size_of::<ClassDef>() as u64)?;
                     classes.push(ClassDef {
                         id,
-                        name: strings[name].clone(),
+                        name: Rc::clone(&strings[name]),
                         fields,
                     });
                 }
@@ -523,7 +614,7 @@ fn read_metadata<'a>(buf: &'a [u8], pos: i64) -> Read<Vec<ClassDef<'a>>> {
     Ok(classes)
 }
 
-fn field_def<'a>(e: &Element, strings: &[Cow<'a, str>]) -> Read<FieldDef<'a>> {
+fn field_def(e: &Element, strings: &[Rc<str>]) -> Read<FieldDef> {
     let ty = atoi(e.attr(strings, "class"))?;
     let Some(name) = e
         .attr_index(strings, "name")
@@ -537,15 +628,16 @@ fn field_def<'a>(e: &Element, strings: &[Cow<'a, str>]) -> Read<FieldDef<'a>> {
         d => return Err(message(format!("unsupported dimension {d}"))),
     };
     Ok(FieldDef {
-        name: strings[name].clone(),
+        name: Rc::clone(&strings[name]),
         ty,
         cp: e.attr(strings, "constantPool") == "true",
         array,
     })
 }
 
-fn seek(buf: &[u8], pos: i64) -> Read<usize> {
-    if pos >= 0 && (pos as u64) < buf.len() as u64 {
+/// `pos` when it lies in `buf` at or after `lo`, the chunk's start.
+fn seek(buf: &[u8], lo: usize, pos: i64) -> Read<usize> {
+    if pos >= lo as i64 && (pos as u64) < buf.len() as u64 {
         Ok(pos as usize)
     } else {
         Err(ReadError::Eof)
@@ -767,8 +859,8 @@ impl Types {
 }
 
 /// One chunk's metadata: its classes by id, the bound types and the plans.
-struct Meta<'a> {
-    classes: Vec<ClassDef<'a>>,
+struct Meta {
+    classes: Vec<ClassDef>,
     by_id: IdMap<i64, usize>,
     types: Types,
     /// The event types read, by [`EVENT_NAMES`] position, with their plans;
@@ -779,13 +871,18 @@ struct Meta<'a> {
     pools: Vec<Option<(PoolKind, Vec<Plan>)>>,
 }
 
-impl<'a> Meta<'a> {
-    fn new(classes: Vec<ClassDef<'a>>) -> Read<Meta<'a>> {
+impl Meta {
+    fn new(classes: Vec<ClassDef>, budget: &Budget) -> Read<Meta> {
+        budget.take(
+            classes.len() as u64
+                * (entry::<i64, usize>()
+                    + 2 * std::mem::size_of::<Option<(PoolKind, Vec<Plan>)>>() as u64),
+        )?;
         let mut by_id = IdMap::default();
         for (i, c) in classes.iter().enumerate() {
             by_id.insert(c.id, i);
         }
-        let last = |name: &str| classes.iter().rposition(|c| c.name == name);
+        let last = |name: &str| classes.iter().rposition(|c| &*c.name == name);
         let need = |name: &str| {
             last(name)
                 .map(|i| classes[i].id)
@@ -835,12 +932,14 @@ impl<'a> Meta<'a> {
             let plans = meta.plans_by_name(name, &event_specs(i), false);
             meta.events.push((id, plans));
         }
+        let plans = meta.frame_plans.len() + meta.events.iter().map(|e| e.1.len()).sum::<usize>();
+        budget.take(plans as u64 * std::mem::size_of::<Plan>() as u64)?;
         Ok(meta)
     }
 
     /// The last class of this name, as the library's name map keeps it.
     fn class_index(&self, name: &str) -> Option<usize> {
-        self.classes.iter().rposition(|c| c.name == name)
+        self.classes.iter().rposition(|c| &*c.name == name)
     }
 
     fn plans_by_name(&self, name: &str, specs: &[Spec], frames: bool) -> Vec<Plan> {
@@ -860,7 +959,7 @@ impl<'a> Meta<'a> {
                 let slot = specs
                     .iter()
                     .find(|(name, ty, cp, array, _)| {
-                        f.name == *name && f.ty == t.of(*ty) && f.cp == *cp && f.array == *array
+                        &*f.name == *name && f.ty == t.of(*ty) && f.cp == *cp && f.array == *array
                     })
                     .map_or(Slot::None, |s| s.4);
                 let kind = if f.cp {
@@ -898,12 +997,13 @@ impl<'a> Meta<'a> {
     }
 
     /// Reads one object's fields by `plans` into `out`.
-    fn read_object(
+    fn read_object<'a>(
         &self,
         cur: &mut Cursor<'a>,
         base: usize,
         plans: &[Plan],
         out: &mut Values<'a>,
+        budget: &Budget,
     ) -> Read<()> {
         for p in plans {
             let n = if p.array {
@@ -914,6 +1014,7 @@ impl<'a> Meta<'a> {
                     ));
                 }
                 if p.slot == Slot::Frames {
+                    budget.take(n as u64 * std::mem::size_of::<Frame>() as u64)?;
                     out.frames = Vec::with_capacity(n);
                 }
                 n
@@ -931,6 +1032,7 @@ impl<'a> Meta<'a> {
                     Kind::Str => {
                         let s = cur.field_string(base)?;
                         if let Slot::Text(i) = p.slot {
+                            budget.take(text_bytes(&s))?;
                             out.text[i as usize] = s;
                         }
                     }
@@ -954,7 +1056,7 @@ impl<'a> Meta<'a> {
                     }
                     Kind::Frames => {
                         let mut frame = Values::default();
-                        self.read_object(cur, base, &self.frame_plans, &mut frame)?;
+                        self.read_object(cur, base, &self.frame_plans, &mut frame, budget)?;
                         if p.slot == Slot::Frames {
                             out.frames.push(Frame {
                                 method: frame.num[0],
@@ -981,7 +1083,7 @@ impl<'a> Meta<'a> {
 
     /// An object inside an object: references as 32-bit varints, and no
     /// object inside it.
-    fn skip_nested(&self, cur: &mut Cursor<'a>, base: usize, class: usize) -> Read<()> {
+    fn skip_nested(&self, cur: &mut Cursor<'_>, base: usize, class: usize) -> Read<()> {
         let t = &self.types;
         for f in &self.classes[class].fields {
             if f.cp || f.ty == t.int || f.ty == t.float {
@@ -1089,17 +1191,19 @@ pub(crate) fn merge_generated_class(symbol: Cow<'_, str>) -> Cow<'_, str> {
 /// The recording, read event by event.
 pub(crate) struct Reader<'a> {
     cur: Cursor<'a>,
+    budget: Budget,
     chunk_end: i64,
     ticks_per_second: u64,
-    meta: Option<Meta<'a>>,
+    meta: Option<Meta>,
     pools: Pools<'a>,
     values: Values<'a>,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(body: &'a [u8]) -> Self {
+    pub(crate) fn new(body: &'a [u8], budget: Budget) -> Self {
         Reader {
             cur: Cursor { buf: body, pos: 0 },
+            budget,
             chunk_end: 0,
             ticks_per_second: 0,
             meta: None,
@@ -1143,6 +1247,10 @@ impl<'a> Reader<'a> {
                     "invalid event size {size} at position {start}"
                 )));
             }
+            // Inside the declared chunk but past the body: the body is cut.
+            if size > (self.cur.buf.len() - start) as u64 {
+                return Err(ReadError::Eof);
+            }
             let ty = self.cur.varlong()? as i64;
             let end = start.saturating_add(size as usize);
             let Some(meta) = &self.meta else {
@@ -1161,7 +1269,7 @@ impl<'a> Reader<'a> {
             };
             let v = &mut self.values;
             v.reset();
-            meta.read_object(&mut event, base, &meta.events[kind].1, v)?;
+            meta.read_object(&mut event, base, &meta.events[kind].1, v, &self.budget)?;
             self.cur.pos = end;
             let n = v.num;
             let correlation = Correlation {
@@ -1223,25 +1331,30 @@ impl<'a> Reader<'a> {
         let (size, cp, meta) = self
             .read_header(pos)
             .map_err(|e| message(format!("error reading chunk header: {e}")))?;
-        // The metadata and the pools are read inside the chunk, so no
-        // chunk reads another's bytes.
+        // The metadata and the pools are read inside the chunk as the body
+        // holds it, from its start to its declared end or the body's: no
+        // chunk reads another's bytes, and none reads past the body. A
+        // chunk the body cuts short is read until a read meets the cut, as
+        // the reference reads it.
         let whole = self.cur.buf;
         let limit = (pos as u64)
             .saturating_add(size as u64)
             .min(whole.len() as u64) as usize;
         let chunk = &whole[..limit];
-        let classes = read_metadata(chunk, (pos as i64).wrapping_add(meta))
-            .and_then(Meta::new)
+        let budget = self.budget.clone();
+        let classes = read_metadata(chunk, pos, (pos as i64).wrapping_add(meta), &budget)
+            .and_then(|c| Meta::new(c, &budget))
             .map_err(|e| message(format!("error reading metadata: {e}")))?;
         self.meta = Some(classes);
         self.pools.clear();
         let cp_pos = (pos as i64).wrapping_add(cp);
         self.cur.buf = chunk;
-        let pools = self.read_pools(cp_pos, size as u64);
+        let pools = self.read_pools(pos, cp_pos);
         self.cur.buf = whole;
         pools.map_err(|e| message(format!("error reading CP: {e} @ {cp_pos}")))?;
         for s in self.pools.symbols.values_mut() {
             if let Cow::Owned(n) = merge_generated_class(Cow::Borrowed(s.as_ref())) {
+                budget.take(n.len() as u64)?;
                 *s = Cow::Owned(n);
             }
         }
@@ -1285,20 +1398,27 @@ impl<'a> Reader<'a> {
     }
 
     /// The constant pool events, from the first at `pos` along their deltas,
-    /// all inside the chunk. An event is read once, and together they read
-    /// no more bytes than the chunk holds.
-    fn read_pools(&mut self, mut pos: i64, chunk_size: u64) -> Read<()> {
+    /// all inside the chunk that starts at `lo`, each inside its own declared
+    /// length. An event is read once, and together they read no more bytes
+    /// than the chunk holds.
+    fn read_pools(&mut self, lo: usize, mut pos: i64) -> Read<()> {
+        let chunk = self.cur.buf;
+        let chunk_size = (chunk.len() - lo) as u64;
         let mut visited = std::collections::HashSet::new();
         let mut read: u64 = 0;
         loop {
+            self.budget.take(entry::<i64, ()>())?;
             if !visited.insert(pos) {
                 return Err(message(format!(
                     "constant pool event at {pos} is reached twice"
                 )));
             }
-            let start = seek(self.cur.buf, pos)?;
+            let start = seek(chunk, lo, pos)?;
+            self.cur.buf = chunk;
             self.cur.pos = start;
-            self.cur.varlong()?;
+            let size = self.cur.varlong()?;
+            self.cur.buf =
+                &chunk[..(start as u64).saturating_add(size).min(chunk.len() as u64) as usize];
             self.cur.varlong()?;
             self.cur.varlong()?;
             self.cur.varlong()?;
@@ -1315,6 +1435,8 @@ impl<'a> Reader<'a> {
                     let kind = pool_kind(&meta.classes[class].name);
                     let frames = kind == PoolKind::StackTrace;
                     let plans = meta.plans(class, &pool_specs(kind), frames);
+                    self.budget
+                        .take(plans.len() as u64 * std::mem::size_of::<Plan>() as u64)?;
                     meta.pools[class] = Some((kind, plans));
                 }
                 self.read_pool(class).map_err(|e| {
@@ -1322,7 +1444,7 @@ impl<'a> Reader<'a> {
                     message(format!("error reading {} {e}", meta.classes[class]))
                 })?;
             }
-            read += (self.cur.pos - start) as u64;
+            read += (self.cur.pos.min(chunk.len()) - start) as u64;
             if read > chunk_size {
                 return Err(message(
                     "constant pool events read more than their chunk holds".to_string(),
@@ -1343,7 +1465,10 @@ impl<'a> Reader<'a> {
         let meta = self.meta.as_ref().ok_or(ReadError::Eof)?;
         let (kind, plans) = meta.pools[class].as_ref().ok_or(ReadError::Eof)?;
         if *kind == PoolKind::ChunkHeader {
-            self.cur.pos = self.cur.pos.saturating_add(CHUNK_HEADER_SIZE);
+            if self.cur.pos + CHUNK_HEADER_SIZE > self.cur.buf.len() {
+                return Err(ReadError::Eof);
+            }
+            self.cur.pos += CHUNK_HEADER_SIZE;
             return Ok(());
         }
         let cur = &mut self.cur;
@@ -1357,8 +1482,15 @@ impl<'a> Reader<'a> {
                 continue;
             }
             v.reset();
-            meta.read_object(cur, base, plans, v)?;
+            meta.read_object(cur, base, plans, v, &self.budget)?;
             let p = &mut self.pools;
+            self.budget.take(match kind {
+                PoolKind::Symbol | PoolKind::ThreadState => entry::<u64, Cow<'_, str>>(),
+                PoolKind::Class => entry::<u64, u64>(),
+                PoolKind::Method => entry::<u64, Method>(),
+                PoolKind::StackTrace => entry::<u64, Vec<Frame>>(),
+                _ => 0,
+            })?;
             match kind {
                 PoolKind::Symbol => {
                     p.symbols.insert(id, std::mem::take(&mut v.text[0]));
