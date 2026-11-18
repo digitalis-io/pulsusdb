@@ -343,6 +343,7 @@ Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async
 | a profile that does not decode | 422 | `unknown` | `parsing IngestInput-pprof failed invalid_argument: <error>` |
 | a profile the checks refuse | 422 | `unknown` | `pushing IngestInput-pprof failed push series with index 0 and id  failed: invalid_argument: <error>` |
 | a JFR recording or form that does not read | 422 | `unknown` | `parsing IngestInput-pprof failed <error>`: the reader's error, such as `jfr parser ParseEvent error: error reading chunk header: unexpected EOF`, or `jfr field is required`, `loadJFRFromForm failed to decompress jfr: <error>`, `failed to parse labels form field: <error>` |
+| a JFR recording that would need more memory than 16 bytes per body byte plus 1 MiB, or 64 MiB in all | 422 | `unknown` | `parsing IngestInput-pprof failed jfr parser ParseEvent error: the recording needs more memory than its size allows` |
 | a JFR profile the checks refuse | 422 | `unknown` | `pushing IngestInput-pprof failed push series with index 0 and id  failed: invalid_argument: <error>` |
 | a folded, lines, trie, tree or speedscope body that does not parse | 422 | `unknown` | the parser's error, such as `strconv.Atoi: parsing "x": invalid syntax`, `bufio.Scanner: token too long`, `EOF`, `tree node children count 16001 exceeds maximum 16000` or `Unknown schema: <schema>` |
 | backpressure | 429 | `resource_exhausted` | `sink is applying backpressure: buffers are full` |
