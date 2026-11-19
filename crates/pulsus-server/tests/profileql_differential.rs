@@ -2367,6 +2367,7 @@ fn check_fixture(
                             value: (v * b) as f64,
                             timestamp: s0_ms + after_s * 1000,
                             annotations: Vec::new(),
+                            exemplars: Vec::new(),
                         })
                         .collect(),
                 })
@@ -2396,6 +2397,7 @@ fn check_fixture(
                             timestamp: s0_ms + after_s * 1000,
                             y_min: y_min.clone(),
                             counts: all,
+                            exemplars: Vec::new(),
                         }
                     })
                     .collect(),

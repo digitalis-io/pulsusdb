@@ -11,9 +11,9 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::catalogue::{Read, compat_sets};
 use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
-use super::heatmap::HeatmapRow;
+use super::heatmap::{HeatmapExemplarRow, HeatmapRow};
 use super::selector::WindowLimits;
-use super::series::TimeSeriesRow;
+use super::series::{TimeSeriesExemplarRow, TimeSeriesRow};
 use super::tree::TreeRow;
 
 /// ClickHouse's `TOO_MANY_ROWS` (`max_rows_to_read`).
@@ -251,6 +251,26 @@ impl ProfilesEngine {
     /// Issue #825: sends S8 (`super::heatmap`) and returns one row per
     /// series.
     pub async fn read_heatmap(&self, sql: &str) -> Result<Vec<HeatmapRow>, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #826: sends S6 with exemplars (`super::series`) and returns
+    /// one row per series and one per selected series' labels.
+    pub async fn read_series_exemplars(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<TimeSeriesExemplarRow>, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #826: sends S8 with exemplars (`super::heatmap`) and returns
+    /// one row per series and one per selected series' labels.
+    pub async fn read_heatmap_exemplars(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<HeatmapExemplarRow>, ProfilesReadError> {
         let settings = read_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
     }

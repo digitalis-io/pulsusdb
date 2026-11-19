@@ -5,6 +5,7 @@
 //! rows on shard 1, fingerprint 4 with its series row on shard 2. Each
 //! shard joins its own entries to its own series rows and pre-aggregates;
 //! the node that receives the statement merges them — one statement.
+//! Issue #826 adds the exemplars (K3, K4).
 //!
 //! ```text
 //! docker compose -f ci/clickhouse-cluster/compose.yaml up -d
@@ -213,7 +214,7 @@ async fn the_time_series_merges_both_shards_in_one_statement() {
     let comment = format!("{db}-k1-{now}");
     let rows = ProfilesEngine::new(
         ChClient::new(shard1_config(&db)).await.expect("shard1"),
-        config,
+        config.clone(),
         tenant("t1"),
     )
     .with_query_log_comment(comment.clone())
@@ -255,6 +256,90 @@ async fn the_time_series_merges_both_shards_in_one_statement() {
         .await
         .expect("query_log");
     assert_eq!(n, ["1"], "K2");
+
+    // K3 (issue #826): with exemplars, K1's points, each carrying its
+    // largest profile and the labels of its series, fingerprint 4's from
+    // shard 2.
+    let with = SeriesRequest {
+        exemplars: true,
+        ..req
+    };
+    let sql = match series::plan(&tenant("t1"), &config, &with, now) {
+        Ok(Some(sql)) => sql,
+        other => panic!("K3: expected a plan, got {other:?}"),
+    };
+    let comment = format!("{db}-k3-{now}");
+    let rows = ProfilesEngine::new(
+        ChClient::new(shard1_config(&db)).await.expect("shard1"),
+        config,
+        tenant("t1"),
+    )
+    .with_query_log_comment(comment.clone())
+    .read_series_exemplars(&sql)
+    .await
+    .unwrap_or_else(|err| panic!("K3: {err:?}\n{sql}"));
+    let labels = vec![
+        ("__profile_type__".to_string(), CPU.to_string()),
+        ("service_name".to_string(), "x".to_string()),
+    ];
+    let point = |timestamp: i64, value: f64, at: i64, total: i64| series::Point {
+        timestamp,
+        value,
+        exemplar: Some(series::Exemplar {
+            timestamp: at,
+            profile_id: PROFILE.to_string(),
+            span_id: String::new(),
+            trace_id: String::new(),
+            value: total,
+            labels: labels.clone(),
+        }),
+    };
+    assert_eq!(
+        series::series_exemplars(rows, &by_pod, None),
+        vec![
+            series::Series {
+                labels: pod("b"),
+                points: vec![point(s + 2 * STEP_MS, 6.0, s + 30_000, 4)],
+            },
+            series::Series {
+                labels: vec![],
+                points: vec![point(s + 3 * STEP_MS, 5.0, s + 45_000, 5)],
+            },
+            series::Series {
+                labels: pod("a"),
+                points: vec![
+                    point(s, 1.0, s - STEP_MS, 1),
+                    point(s + STEP_MS, 2.0, s + STEP_MS, 2),
+                ],
+            },
+        ],
+        "K3"
+    );
+
+    // K4 (issue #826): one statement, the exemplar statement.
+    let filter = format!("is_initial_query AND log_comment = '{comment}'");
+    settle_query_log(&[&shard1], &filter, 1).await;
+    let sent = shard1
+        .query_strings(
+            &format!(
+                "SELECT query AS s FROM system.query_log \
+                 WHERE {filter} AND type = 'QueryFinish'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    assert_eq!(sent.len(), 1, "K4: {sent:?}");
+    for expected in [
+        "argMax((e.profile_id, e.timestamp_ns, e.fingerprint), e.total)",
+        "UNION ALL",
+    ] {
+        assert!(
+            sent[0].contains(expected),
+            "K4: {expected:?} missing from {}",
+            sent[0]
+        );
+    }
 
     exec(
         &bootstrap,

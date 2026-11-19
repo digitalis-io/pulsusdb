@@ -2628,6 +2628,16 @@ they are named so nobody adds them later.
   when they are a millisecond apart. PulsusDB counts one value per profile
   and span either way, so the count does not depend on whether two
   timestamps coincide (`docs/api.md` §5).
+- **Exemplar choices (issue #826).** The reference answers a
+  `SelectHeatmap` whose exemplar type does not match its query type with
+  `500` when the window holds data, and with an empty answer when it holds
+  none (`pkg/querybackend/query_heatmap.go:143-159`); PulsusDB answers
+  `400` with the same texts on every window, as for an absent query type
+  above. The reference sums the parts of a profile whose samples carry
+  differing labels into one exemplar with the labels the parts share
+  (`pkg/model/timeseries/exemplar_builder.go:80-113`); PulsusDB keeps one
+  candidate per series, each with its own total and labels, as it counts
+  the heatmap's values (`docs/api.md` §5).
 - **Everything that follows from our architecture.** Storing spans and
   log lines as ClickHouse rows rather than in the reference's own file
   formats decides a great deal — which parameters are meaningful, what

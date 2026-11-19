@@ -254,6 +254,28 @@ that is not a row here fails the suite.
 - **Why:** #825's code review note 3.
 - **Case:** `none`: two profiles carrying one span in one millisecond.
 
+### `exemplar-split-profile-per-part`
+
+- **Route:** `SelectSeries`, `SelectHeatmap`.
+- **Request:** exemplars, over a profile whose samples carry differing
+  labels.
+- **PulsusDB:** one candidate per series, each with its own total and
+  labels.
+- **Reference:** the parts summed into one, with the labels they share.
+- **Why:** #826 plan E6: summing first needs a group per profile, about
+  one key per entry.
+- **Case:** `#826 part B`.
+
+### `heatmap-exemplar-mismatch-is-400`
+
+- **Route:** `SelectHeatmap`.
+- **Request:** an exemplar type unlike the query type.
+- **PulsusDB:** `400 invalid_argument`, on every window.
+- **Reference:** `500` when the window holds data, `{}` when it holds none.
+- **Why:** owner, 2026-11-17, the decision for #825's absent query type,
+  applied here (#826 plan E8).
+- **Case:** `#826 part B`.
+
 ### `diff-side-failure-keeps-its-code`
 
 **Retired 2026-11-18.** The reference's served `Diff` returns each side's

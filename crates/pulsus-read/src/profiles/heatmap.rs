@@ -5,6 +5,11 @@
 //!
 //! `INDIVIDUAL` reads each profile's total from `profile_entries`; `SPAN`
 //! reads each profile's samples of one span from `profile_samples`, summed.
+//!
+//! Issue #826: with exemplars, each value carries its ids until the window
+//! has the range, each cell's largest value is its exemplar, and a second
+//! `UNION ALL` branch returns each selected series' labels;
+//! [`heatmap_exemplars`] joins them.
 
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
@@ -14,7 +19,7 @@ use crate::metrics::DataWindow;
 use crate::traces::tenant_scope::TenantTerm;
 
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
-use super::series;
+use super::series::{self, Exemplar};
 
 /// `querier.v1.HeatmapQueryType` `INDIVIDUAL`.
 pub const QUERY_TYPE_INDIVIDUAL: i32 = 1;
@@ -36,6 +41,8 @@ pub struct HeatmapRequest<'a> {
     pub query_type: i32,
     /// The request's `limit`, `None` when absent.
     pub limit: Option<i64>,
+    /// Issue #826: exemplars of the query type, one per cell.
+    pub exemplars: bool,
 }
 
 /// One series as S8 returns it: its `group_by` values, its value count,
@@ -49,12 +56,33 @@ pub struct HeatmapRow {
     pub y_min: Vec<f64>,
 }
 
+/// Issue #826: one cell's exemplar as S8 returns it: `(total, time ms,
+/// profile id, span id, trace id in hex, fingerprint)`.
+pub type ExemplarTuple = (i64, i64, String, u64, String, u128);
+
+/// Issue #826: one row of S8 with exemplars. `kind` 0 is a series as
+/// [`HeatmapRow`], each slot also carrying its cells' exemplars in bucket
+/// order; `kind` 1 is one selected series' `fingerprint` and its
+/// stored `labels` less the `group_by` names.
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, Serialize, Deserialize)]
+pub struct HeatmapExemplarRow {
+    pub kind: u8,
+    pub g: Vec<String>,
+    pub n: u64,
+    pub slots: Vec<(i64, Vec<u32>, Vec<ExemplarTuple>)>,
+    pub y_min: Vec<f64>,
+    pub fingerprint: u128,
+    pub labels: Vec<(String, String)>,
+}
+
 /// One slot of a series.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slot {
     pub timestamp: i64,
     pub y_min: Vec<f64>,
     pub counts: Vec<i32>,
+    /// Issue #826: one per non-empty bucket, lowest bucket first.
+    pub exemplars: Vec<Exemplar>,
 }
 
 /// One series of the answer: its labels in `group_by` order, a missing one
@@ -139,7 +167,7 @@ pub fn plan(
     let source = if span {
         format!(
             "FROM (
-      SELECT fingerprint, timestamp_ns, sum(value) AS total
+      SELECT fingerprint, timestamp_ns, sum(value) AS total{ids}
       FROM {samples}
       WHERE {tenant_term} AND type_id = {type_id}{service_terms}
         AND fingerprint IN ({series})
@@ -148,6 +176,11 @@ pub fn plan(
       GROUP BY fingerprint, timestamp_ns, profile_id, trace_id, span_id
     ) AS e{join}",
             samples = config.samples_table,
+            ids = if req.exemplars {
+                ", span_id, trace_id"
+            } else {
+                ""
+            },
         )
     } else {
         format!(
@@ -174,6 +207,45 @@ pub fn plan(
         Some(n) if n > 0 => ("g".to_string(), format!("\nLIMIT {}", n.saturating_add(1))),
         _ => ("g".to_string(), String::new()),
     };
+    if req.exemplars {
+        let (xs, exemplar) = if span {
+            (
+                "arraySort(x -> (-x.1, x.2, x.3, x.4), groupArray((e.total, e.timestamp_ns, e.span_id, e.trace_id, e.fingerprint)))",
+                "(x.1, intDiv(x.2, 1000000), '', x.3, lower(hex(x.4)), x.5)",
+            )
+        } else {
+            (
+                "arraySort(x -> (-x.1, x.2, x.3), groupArray((e.total, e.timestamp_ns, e.profile_id, e.fingerprint)))",
+                "(x.1, intDiv(x.2, 1000000), toString(x.3), toUInt64(0), '', x.4)",
+            )
+        };
+        let labels =
+            series::labels_branch(tenant, w, series_table, &matchers, req.group_by, "[], ");
+        return Ok(Some(format!(
+            "SELECT 0 AS kind, g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20)), arrayReverse(arrayMap((x, c) -> {exemplar}, arrayFilter((x, c, p) -> c != p, xs, b, arrayPopBack(arrayPushFront(b, -1))), arrayFilter((c, p) -> c != p, b, arrayPopBack(arrayPushFront(b, -1)))))))) AS slots,
+       any(arrayMap(i -> toFloat64(lo + toInt64(i * w)), range(20))) AS y_min, toUInt128(0) AS fingerprint, CAST([] AS Array(Tuple(String, String))) AS labels
+FROM (
+  SELECT g, ts, lo, w, xs,
+         arrayMap(v -> least(19, toInt64((v - lo + 1) / w)), xs.1) AS b0,
+         arrayMap((c, v) -> c - (toInt64(c * w) > v - lo), b0, xs.1) AS b1,
+         arrayMap((c, v) -> c + (c < 19 AND toInt64((c + 1) * w) <= v - lo), b1, xs.1) AS b
+  FROM (
+    SELECT g, ts, xs, lo, toFloat64(if(hi = lo, 1, hi - lo)) / 20 AS w
+    FROM (
+      SELECT g, ts, xs, min(v_min) OVER () AS lo, greatest(max(v_max) OVER (), 0) AS hi
+      FROM (
+        SELECT {g} AS g, {start} + intDiv(intDiv(e.timestamp_ns, 1000000) - {start} + {step_minus_1}, {step}) * {step} AS ts, {xs} AS xs, min(e.total) AS v_min, max(e.total) AS v_max
+        {source}
+        GROUP BY g, ts
+      )
+    )
+  )
+)
+GROUP BY g
+ORDER BY n DESC, {order}{limit}{labels}",
+            step_minus_1 = step - 1,
+        )));
+    }
     Ok(Some(format!(
         "SELECT g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20))))) AS slots,
        any(arrayMap(i -> toFloat64(lo + toInt64(i * w)), range(20))) AS y_min
@@ -206,31 +278,92 @@ ORDER BY n DESC, {order}{limit}",
 /// value counts, descending, then by their labels, and cut to `limit`;
 /// otherwise ordered by their labels.
 pub fn heatmap(rows: Vec<HeatmapRow>, group_by: &[String], limit: Option<i64>) -> Vec<Series> {
-    let mut out: Vec<(u64, Series)> = rows
+    order_and_cut(
+        rows.into_iter()
+            .map(|row| {
+                let y_min = row.y_min;
+                let slots = row
+                    .slots
+                    .into_iter()
+                    .map(|(timestamp, counts)| Slot {
+                        timestamp,
+                        y_min: y_min.clone(),
+                        counts: slot_counts(counts),
+                        exemplars: Vec::new(),
+                    })
+                    .collect();
+                let labels = series::group_labels(group_by, row.g);
+                (row.n, Series { labels, slots })
+            })
+            .collect(),
+        limit,
+    )
+}
+
+/// Issue #826: S8's exemplar rows as [`heatmap`] answers them, each slot
+/// carrying its cells' exemplars, labelled with the `kind` 1 row of their
+/// fingerprint: a span id 0 as `""`, another as 16 hex digits of its
+/// bytes little-endian; an all-zero trace id as `""`.
+pub fn heatmap_exemplars(
+    rows: Vec<HeatmapExemplarRow>,
+    group_by: &[String],
+    limit: Option<i64>,
+) -> Vec<Series> {
+    let (rows, labels) = series::split_labels(rows, |r| r.kind == 0, |r| (r.fingerprint, r.labels));
+    order_and_cut(
+        rows.into_iter()
+            .map(|row| {
+                let y_min = row.y_min;
+                let slots = row
+                    .slots
+                    .into_iter()
+                    .map(|(timestamp, counts, exemplars)| Slot {
+                        timestamp,
+                        y_min: y_min.clone(),
+                        counts: slot_counts(counts),
+                        exemplars: exemplars
+                            .into_iter()
+                            .map(|(total, at, profile_id, span, trace, fp)| Exemplar {
+                                timestamp: at,
+                                profile_id,
+                                span_id: if span == 0 {
+                                    String::new()
+                                } else {
+                                    span.to_le_bytes()
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect()
+                                },
+                                trace_id: if trace.bytes().all(|b| b == b'0') {
+                                    String::new()
+                                } else {
+                                    trace
+                                },
+                                value: total,
+                                labels: labels.get(&fp).cloned().unwrap_or_default(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                let labels = series::group_labels(group_by, row.g);
+                (row.n, Series { labels, slots })
+            })
+            .collect(),
+        limit,
+    )
+}
+
+fn slot_counts(counts: Vec<u32>) -> Vec<i32> {
+    counts
         .into_iter()
-        .map(|row| {
-            let labels: Vec<(String, String)> = group_by
-                .iter()
-                .zip(row.g)
-                .filter(|(_, value)| !value.is_empty())
-                .map(|(name, value)| (name.clone(), value))
-                .collect();
-            let y_min = row.y_min;
-            let slots: Vec<Slot> = row
-                .slots
-                .into_iter()
-                .map(|(timestamp, counts)| Slot {
-                    timestamp,
-                    y_min: y_min.clone(),
-                    counts: counts
-                        .into_iter()
-                        .map(|c| i32::try_from(c).unwrap_or(i32::MAX))
-                        .collect(),
-                })
-                .collect();
-            (row.n, Series { labels, slots })
-        })
-        .collect();
+        .map(|c| i32::try_from(c).unwrap_or(i32::MAX))
+        .collect()
+}
+
+/// With more series than a positive `limit`, ordered by their value
+/// counts, descending, then by their labels, and cut to `limit`; otherwise
+/// ordered by their labels.
+fn order_and_cut(mut out: Vec<(u64, Series)>, limit: Option<i64>) -> Vec<Series> {
     let cut = limit
         .filter(|k| *k > 0)
         .map(|k| usize::try_from(k).unwrap_or(usize::MAX))
@@ -298,6 +431,52 @@ WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
 GROUP BY g
 ORDER BY n DESC, g";
 
+    /// Plan §2.2's statement (issue #826): §0's request with `INDIVIDUAL`
+    /// exemplars.
+    const EXAMPLE_EXEMPLARS: &str = "SELECT 0 AS kind, g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20)), arrayReverse(arrayMap((x, c) -> (x.1, intDiv(x.2, 1000000), toString(x.3), toUInt64(0), '', x.4), arrayFilter((x, c, p) -> c != p, xs, b, arrayPopBack(arrayPushFront(b, -1))), arrayFilter((c, p) -> c != p, b, arrayPopBack(arrayPushFront(b, -1)))))))) AS slots,
+       any(arrayMap(i -> toFloat64(lo + toInt64(i * w)), range(20))) AS y_min, toUInt128(0) AS fingerprint, CAST([] AS Array(Tuple(String, String))) AS labels
+FROM (
+  SELECT g, ts, lo, w, xs,
+         arrayMap(v -> least(19, toInt64((v - lo + 1) / w)), xs.1) AS b0,
+         arrayMap((c, v) -> c - (toInt64(c * w) > v - lo), b0, xs.1) AS b1,
+         arrayMap((c, v) -> c + (c < 19 AND toInt64((c + 1) * w) <= v - lo), b1, xs.1) AS b
+  FROM (
+    SELECT g, ts, xs, lo, toFloat64(if(hi = lo, 1, hi - lo)) / 20 AS w
+    FROM (
+      SELECT g, ts, xs, min(v_min) OVER () AS lo, greatest(max(v_max) OVER (), 0) AS hi
+      FROM (
+        SELECT s.g AS g, 1794819600000 + intDiv(intDiv(e.timestamp_ns, 1000000) - 1794819600000 + 14999, 15000) * 15000 AS ts, arraySort(x -> (-x.1, x.2, x.3), groupArray((e.total, e.timestamp_ns, e.profile_id, e.fingerprint))) AS xs, min(e.total) AS v_min, max(e.total) AS v_max
+        FROM profile_entries AS e
+  INNER JOIN (
+    SELECT fingerprint, any([JSONExtractString(labels, 'service_name')]) AS g
+FROM profile_series
+WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
+  AND bitAnd(hours, multiIf(day = '2026-11-16' AND day = '2026-11-16', 1792, day = '2026-11-16', 16776960, day = '2026-11-16', 2047, 16777215)) != 0
+  AND type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+    GROUP BY fingerprint
+  ) AS s ON e.fingerprint = s.fingerprint
+    WHERE org_id = 't1' AND e.type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+      AND e.fingerprint IN (SELECT fingerprint
+FROM profile_series
+WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
+  AND bitAnd(hours, multiIf(day = '2026-11-16' AND day = '2026-11-16', 1792, day = '2026-11-16', 16776960, day = '2026-11-16', 2047, 16777215)) != 0
+  AND type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds')
+      AND e.timestamp_ns >= 1794819585000000000 AND e.timestamp_ns <= 1794823200000000000
+        GROUP BY g, ts
+      )
+    )
+  )
+)
+GROUP BY g
+ORDER BY n DESC, g
+UNION ALL
+SELECT 1, CAST([] AS Array(String)), 0, [], [], fingerprint, arrayFilter(p -> NOT has(['service_name'], p.1), JSONExtractKeysAndValues(any(labels), 'String'))
+FROM profile_series
+WHERE org_id = 't1' AND day BETWEEN '2026-11-16' AND '2026-11-16'
+  AND bitAnd(hours, multiIf(day = '2026-11-16' AND day = '2026-11-16', 1792, day = '2026-11-16', 16776960, day = '2026-11-16', 2047, 16777215)) != 0
+  AND type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+GROUP BY fingerprint";
+
     fn tenant(name: &str) -> Tenant {
         let value = http::HeaderValue::from_str(name).expect("a header value");
         Tenant::from_header(Some(&value), false).expect("a valid tenant")
@@ -347,6 +526,7 @@ ORDER BY n DESC, g";
             group_by,
             query_type: QUERY_TYPE_INDIVIDUAL,
             limit: None,
+            exemplars: false,
         }
     }
 
@@ -618,6 +798,7 @@ ORDER BY n DESC, g";
                     timestamp: START,
                     y_min: row("", n).y_min,
                     counts: vec![n as i32; 20],
+                    exemplars: Vec::new(),
                 }]
             );
         }
@@ -628,6 +809,149 @@ ORDER BY n DESC, g";
         assert_eq!(
             labels(&heatmap(rows, &group_by, Some(3))),
             vec![vec![], pod("a"), pod("b")]
+        );
+    }
+
+    /// H9 (issue #826): §0's request with `INDIVIDUAL` exemplars renders
+    /// plan §2.2's statement, byte for byte; off, #825's.
+    #[test]
+    fn h9_exemplars_render_the_example_statement() {
+        let g = by_service();
+        let req = HeatmapRequest {
+            exemplars: true,
+            ..example(&g)
+        };
+        assert_eq!(planned(&single(), &req, END), EXAMPLE_EXEMPLARS);
+        assert_eq!(planned(&single(), &example(&g), END), EXAMPLE);
+    }
+
+    /// H10 (issue #826): `SPAN` exemplars carry the span and the trace.
+    #[test]
+    fn h10_span_exemplars_carry_span_and_trace() {
+        let g = by_service();
+        let sql = planned(
+            &single(),
+            &HeatmapRequest {
+                query_type: QUERY_TYPE_SPAN,
+                exemplars: true,
+                ..example(&g)
+            },
+            END,
+        );
+        for expected in [
+            "SELECT fingerprint, timestamp_ns, sum(value) AS total, span_id, trace_id\n",
+            "arraySort(x -> (-x.1, x.2, x.3, x.4), groupArray((e.total, e.timestamp_ns, e.span_id, e.trace_id, e.fingerprint))) AS xs",
+            "(x.1, intDiv(x.2, 1000000), '', x.3, lower(hex(x.4)), x.5)",
+        ] {
+            assert!(sql.contains(expected), "{expected:?} missing from\n{sql}");
+        }
+    }
+
+    /// H11 (issue #826): the tenant check accepts both query types with
+    /// exemplars, single node and clustered, for two tenants; the labels
+    /// branch is there and scoped.
+    #[test]
+    fn h11_the_tenant_check_accepts_the_exemplar_forms() {
+        let g = by_service();
+        for name in ["t1", "t2"] {
+            let term = TenantTerm::of(&tenant(name));
+            for (config, dist) in [(single(), ""), (clustered(), "_dist")] {
+                for query_type in [QUERY_TYPE_INDIVIDUAL, QUERY_TYPE_SPAN] {
+                    let req = HeatmapRequest {
+                        query_type,
+                        exemplars: true,
+                        ..example(&g)
+                    };
+                    let sql = match plan(&tenant(name), &config, &req, END) {
+                        Ok(Some(sql)) => sql,
+                        other => panic!("expected a plan, got {other:?}"),
+                    };
+                    assert!(
+                        sql.contains(
+                            "\nUNION ALL\nSELECT 1, CAST([] AS Array(String)), 0, [], [], fingerprint, "
+                        ),
+                        "{sql}"
+                    );
+                    assert_eq!(
+                        tenant_scope::check(&sql, &term, &tenant_scope::tables(dist)),
+                        Ok(()),
+                        "{sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// H12 (issue #826): each exemplar tuple becomes an exemplar, the span
+    /// as 16 hex digits of its bytes little-endian, an all-zero trace as
+    /// `""`, in the row's order, labelled from its fingerprint's row.
+    #[test]
+    fn h12_rows_become_slots_with_exemplars() {
+        let x = vec![("x".to_string(), "1".to_string())];
+        let rows = vec![
+            HeatmapExemplarRow {
+                kind: 0,
+                g: vec![String::new()],
+                n: 2,
+                slots: vec![(
+                    START,
+                    vec![1; 20],
+                    vec![
+                        (
+                            5,
+                            7,
+                            String::new(),
+                            10,
+                            "00000000000000000000000000000002".to_string(),
+                            9,
+                        ),
+                        (
+                            4,
+                            6,
+                            String::new(),
+                            11,
+                            "00000000000000000000000000000000".to_string(),
+                            9,
+                        ),
+                    ],
+                )],
+                y_min: vec![0.0; 20],
+                fingerprint: 0,
+                labels: Vec::new(),
+            },
+            HeatmapExemplarRow {
+                kind: 1,
+                g: Vec::new(),
+                n: 0,
+                slots: Vec::new(),
+                y_min: Vec::new(),
+                fingerprint: 9,
+                labels: x.clone(),
+            },
+        ];
+        let out = heatmap_exemplars(rows, &[], None);
+        let exemplar = |value: i64, timestamp: i64, span: &str, trace: &str| Exemplar {
+            timestamp,
+            profile_id: String::new(),
+            span_id: span.to_string(),
+            trace_id: trace.to_string(),
+            value,
+            labels: x.clone(),
+        };
+        assert_eq!(
+            out,
+            vec![Series {
+                labels: Vec::new(),
+                slots: vec![Slot {
+                    timestamp: START,
+                    y_min: vec![0.0; 20],
+                    counts: vec![1; 20],
+                    exemplars: vec![
+                        exemplar(5, 7, "0a00000000000000", "00000000000000000000000000000002"),
+                        exemplar(4, 6, "0b00000000000000", ""),
+                    ],
+                }],
+            }]
         );
     }
 }
