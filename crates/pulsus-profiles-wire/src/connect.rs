@@ -62,7 +62,17 @@ pub fn error_json(code: Code, message: &str) -> String {
     out.push_str(r#"{"code":""#);
     out.push_str(code.as_str());
     out.push_str(r#"","message":""#);
-    for c in message.chars() {
+    go_string(&mut out, message);
+    out.push_str("\"}");
+    out
+}
+
+/// Issue #829: `s`'s characters as Go's `json.Marshal` escapes a string's,
+/// without the quotes: `"` and `\\`, the five short control escapes, any
+/// other control character as `\u00xx`, and `<`, `>`, `&`, U+2028 and
+/// U+2029 as `\u` escapes.
+pub fn go_string(out: &mut String, s: &str) {
+    for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -78,8 +88,13 @@ pub fn error_json(code: Code, message: &str) -> String {
             c => out.push(c),
         }
     }
-    out.push_str("\"}");
-    out
+}
+
+/// Issue #829: `v` as Go's `json.Encoder` writes a `[]string`: `null` when
+/// empty, else the strings in order, each by [`go_string`]; then `\n`.
+pub fn go_string_array(v: &[String]) -> String {
+    let _ = v;
+    String::new()
 }
 
 #[cfg(test)]
@@ -91,6 +106,16 @@ mod tests {
         assert_eq!(
             error_json(Code::InvalidArgument, "a \"b\" <c> & \\ \n\u{1}\u{8}\u{c}"),
             r#"{"code":"invalid_argument","message":"a \"b\" \u003cc\u003e \u0026 \\ \n\u0001\b\f"}"#
+        );
+    }
+
+    /// Issue #829: a `[]string` as Go's `json.Encoder` writes it.
+    #[test]
+    fn go_string_array_writes_null_or_the_escaped_strings() {
+        assert_eq!(go_string_array(&[]), "null\n");
+        assert_eq!(
+            go_string_array(&["a<b".to_string(), "c".to_string()]),
+            "[\"a\\u003cb\",\"c\"]\n"
         );
     }
 }

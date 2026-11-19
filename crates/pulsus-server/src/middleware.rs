@@ -590,6 +590,12 @@ mod tests {
             "/api/profiles/v1/series",
             "/api/profiles/v1/merge",
             "/api/profiles/v1/select_series",
+            "/api/profiles/v1/render",
+            "/api/profiles/v1/render-diff",
+            "/api/profiles/v1/label-values",
+            "/pyroscope/render",
+            "/pyroscope/render-diff",
+            "/pyroscope/label-values",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
