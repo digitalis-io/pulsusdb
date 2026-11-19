@@ -301,3 +301,14 @@ own error, as PulsusDB does.
   (`pkg/querier/http.go:57`).
 - **Why:** defects entry 49.
 - **Case:** `C37` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `render-timeline-keeps-the-window-grid`
+
+- **Route:** `/pyroscope/render`.
+- **Request:** a window that starts before the tenant's first profile.
+- **PulsusDB:** the timeline's points on the window's own steps.
+- **Reference:** the points on steps starting at the tenant's first
+  profile, so a sample can fall one slot earlier
+  (`pkg/frontend/readpath/router.go:92-113`).
+- **Why:** owner, 2026-11-19, "Record the difference"; defects entry 50.
+- **Case:** `C38` in `crates/pulsus-server/tests/profileql_differential.rs`.

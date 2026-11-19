@@ -5,7 +5,7 @@
 //! the answer must be. Part B of issues #823, #824, #825 and #827 adds
 //! the flame graph, the series, the heatmap and the diff (C15–C30) over a
 //! second pair of tenants holding the query fixture. Issue #829 part A adds
-//! the tree format, the render routes and `label-values` (C31–C37).
+//! the tree format, the render routes and `label-values` (C31–C38).
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -211,10 +211,12 @@ enum Method {
         selector: &'static str,
         max_nodes: Option<i64>,
     },
-    /// Issue #829: `GET /pyroscope/render` of `TYPE_A` over `R`.
+    /// Issue #829: `GET /pyroscope/render` of `TYPE_A` over `R`, or with
+    /// `early` over `E`.
     Render {
         selector: &'static str,
         max_nodes: Option<i64>,
+        early: bool,
     },
     /// Issue #829: `GET /pyroscope/render-diff` of two `TYPE_A` selections,
     /// both over `R`.
@@ -380,6 +382,15 @@ enum Expect {
         row: &'static str,
         ours: &'static Graph,
         theirs: &'static Graph,
+    },
+    /// Issue #829: a ledger case on a render answer: both answers are
+    /// `Render(graph)`, and each timeline's one non-zero sample is at its
+    /// own index.
+    LedgerTimeline {
+        row: &'static str,
+        graph: &'static Graph,
+        ours: usize,
+        theirs: usize,
     },
 }
 
@@ -967,6 +978,7 @@ static CASES: &[Case] = &[
         request: get_query(Method::Render {
             selector: r#"{service_name="q-trim"}"#,
             max_nodes: None,
+            early: false,
         }),
         expect: Expect::Parity(Fixture::Render(&Q_TRIM)),
     },
@@ -976,6 +988,7 @@ static CASES: &[Case] = &[
         request: get_query(Method::Render {
             selector: r#"{service_name="q-trim"}"#,
             max_nodes: Some(4),
+            early: false,
         }),
         expect: Expect::Parity(Fixture::Render(&Q_TRIM_4)),
     },
@@ -1009,6 +1022,21 @@ static CASES: &[Case] = &[
                 status: 400,
                 body: None,
             },
+        },
+    },
+    Case {
+        id: "C38",
+        client: "exploration app, export, a window from before the first profile",
+        request: get_query(Method::Render {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: None,
+            early: true,
+        }),
+        expect: Expect::LedgerTimeline {
+            row: "render-timeline-keeps-the-window-grid",
+            graph: &Q_TRIM,
+            ours: 1,
+            theirs: 0,
         },
     },
 ];
@@ -1085,7 +1113,9 @@ fn the_ledger_and_the_cases_name_each_other() {
     let mut problems: Vec<String> = Vec::new();
 
     for case in CASES {
-        if let Expect::Ledger { row, .. } | Expect::LedgerGraph { row, .. } = case.expect
+        if let Expect::Ledger { row, .. }
+        | Expect::LedgerGraph { row, .. }
+        | Expect::LedgerTimeline { row, .. } = case.expect
             && !headings.contains(row)
         {
             problems.push(format!(
@@ -1104,7 +1134,10 @@ fn the_ledger_and_the_cases_name_each_other() {
         };
         match CASES.iter().find(|c| c.id == case_id) {
             Some(Case {
-                expect: Expect::Ledger { row, .. } | Expect::LedgerGraph { row, .. },
+                expect:
+                    Expect::Ledger { row, .. }
+                    | Expect::LedgerGraph { row, .. }
+                    | Expect::LedgerTimeline { row, .. },
                 ..
             }) if row == id => {}
             Some(_) => problems.push(format!(
@@ -2432,6 +2465,15 @@ fn render_failure(graph: &Graph, b: i64, body: &[u8]) -> Option<String> {
     None
 }
 
+/// Issue #829: the index of a render answer's first non-zero timeline
+/// sample.
+fn timeline_index(body: &[u8]) -> Option<usize> {
+    json_value(body)?["timeline"]["samples"]
+        .as_array()?
+        .iter()
+        .position(|v| v.as_u64() != Some(0))
+}
+
 /// Issue #829: a render-diff answer against `g` in the unit `b`.
 fn render_diff_failure(g: &DiffGraph, b: i64, body: &[u8]) -> Option<String> {
     let Some(v) = json_value(body) else {
@@ -2852,12 +2894,16 @@ fn value_checks(t1: bool) -> Vec<(&'static str, &'static str, i64)> {
 /// profiles it holds: the reference, asked for a window that starts before
 /// the tenant's oldest profile, places the point at that profile's own
 /// time (`pkg/frontend/readpath/router.go:92-113` starts its series there),
-/// and the two then land in one slot.
+/// and the two then land in one slot. `E`, C38's window, starts 1 ms after
+/// the 15 s boundary before `q-trim`, the query tenants' first profile, so
+/// each step ends 1 ms after a boundary and our point falls in the slot
+/// after the profile's own (the fixture keeps that profile off a boundary).
 #[derive(Debug, Clone, Copy)]
 struct Windows {
     w: (i64, i64),
     q: (i64, i64),
     r: (i64, i64),
+    e: (i64, i64),
 }
 
 /// `msg` in `encoding`.
@@ -3044,13 +3090,17 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
 /// Issue #829: a `GET` route's path and query string, `max-nodes` as the
 /// exploration app sends it.
 fn get_target(method: &Method, win: Windows) -> String {
-    let (from, until) = win.r;
+    let (from, until) = match method {
+        Method::Render { early: true, .. } => win.e,
+        _ => win.r,
+    };
     let mut params: Vec<(&str, String)> = Vec::new();
     let max = |n: &Option<i64>| n.map(|n| ("max-nodes", n.to_string()));
     let route = match method {
         Method::Render {
             selector,
             max_nodes,
+            ..
         } => {
             params.push(("query", format!("{TYPE_A}{selector}")));
             params.push(("from", from.to_string()));
@@ -3129,7 +3179,17 @@ fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) 
 /// `LabelValues` proto for `rx` over `w`, as `tenant`.
 fn rx_values(server: &Server, tenant: &str, w: (i64, i64)) -> Option<Vec<String>> {
     let request = proto(Method::LabelValues("rx", &["{}"]), false);
-    let res = send(server, &request, Some(tenant), Windows { w, q: w, r: w });
+    let res = send(
+        server,
+        &request,
+        Some(tenant),
+        Windows {
+            w,
+            q: w,
+            r: w,
+            e: w,
+        },
+    );
     if res.status != 200 {
         return None;
     }
@@ -3534,7 +3594,12 @@ async fn profileql_matches_the_reference() {
     };
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let t0_s = (now_ms - 5 * 60_000).div_euclid(1000);
+    let mut t0_s = (now_ms - 5 * 60_000).div_euclid(1000);
+    // Issue #829: `q-trim`, pushed at `t0_s + 1`, is kept off a 15 s
+    // boundary, where C38's two timelines could not differ.
+    if (t0_s + 1) % 15 == 0 {
+        t0_s -= 1;
+    }
     let w = (now_ms - HOUR_MS, now_ms + HOUR_MS);
     let s0_s = t0_s + 180;
     let s0_ms = s0_s * 1000;
@@ -3542,6 +3607,7 @@ async fn profileql_matches_the_reference() {
         w,
         q: (s0_ms, s0_ms + 60_500),
         r: (w.0.div_euclid(15_000) * 15_000 + 14_999, w.1),
+        e: (((t0_s + 1) * 1000).div_euclid(15_000) * 15_000 + 1, w.1),
     };
     let mut mismatches = Mismatches::default();
 
@@ -3652,7 +3718,7 @@ async fn profileql_matches_the_reference() {
     eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
-    // §4: C0–C37.
+    // §4: C0–C38.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {
@@ -3672,6 +3738,42 @@ async fn profileql_matches_the_reference() {
             let a = send(&ours, &case.request, tenant, win);
             let b = send(&reference, &case.request, tenant, win);
             match case.expect {
+                Expect::LedgerTimeline {
+                    row,
+                    graph,
+                    ours: io,
+                    theirs: it,
+                } => {
+                    let unit = unit(is_t1);
+                    let failures: Vec<String> = [(&a, io, &ours), (&b, it, &reference)]
+                        .into_iter()
+                        .filter_map(|(res, index, server)| {
+                            let why = if res.status != 200 {
+                                Some(format!("status {}, want 200", res.status))
+                            } else {
+                                render_failure(graph, unit, &res.body).or_else(|| {
+                                    let at = timeline_index(&res.body);
+                                    (at != Some(index))
+                                        .then(|| format!("non-zero sample at {at:?}, want {index}"))
+                                })
+                            };
+                            why.map(|w| format!("{}: {w}", server.name))
+                        })
+                        .collect();
+                    if !failures.is_empty() {
+                        mismatches.both(
+                            &what,
+                            &format!(
+                                "ledger row `{row}`: an answer is not its pin: {}",
+                                failures.join("; ")
+                            ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    }
+                }
                 Expect::LedgerGraph {
                     row,
                     ours: go,

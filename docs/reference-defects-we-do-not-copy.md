@@ -103,6 +103,7 @@ replaces one.
 | [47](#47-a-jfr-lock-delay-is-stored-as-its-clock-ticks) | profiles reference | ingest | C | A JFR lock or park delay is stored as its clock-tick count labelled nanoseconds: 2.3 times too large in the library's own test recording. |
 | [48](#48-a-jfr-wall-clock-samples-count-is-carried-into-every-later-event) | profiles reference | ingest | C | In a JFR recording holding wall-clock samples, every later CPU, allocation or lock event counts as the last wall-clock sample's count. |
 | [49](#49-label-values-drops-the-label-it-is-asked-for) | profiles reference | queries | C | `/pyroscope/label-values?label=service_name` answers `400` instead of the values of `service_name`. |
+| [50](#50-a-render-timeline-from-before-a-tenants-first-profile-leaves-the-windows-grid) | profiles reference | queries | A | A render window that starts before a tenant's first profile puts that profile's sample one step earlier than the same window does once older data exists. |
 
 ---
 
@@ -2581,6 +2582,37 @@ The label's values over the last hour, with no matchers (`docs/api.md` §5).
 
 Ledger row `label-values-passes-the-name` (the profiles differential's ledger, issue #822).
 Pinned by case C37 of `crates/pulsus-server/tests/profileql_differential.rs`.
+
+---
+
+## 50. A render timeline from before a tenant's first profile leaves the window's grid
+
+**The profiles reference · queries · test A**
+
+### What the reference does
+
+The time series behind a render timeline is read in steps from the window's start, each point at
+the end of its step. When the window starts before the tenant's oldest profile, the read is split
+there (`pkg/frontend/readpath/router.go:92-113`): the part from the oldest profile on starts its own
+steps at that profile's time, so each point sits at that grid instead of the window's, and a
+profile falls one timeline slot earlier than the window's own grid puts it.
+
+### Why that is wrong rather than different
+
+One request answers on two grids (**A**): the same window over the same profiles puts a sample in
+one slot while the tenant's data begins inside the window, and in the next slot once older data
+exists.
+
+### What PulsusDB does
+
+The series always steps from the window's start, as the timeline's own `durationDelta` says
+(`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `render-timeline-keeps-the-window-grid` (the profiles differential's ledger, issue #822).
+Pinned by case C38 of `crates/pulsus-server/tests/profileql_differential.rs`. Owner decision,
+2026-11-19: "Record the difference".
 
 ---
 
