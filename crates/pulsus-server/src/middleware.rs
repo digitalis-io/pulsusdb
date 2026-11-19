@@ -564,10 +564,10 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823, #824, #827, #825): the sixteen Connect paths answer a
-    /// deadline as a Connect error, the six `GET` routes (`{name}` as `env`) as the
-    /// reference's HTTP handlers do; the profiles ingest path keeps the bare
-    /// `408`.
+    /// C6 (issue #821, #823, #824, #827, #825, #829): the sixteen Connect paths
+    /// answer a deadline as a Connect error, the twelve `GET` paths (`{name}` as
+    /// `env`) as the reference's HTTP handlers do; the profiles ingest path
+    /// keeps the bare `408`.
     #[test]
     fn c6_the_profiles_query_paths_answer_a_connect_deadline() {
         for path in [

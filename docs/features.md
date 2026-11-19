@@ -160,6 +160,7 @@ and for the one performance cliff it introduces.
 | Stats | `GET /api/profiles/v1/stats` | M5 |
 | Render (flamebearer) | `GET /api/profiles/v1/render` | M5 |
 | Diff render | `GET /api/profiles/v1/render-diff` | M5 |
+| Label values, the reference's form | `GET /api/profiles/v1/label-values` | M5 |
 | DOT export | `render?format=dot` — `maxNodes`, unit-aware labels, scaled fonts | M5 |
 | Compat query aliases (Connect-protocol querier surface + render paths) | flag-gated | M5 |
 

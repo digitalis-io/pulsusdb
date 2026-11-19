@@ -26,8 +26,8 @@
 //! ## The profiles query paths (issue #821)
 //!
 //! Two more classes: the sixteen profiles Connect paths answer the reference's
-//! Connect error (`DEADLINE_CONNECT_PATHS`), and the six profiles `GET`
-//! routes answer as the reference's HTTP read handlers do
+//! Connect error (`DEADLINE_CONNECT_PATHS`), and the twelve profiles `GET`
+//! paths answer as the reference's HTTP read handlers do
 //! (`DEADLINE_PROFILES_HTTP_PATHS`). Both constants are source-scanned and
 //! compared with the manifest's `ProfilesConnect` and `ProfilesQuery` rows
 //! in both directions.

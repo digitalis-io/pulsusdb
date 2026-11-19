@@ -255,3 +255,13 @@ own error, as PulsusDB does.
   function the reference does not mount.
 - **Why:** was defects entry 47, withdrawn by #827 part B.
 - **Case:** `none`.
+
+### `label-values-passes-the-name`
+
+- **Route:** `/pyroscope/label-values`.
+- **Request:** a label other than `__name__`.
+- **PulsusDB:** `200`, the label's values over the last hour.
+- **Reference:** `400`: it sends `LabelValues` with no name
+  (`pkg/querier/http.go:57`).
+- **Why:** defects entry 47.
+- **Case:** `C37` in `crates/pulsus-server/tests/profileql_differential.rs`.

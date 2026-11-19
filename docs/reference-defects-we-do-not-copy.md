@@ -100,6 +100,7 @@ replaces one.
 | [44](#44-a-push-whose-name-carries-profile_id-stores-nothing-and-answers-200) | profiles reference | ingest | C | `name=app{profile_id=p1}` with folded stacks answers `200` and stores nothing. |
 | [45](#45-speedscope-values-are-truncated-before-they-are-scaled) | profiles reference | ingest | A, C | A speedscope weight of `0.5` s stores 0, a parent's self time is 100 times too small, and a `nanoseconds` file stores nothing. |
 | [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
+| [47](#47-label-values-drops-the-label-it-is-asked-for) | profiles reference | queries | C | `/pyroscope/label-values?label=service_name` answers `400` instead of the values of `service_name`. |
 
 ---
 
@@ -2491,6 +2492,32 @@ Siblings of one name sum, as the same stack sent twice in any other format does 
 Ledger row `ingest-tree-same-name-siblings-sum` (the profiles differential's ledger, issue #822).
 No test of its own: the tree reader adds every node to the stack set that every format shares
 (`crates/pulsus-write/src/protocols/profileql_legacy/tree.rs`), and the set sums equal stacks.
+
+---
+
+## 47. `label-values` drops the label it is asked for
+
+**The profiles reference · queries · test C**
+
+### What the reference does
+
+`GET /pyroscope/label-values?label=<name>` reads `label`, and for any name but `__name__` sends
+`LabelValues` with an empty request (`pkg/querier/http.go:57`): no name, no matchers and no window.
+The method refuses an empty name, so the route answers `400` for every label.
+
+### Why that is wrong rather than different
+
+The one input the route takes is dropped before it is used (**C**), so the route answers no label's
+values.
+
+### What PulsusDB does
+
+The label's values over the last hour, with no matchers (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `label-values-passes-the-name` (the profiles differential's ledger, issue #822).
+Pinned by case C37 of `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ---
 
