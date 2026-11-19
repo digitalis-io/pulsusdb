@@ -56,7 +56,10 @@ pub const REPLICA_CONNECT_TIMEOUT_MS: u64 = 100;
 /// `connect_timeout_with_failover_ms = 100,
 /// connect_timeout_with_failover_secure_ms = 100`.
 pub fn replica_connect_timeout_clause() -> String {
-    String::new()
+    format!(
+        "connect_timeout_with_failover_ms = {REPLICA_CONNECT_TIMEOUT_MS}, \
+         connect_timeout_with_failover_secure_ms = {REPLICA_CONNECT_TIMEOUT_MS}"
+    )
 }
 
 /// The settings that can turn a read into a partial or changed answer that
@@ -242,7 +245,14 @@ impl QuerySettings {
     /// `connect_timeout_with_failover_secure_ms` at
     /// [`REPLICA_CONNECT_TIMEOUT_MS`].
     pub fn replica_connect_timeout(self) -> Self {
-        self
+        self.set(
+            "connect_timeout_with_failover_ms",
+            REPLICA_CONNECT_TIMEOUT_MS,
+        )
+        .set(
+            "connect_timeout_with_failover_secure_ms",
+            REPLICA_CONNECT_TIMEOUT_MS,
+        )
     }
 
     /// The value of one setting, if present. Introspection only (tests /
@@ -530,6 +540,14 @@ impl QuerySettings {
     /// |---|---|---|
     /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
     /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
+    ///
+    /// Two more, on every landing insert since issue #888, through
+    /// [`Self::replica_connect_timeout`]:
+    ///
+    /// | setting | pinned to | why |
+    /// |---|---|---|
+    /// | `connect_timeout_with_failover_ms` | `100` | **how long one try at a replica waits to connect.** On a cluster the wrapper writes one replica of the shard, tried in turn. At the server's default 1000, a replica whose address drops packets holds the insert, and this process's connection lease, 1 s per try (issue #888). A connect within one region takes milliseconds. An insert that reaches no replica fails `Code: 279` as before; a try that does not connect has sent no row |
+    /// | `connect_timeout_with_failover_secure_ms` | `100` | the same, when the cluster's servers talk TLS |
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
         Self::deduplicate_through_views()
             .set("insert_deduplication_token", token)
@@ -554,6 +572,7 @@ impl QuerySettings {
                 MAX_PARTITIONS_PER_INSERT_BLOCK,
             )
             .set("throw_on_max_partitions_per_insert_block", 1)
+            .replica_connect_timeout()
     }
 
     /// The settings every insert of one traces landing block carries (issues

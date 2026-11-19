@@ -32,7 +32,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use pulsus_clickhouse::{Attempt, ChClient, ChError, QuerySettings, Row};
+use pulsus_clickhouse::{
+    Attempt, ChClient, ChError, QuerySettings, Row, replica_connect_timeout_clause,
+};
 use pulsus_model::{FloatHistogram, Tenant};
 use pulsus_promql::plan::RangeSource;
 use pulsus_promql::{AggOp, Annotations, FillValues, PlanExpr, QueryPlan, SelectorSpec, SetOp};
@@ -1552,9 +1554,10 @@ struct IdentityRow {
 pub fn lag_sql(cluster: &str, db: &str) -> String {
     format!(
         "SELECT max(absolute_delay) AS lag_s FROM clusterAllReplicas({}, system.replicas) \
-         WHERE database = {} AND startsWith(table, 'metric_') SETTINGS skip_unavailable_shards = 1",
+         WHERE database = {} AND startsWith(table, 'metric_') SETTINGS skip_unavailable_shards = 1, {}",
         ch_string(cluster),
-        ch_string(db)
+        ch_string(db),
+        replica_connect_timeout_clause()
     )
 }
 
@@ -1589,9 +1592,10 @@ pub fn identity_sql(cluster: Option<&str>, db: &str) -> String {
         Some(c) => format!(
             "SELECT arraySort(groupUniqArray(toString(uuid))) AS ids \
              FROM clusterAllReplicas({}, system.databases) WHERE name = {} \
-             SETTINGS skip_unavailable_shards = 1",
+             SETTINGS skip_unavailable_shards = 1, {}",
             ch_string(c),
-            ch_string(db)
+            ch_string(db),
+            replica_connect_timeout_clause()
         ),
         None => format!(
             "SELECT arraySort(groupUniqArray(toString(uuid))) AS ids \

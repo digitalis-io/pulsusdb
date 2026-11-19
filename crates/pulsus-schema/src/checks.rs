@@ -308,6 +308,13 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     // The deadline's overflow mode; `QuerySettings::landing_insert`'s own
     // doc comment says why it is pinned.
     ("timeout_overflow_mode", NameCatalogue::Setting),
+    // Every landing insert and the three every-replica reads pin these
+    // (issue #888).
+    ("connect_timeout_with_failover_ms", NameCatalogue::Setting),
+    (
+        "connect_timeout_with_failover_secure_ms",
+        NameCatalogue::Setting,
+    ),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
     ("tupleElement", NameCatalogue::Function),

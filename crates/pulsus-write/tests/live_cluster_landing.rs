@@ -2165,7 +2165,10 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
         )
         .await;
     match probe {
-        Err(err) if err.to_string().contains("Timeout exceeded while connecting") => {}
+        Err(err)
+            if err
+                .to_string()
+                .contains("Timeout exceeded while connecting") => {}
         Err(err) => panic!("DROP did not time out on the fixture network: {err}"),
         Ok(()) => panic!("DROP did not time out on the fixture network: it answered"),
     }
@@ -2313,11 +2316,16 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
     }
     // P4.
     if poll.len() < 8 {
-        failures.push(format!("P4: {} poll statements, at least 8 expected", poll.len()));
+        failures.push(format!(
+            "P4: {} poll statements, at least 8 expected",
+            poll.len()
+        ));
     }
     for (i, (name, (elapsed, result))) in poll.iter().enumerate() {
         if let Err(e) = result {
-            failures.push(format!("P4: poll {i} ({name}) failed after {elapsed:?}: {e}"));
+            failures.push(format!(
+                "P4: poll {i} ({name}) failed after {elapsed:?}: {e}"
+            ));
         }
         if *elapsed >= Duration::from_secs(1) {
             failures.push(format!("P4: poll {i} ({name}) took {elapsed:?}"));
