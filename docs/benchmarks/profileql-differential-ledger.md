@@ -164,6 +164,42 @@ that is not a row here fails the suite.
 - **Why:** #818 plan §8.
 - **Case:** `none`: error answers are not compared (#822 plan §10).
 
+### `ingest-jfr-delay-in-nanoseconds`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording holding `jdk.JavaMonitorEnter` or `jdk.ThreadPark`
+  events on a clock other than one tick per nanosecond.
+- **PulsusDB:** each delay is converted to nanoseconds with its chunk's
+  ticks per second: the library's `example.jfr` stores about 8,005,192,311.
+- **Reference:** the tick count is stored as nanoseconds: 18,443,760,794.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 47.
+- **Case:** `VJ` in `crates/pulsus-server/tests/profileql_differential.rs`
+  (#819), which pins both totals.
+
+### `ingest-jfr-event-count-not-carried`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording holding `profiler.WallClockSample` events with a
+  `samples` count above 1 and later CPU, allocation or lock events.
+- **PulsusDB:** each of those later events counts once.
+- **Reference:** each counts as the last wall-clock sample's count.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 48.
+- **Case:** `none` (#819): the fixture's `example.jfr` holds no wall-clock
+  sample, so the two count each event once there; our side is pinned by J6
+  in `crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
+
+### `ingest-jfr-series-stored-together`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording of several profiles, one of which the checks
+  refuse.
+- **PulsusDB:** nothing is stored, and the refusal names index 0.
+- **Reference:** each series is pushed on its own, so the others are stored,
+  and the refusal names the refused series' position.
+- **Why:** atomic writes; #819 plan E6 and E7.
+- **Case:** `none` (#819): it needs a series the checks refuse, which the
+  fixture does not push.
+
 ### `otlp-multiple-values-are-summed`
 
 - **Route:** `/v1development/profiles`.
@@ -263,5 +299,5 @@ own error, as PulsusDB does.
 - **PulsusDB:** `200`, the label's values over the last hour.
 - **Reference:** `400`: it sends `LabelValues` with no name
   (`pkg/querier/http.go:57`).
-- **Why:** defects entry 47.
+- **Why:** defects entry 49.
 - **Case:** `C37` in `crates/pulsus-server/tests/profileql_differential.rs`.

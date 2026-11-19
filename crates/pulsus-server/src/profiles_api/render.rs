@@ -271,7 +271,7 @@ async fn render_diff_answer(
 /// `GET /api/profiles/v1/label-values?label=`: the profile types' ids for
 /// `__name__`, else the label's values over the last hour, with no
 /// matchers. The reference sends no name, so answers `400` for every
-/// other label; `docs/reference-defects-we-do-not-copy.md` §47.
+/// other label; `docs/reference-defects-we-do-not-copy.md` §49.
 pub(crate) async fn label_values_get(
     State(state): State<AppState>,
     headers: HeaderMap,
