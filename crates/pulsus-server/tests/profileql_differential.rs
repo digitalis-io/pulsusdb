@@ -2262,7 +2262,7 @@ fn query_pushes(t0_s: i64, s0_s: i64, e0_s: i64, q1: bool) -> Vec<Push> {
         },
     });
     // The exemplar fixture: `(rx, service, pod, ms after E0, k, form, id)`.
-    let exemplar_rows: [(&'static str, &str, Option<&str>, i64, i64, Form, &str); 6] = [
+    let exemplar_rows = [
         ("q-ex-1", "q-ex", Some("a"), 3_250, 2, Form::Plain, ID_E1),
         ("q-ex-2", "q-ex", Some("b"), 7_500, 1, Form::Plain, ID_E2),
         ("q-ex-3", "q-ex", Some("a"), 10_000, 40, Form::Plain, ID_E3),
