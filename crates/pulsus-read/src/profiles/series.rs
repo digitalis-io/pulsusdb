@@ -1114,4 +1114,56 @@ GROUP BY fingerprint";
             vec![pod("a"), pod("b")]
         );
     }
+
+    /// S20 (issue #826 part B): an exemplar's labels take the reference's
+    /// order, `__profile_type__` first, `__service_name__` second, the rest
+    /// by name.
+    #[test]
+    fn s20_exemplar_labels_take_the_reference_order() {
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
+        };
+        let rows = vec![
+            TimeSeriesExemplarRow {
+                kind: 0,
+                g: vec!["a".to_string()],
+                series_total: 3.0,
+                points: vec![(1, 3.0, 3, "p".to_string(), 7, 9)],
+                fingerprint: 0,
+                labels: Vec::new(),
+            },
+            TimeSeriesExemplarRow {
+                kind: 1,
+                g: Vec::new(),
+                series_total: 0.0,
+                points: Vec::new(),
+                fingerprint: 9,
+                labels: pairs(&[
+                    ("__name__", "process_cpu"),
+                    ("__period_type__", "cpu"),
+                    ("__profile_type__", "T"),
+                    ("__service_name__", "v"),
+                    ("pod", "e"),
+                ]),
+            },
+        ];
+        let out = series_exemplars(rows, &strings(&["pod"]), None);
+        let got = out[0].points[0]
+            .exemplar
+            .as_ref()
+            .map(|e| e.labels.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            got,
+            pairs(&[
+                ("__profile_type__", "T"),
+                ("__service_name__", "v"),
+                ("__name__", "process_cpu"),
+                ("__period_type__", "cpu"),
+                ("pod", "e"),
+            ])
+        );
+    }
 }
