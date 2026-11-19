@@ -1,12 +1,27 @@
 //! Issue #828: the merged profile as a pprof `Profile` — `SelectMergeProfile`,
 //! `SelectMergeStacktraces` with `PROFILE_FORMAT_PPROF`, and
 //! `GET /api/profiles/v1/export` — planned as one statement (S9).
+//!
+//! The statement merges the selected samples per stack and reads the
+//! locations those stacks name, in one pass over the samples: each merged
+//! stack is expanded into itself and its location ids, and the locations
+//! are the join's probe side. `go_pgo`'s slice and `aggregate_callees`'
+//! re-merge run in the statement too. [`build`] cuts the stacks to
+//! `max_nodes` and writes the message.
+
+use std::collections::HashMap;
 
 use pulsus_model::Tenant;
-use pulsus_profiles_wire::google_v1::Profile;
+use pulsus_profiles_wire::google_v1::{
+    Function, Line, Location, Mapping, Profile, Sample, ValueType,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::logql::escape::ch_string;
+use crate::traces::tenant_scope::TenantTerm;
+
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
+use super::tree::{self, TreeRequest, call_site_predicate};
 
 /// What a pprof request selects: [`super::tree::TreeRequest`]'s fields,
 /// with `go_pgo` as `(keep_locations, aggregate_callees)`.
@@ -35,13 +50,15 @@ pub struct Planned {
     pub profile_type: String,
     /// The request's `max_nodes`, 0 when absent.
     pub max_nodes: i64,
-    /// Whether the request carries a call site.
+    /// Whether the statement filters by a call site: one was sent and
+    /// `go_pgo` was not.
     pub call_site: bool,
     pub go_pgo: Option<(u32, bool)>,
 }
 
 /// One row of S9: a merged stack (`kind` 0) or a location it names
-/// (`kind` 1).
+/// (`kind` 1). `period` is the largest period of the selected samples, on
+/// every row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, clickhouse::Row, Serialize, Deserialize)]
 pub struct PprofRow {
     pub period: i64,
@@ -63,20 +80,553 @@ pub struct PprofRow {
     pub line_numbers: Vec<i64>,
 }
 
-/// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
-/// lookback floor, so nothing is read.
-pub fn plan(
-    _tenant: &Tenant,
-    _config: &ProfilesReadConfig,
-    _req: &PprofRequest<'_>,
-    _now_ms: i64,
-) -> Result<Option<Planned>, ProfilesReadError> {
-    Ok(None)
+/// The location columns, as the location read selects them.
+const LOCATION_COLUMNS: &str = "SELECT location_id, mapping_file, mapping_build_id, mapping_start, mapping_limit, mapping_offset,
+         mapping_flags, address, line_functions, line_system_names, line_files, line_start_lines, line_numbers";
+
+/// The sample read's `AND` lines one level deeper than S5 nests them.
+fn deeper(lines: &str) -> String {
+    lines.replace("\n      AND ", "\n        AND ")
 }
 
-/// The `Profile` of S9's rows.
-pub fn build(_planned: &Planned, _rows: Vec<PprofRow>) -> Profile {
-    Profile::default()
+/// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
+/// lookback floor, so nothing is read. The selection is checked by
+/// [`tree::side`]; `max_nodes` is not checked (D5).
+pub fn plan(
+    tenant: &Tenant,
+    config: &ProfilesReadConfig,
+    req: &PprofRequest<'_>,
+    now_ms: i64,
+) -> Result<Option<Planned>, ProfilesReadError> {
+    let tree_req = TreeRequest {
+        profile_type: req.profile_type,
+        label_selector: req.label_selector,
+        start_ms: req.start_ms,
+        end_ms: req.end_ms,
+        max_nodes: req.max_nodes,
+        call_site: req.call_site,
+        span_selector: req.span_selector,
+        trace_id_selector: req.trace_id_selector,
+        profile_id_selector: req.profile_id_selector,
+    };
+    let Some(side) = tree::side(tenant, config, &tree_req, now_ms)? else {
+        return Ok(None);
+    };
+    let tenant_term = TenantTerm::of(tenant);
+    let (d0, d1) = side.days();
+    // `go_pgo` wins over a call site, as the reference's resolver chooses.
+    let call_site = req.go_pgo.is_none() && !req.call_site.is_empty();
+    let call_site_line = if call_site {
+        format!(
+            "\n          AND {}",
+            call_site_predicate("names", req.call_site)
+        )
+    } else {
+        String::new()
+    };
+    let merged = format!(
+        "SELECT any(st.location_ids) AS location_ids, any(agg.v) AS v, any(agg.p) AS p
+    FROM (
+      SELECT stack_id, location_ids
+      FROM profile_stacks
+      WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'{call_site_line}
+    ) AS st
+    INNER JOIN (
+      SELECT stack_id, sum(value) AS v, max(period) AS p
+      FROM {samples}
+      WHERE {tenant_term} AND type_id = {type_id}{service_terms}
+        AND fingerprint IN ({series})
+        AND timestamp_ns >= {start_ns} AND timestamp_ns <= {end_ns}{filters}
+      GROUP BY stack_id
+    ) AS agg ON st.stack_id = agg.stack_id
+    GROUP BY st.stack_id",
+        samples = config.samples_table,
+        type_id = ch_string(side.type_id()),
+        service_terms = deeper(&crate::metrics::profile_service_terms(&side.matchers)),
+        series = side.series,
+        start_ns = side.window.start_ms.saturating_mul(1_000_000),
+        end_ns = side.window.end_ms.saturating_mul(1_000_000),
+        filters = deeper(&side.filters),
+    );
+    let stacks = match req.go_pgo {
+        Some((keep, _)) if keep > 0 => format!(
+            "SELECT arraySlice(location_ids, 1, {keep}) AS location_ids, sum(v) AS v, max(p) AS p
+    FROM (
+    {merged}
+    )
+    GROUP BY location_ids"
+        ),
+        _ => merged,
+    };
+    let locations = format!(
+        "{LOCATION_COLUMNS}
+  FROM profile_locations
+  WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'"
+    );
+    let sql = if matches!(req.go_pgo, Some((_, true))) {
+        aggregate_callees(&locations, &stacks)
+    } else {
+        format!(
+            "SELECT max(max(o.pv)) OVER () AS period,
+       o.kind AS kind, o.k AS k, any(o.locs) AS location_ids, any(o.val) AS v,
+       any(l.mapping_file) AS mapping_file, any(l.mapping_build_id) AS mapping_build_id,
+       any(l.mapping_start) AS mapping_start, any(l.mapping_limit) AS mapping_limit,
+       any(l.mapping_offset) AS mapping_offset, any(l.mapping_flags) AS mapping_flags,
+       any(l.address) AS address, any(l.line_functions) AS line_functions,
+       any(l.line_system_names) AS line_system_names, any(l.line_files) AS line_files,
+       any(l.line_start_lines) AS line_start_lines, any(l.line_numbers) AS line_numbers
+FROM (
+  {locations}
+) AS l
+RIGHT JOIN (
+  SELECT tupleElement(t, 1) AS kind, tupleElement(t, 2) AS k, tupleElement(t, 3) AS locs, tupleElement(t, 4) AS val, tupleElement(t, 5) AS pv
+  FROM (
+    {stacks}
+  )
+  ARRAY JOIN arrayConcat([(toUInt8(0), reinterpretAsUInt128(sipHash128(location_ids)), location_ids, v, p)],
+                         arrayMap(x -> (toUInt8(1), x, CAST([], 'Array(UInt128)'), toInt64(0), toInt64(0)), location_ids)) AS t
+) AS o ON l.location_id = o.k
+GROUP BY kind, k"
+        )
+    };
+    Ok(Some(Planned {
+        sql,
+        window_end_ms: side.window.end_ms,
+        profile_type: side.type_id().to_string(),
+        max_nodes: req.max_nodes.unwrap_or(0),
+        call_site,
+        go_pgo: req.go_pgo,
+    }))
+}
+
+/// S9 with `go_pgo.aggregate_callees`: each stack's leaf occurrence with
+/// lines takes a variant of its location whose first line is at line 0,
+/// each stack's path is rebuilt from the effective ids, and the stacks
+/// whose rebuilt paths are equal are summed. A location stored more than
+/// once joins every occurrence once per copy; the copies are equal, so the
+/// path keeps each `(position, id)` once.
+fn aggregate_callees(locations: &str, stacks: &str) -> String {
+    format!(
+        "SELECT max(max(a.p)) OVER () AS period, if(a.sk = 0, toUInt8(1), toUInt8(0)) AS kind,
+       if(kind = 1, a.eid, reinterpretAsUInt128(sipHash128(a.path))) AS k,
+       any(a.path) AS location_ids, sum(a.val) AS v,
+       any(a.mapping_file) AS mapping_file, any(a.mapping_build_id) AS mapping_build_id,
+       any(a.mapping_start) AS mapping_start, any(a.mapping_limit) AS mapping_limit,
+       any(a.mapping_offset) AS mapping_offset, any(a.mapping_flags) AS mapping_flags,
+       any(a.address) AS address, any(a.line_functions) AS line_functions,
+       any(a.line_system_names) AS line_system_names, any(a.line_files) AS line_files,
+       any(a.line_start_lines) AS line_start_lines, any(a.line_numbers) AS line_numbers
+FROM (
+  SELECT j.sk AS sk, j.eid AS eid, arrayMap(x -> x.2, arraySort(groupUniqArray((j.pos, j.eid)))) AS path, any(j.val) AS val, max(j.p) AS p,
+         any(j.mapping_file) AS mapping_file, any(j.mapping_build_id) AS mapping_build_id,
+         any(j.mapping_start) AS mapping_start, any(j.mapping_limit) AS mapping_limit,
+         any(j.mapping_offset) AS mapping_offset, any(j.mapping_flags) AS mapping_flags,
+         any(j.address) AS address, any(j.line_functions) AS line_functions,
+         any(j.line_system_names) AS line_system_names, any(j.line_files) AS line_files,
+         any(j.line_start_lines) AS line_start_lines, any(j.line_numbers) AS line_numbers
+  FROM (
+    SELECT o.sk AS sk, o.pos AS pos, o.val AS val, o.p AS p, l.mapping_file AS mapping_file,
+           l.mapping_build_id AS mapping_build_id, l.mapping_start AS mapping_start, l.mapping_limit AS mapping_limit,
+           l.mapping_offset AS mapping_offset, l.mapping_flags AS mapping_flags, l.address AS address,
+           l.line_functions AS line_functions, l.line_system_names AS line_system_names, l.line_files AS line_files,
+           l.line_start_lines AS line_start_lines,
+           if(o.pos = 1 AND notEmpty(l.line_numbers), arrayConcat([toInt64(0)], arraySlice(l.line_numbers, 2)), l.line_numbers) AS line_numbers,
+           if(o.pos = 1 AND notEmpty(l.line_numbers),
+              reinterpretAsUInt128(sipHash128(mapping_file, mapping_build_id, mapping_start, mapping_limit, mapping_offset,
+                                              mapping_flags, address, line_functions, line_system_names, line_files,
+                                              line_start_lines, line_numbers)),
+              o.lid) AS eid
+    FROM (
+      {locations}
+    ) AS l
+    RIGHT JOIN (
+      SELECT reinterpretAsUInt128(sipHash128(location_ids)) AS sk, pos, location_ids[pos] AS lid, v AS val, p
+      FROM (
+        {stacks}
+      )
+      ARRAY JOIN arrayEnumerate(location_ids) AS pos
+    ) AS o ON l.location_id = o.lid
+  ) AS j
+  GROUP BY GROUPING SETS ((j.sk), (j.eid))
+) AS a
+GROUP BY kind, k"
+    )
+}
+
+// ---------------------------------------------------------------------
+// The build
+// ---------------------------------------------------------------------
+
+/// A function's identity: name, system name, file, start line (D7).
+type FnKey<'a> = (&'a str, &'a str, &'a str, i64);
+
+/// A location's lines as `(function, line)`, in stored order (the innermost
+/// first).
+fn lines_of(r: &PprofRow) -> Vec<(FnKey<'_>, i64)> {
+    let n = r
+        .line_functions
+        .len()
+        .min(r.line_system_names.len())
+        .min(r.line_files.len())
+        .min(r.line_start_lines.len())
+        .min(r.line_numbers.len());
+    (0..n)
+        .map(|i| {
+            (
+                (
+                    r.line_functions[i].as_str(),
+                    r.line_system_names[i].as_str(),
+                    r.line_files[i].as_str(),
+                    r.line_start_lines[i],
+                ),
+                r.line_numbers[i],
+            )
+        })
+        .collect()
+}
+
+/// One location of a built sample's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Frame {
+    /// A stored location, by its id.
+    Stored(u128),
+    /// A stored location with its first `n` lines cut (§3.2 step 6).
+    Partial(u128, usize),
+    /// The cut's stub, `other` (§3.2 step 8).
+    Stub,
+}
+
+/// The `Profile` of S9's rows (§3): a full profile, the cut to `max_nodes`
+/// when one is set or a call site is, or `go_pgo`'s profile.
+pub fn build(planned: &Planned, rows: Vec<PprofRow>) -> Profile {
+    if rows.is_empty() {
+        return Profile {
+            sample_type: vec![ValueType::default()],
+            string_table: vec![String::new()],
+            period_type: Some(ValueType::default()),
+            ..Profile::default()
+        };
+    }
+    let period = rows.iter().map(|r| r.period).max().unwrap_or(0);
+    let mut stacks: Vec<(&[u128], i64)> = rows
+        .iter()
+        .filter(|r| r.kind == 0)
+        .map(|r| (r.location_ids.as_slice(), r.v))
+        .collect();
+    stacks.sort();
+    let locations: HashMap<u128, &PprofRow> = rows
+        .iter()
+        .filter(|r| r.kind == 1)
+        .map(|r| (r.k, r))
+        .collect();
+    let stored = |ids: &[u128]| ids.iter().map(|&k| Frame::Stored(k)).collect::<Vec<_>>();
+    let samples: Vec<(Vec<Frame>, i64)> = if planned.go_pgo.is_some() {
+        stacks
+            .iter()
+            .filter(|(ids, _)| !ids.is_empty())
+            .map(|(ids, v)| (stored(ids), *v))
+            .collect()
+    } else if planned.max_nodes > 0 || planned.call_site {
+        cut(&stacks, &locations, planned.max_nodes)
+    } else {
+        stacks.iter().map(|(ids, v)| (stored(ids), *v)).collect()
+    };
+    let mut e = Encoder::default();
+    e.string("");
+    let empty = PprofRow::default();
+    let row_of = |k: u128| locations.get(&k).copied().unwrap_or(&empty);
+    let mut location_ids: HashMap<Frame, u64> = HashMap::new();
+    for (path, _) in &samples {
+        for frame in path {
+            let (k, skip) = match *frame {
+                Frame::Stored(k) => (k, 0),
+                Frame::Partial(k, n) => (k, n),
+                Frame::Stub => continue,
+            };
+            if !location_ids.contains_key(frame) {
+                let id = e.location(row_of(k), skip);
+                location_ids.insert(*frame, id);
+            }
+        }
+    }
+    if samples.iter().any(|(path, _)| path.contains(&Frame::Stub)) {
+        let id = e.stub();
+        location_ids.insert(Frame::Stub, id);
+    }
+    let sample = samples
+        .iter()
+        .map(|(path, v)| Sample {
+            location_id: path.iter().map(|f| location_ids[f]).collect(),
+            value: vec![*v],
+            label: Vec::new(),
+        })
+        .collect();
+    let parts: Vec<&str> = planned.profile_type.split(':').collect();
+    let part = |i: usize| parts.get(i).copied().unwrap_or("");
+    let unit = e.string(part(2));
+    let sample_kind = e.string(part(1));
+    let period_kind = e.string(part(3));
+    let period_unit = e.string(part(4));
+    Profile {
+        sample_type: vec![ValueType {
+            r#type: sample_kind,
+            unit,
+        }],
+        sample,
+        mapping: e.mappings,
+        location: e.locations,
+        function: e.functions,
+        string_table: e.strings,
+        time_nanos: planned.window_end_ms.saturating_mul(1_000_000),
+        period_type: Some(ValueType {
+            r#type: period_kind,
+            unit: period_unit,
+        }),
+        period,
+        default_sample_type: sample_kind,
+        ..Profile::default()
+    }
+}
+
+/// §3.2: the merged stacks cut to exactly `max_nodes` function nodes.
+fn cut(
+    stacks: &[(&[u128], i64)],
+    locations: &HashMap<u128, &PprofRow>,
+    max_nodes: i64,
+) -> Vec<(Vec<Frame>, i64)> {
+    // Steps 1 and 2: each stack's functions, leaf first, inserted root
+    // first into one tree.
+    let lines: HashMap<u128, Vec<(FnKey<'_>, i64)>> =
+        locations.iter().map(|(&k, r)| (k, lines_of(r))).collect();
+    let line_count = |k: u128| lines.get(&k).map_or(0, Vec::len);
+    let mut index: HashMap<(usize, FnKey<'_>), usize> = HashMap::new();
+    let mut totals: Vec<i64> = vec![0];
+    let mut paths: Vec<Vec<usize>> = Vec::with_capacity(stacks.len());
+    for (ids, v) in stacks {
+        let functions: Vec<FnKey<'_>> = ids
+            .iter()
+            .flat_map(|k| lines.get(k).into_iter().flatten().map(|(f, _)| *f))
+            .collect();
+        let mut parent = 0usize;
+        let mut nodes = Vec::with_capacity(functions.len());
+        for f in functions.iter().rev() {
+            let next = totals.len();
+            let node = *index.entry((parent, *f)).or_insert(next);
+            if node == next {
+                totals.push(0);
+            }
+            totals[node] = totals[node].saturating_add(*v);
+            nodes.push(node);
+            parent = node;
+        }
+        nodes.reverse();
+        paths.push(nodes);
+    }
+    // Step 3: the `max_nodes`-th largest total, the root's 0 counted.
+    let n = totals.len() - 1;
+    let min = if max_nodes < 1 || max_nodes as u128 > n as u128 {
+        0
+    } else {
+        let mut all: Vec<i64> = totals[1..].to_vec();
+        all.push(0);
+        all.sort_unstable_by(|a, b| b.cmp(a));
+        all[max_nodes as usize - 1]
+    };
+    // Step 4.
+    let marked = |node: usize| min > 0 && totals[node] < min;
+
+    let mut out: Vec<(Vec<Frame>, i64)> = Vec::new();
+    let mut at: HashMap<Vec<Frame>, usize> = HashMap::new();
+    let mut full: i64 = 0;
+    for ((ids, v), nodes) in stacks.iter().zip(&paths) {
+        // Step 5.
+        let off = nodes.iter().take_while(|&&node| marked(node)).count();
+        if !nodes.is_empty() && off == nodes.len() {
+            full = full.saturating_add(*v);
+            continue;
+        }
+        // Step 6.
+        let path: Vec<Frame> = if off == 0 {
+            ids.iter().map(|&k| Frame::Stored(k)).collect()
+        } else {
+            let (mut f, mut l) = (0usize, 0usize);
+            while l < ids.len() && f + line_count(ids[l]) <= off {
+                f += line_count(ids[l]);
+                l += 1;
+            }
+            let r = off - f;
+            let mut path = vec![Frame::Stub];
+            if r == 0 {
+                path.extend(ids[l..].iter().map(|&k| Frame::Stored(k)));
+            } else {
+                path.push(Frame::Partial(ids[l], r));
+                path.extend(ids[l + 1..].iter().map(|&k| Frame::Stored(k)));
+            }
+            path
+        };
+        // Step 7.
+        match at.get(&path) {
+            Some(&i) => out[i].1 = out[i].1.saturating_add(*v),
+            None => {
+                at.insert(path.clone(), out.len());
+                out.push((path, *v));
+            }
+        }
+    }
+    if full > 0 {
+        out.push((vec![Frame::Stub], full));
+    }
+    out
+}
+
+/// A mapping's content: file, build id, start, limit, offset, flags.
+type MappingKey = (String, String, u64, u64, u64, u8);
+/// A location's content: its mapping, address and lines.
+type LocationKey = (u64, u64, Vec<(u64, i64)>);
+
+/// The message's tables, each interned by content in first-use order
+/// (§3.5).
+#[derive(Default)]
+struct Encoder {
+    strings: Vec<String>,
+    string_ids: HashMap<String, i64>,
+    mappings: Vec<Mapping>,
+    mapping_ids: HashMap<MappingKey, u64>,
+    functions: Vec<Function>,
+    function_ids: HashMap<(String, String, String, i64), u64>,
+    locations: Vec<Location>,
+    location_ids: HashMap<LocationKey, u64>,
+}
+
+impl Encoder {
+    fn string(&mut self, s: &str) -> i64 {
+        if let Some(&i) = self.string_ids.get(s) {
+            return i;
+        }
+        let i = self.strings.len() as i64;
+        self.strings.push(s.to_string());
+        self.string_ids.insert(s.to_string(), i);
+        i
+    }
+
+    /// A location row's mapping id; 0 when its six mapping fields are all
+    /// empty.
+    fn mapping(&mut self, r: &PprofRow) -> u64 {
+        let key: MappingKey = (
+            r.mapping_file.clone(),
+            r.mapping_build_id.clone(),
+            r.mapping_start,
+            r.mapping_limit,
+            r.mapping_offset,
+            r.mapping_flags,
+        );
+        if key == MappingKey::default() {
+            return 0;
+        }
+        if let Some(&id) = self.mapping_ids.get(&key) {
+            return id;
+        }
+        let filename = self.string(&r.mapping_file);
+        let build_id = self.string(&r.mapping_build_id);
+        let id = self.mappings.len() as u64 + 1;
+        let flag = |bit: u8| r.mapping_flags & (1 << bit) != 0;
+        self.mappings.push(Mapping {
+            id,
+            memory_start: r.mapping_start,
+            memory_limit: r.mapping_limit,
+            file_offset: r.mapping_offset,
+            filename,
+            build_id,
+            has_functions: flag(0),
+            has_filenames: flag(1),
+            has_line_numbers: flag(2),
+            has_inline_frames: flag(3),
+        });
+        self.mapping_ids.insert(key, id);
+        id
+    }
+
+    fn function(&mut self, (name, system_name, file, start_line): FnKey<'_>) -> u64 {
+        let key = (
+            name.to_string(),
+            system_name.to_string(),
+            file.to_string(),
+            start_line,
+        );
+        if let Some(&id) = self.function_ids.get(&key) {
+            return id;
+        }
+        let name = self.string(name);
+        let filename = self.string(file);
+        let system_name = self.string(system_name);
+        let id = self.functions.len() as u64 + 1;
+        self.functions.push(Function {
+            id,
+            name,
+            system_name,
+            filename,
+            start_line,
+        });
+        self.function_ids.insert(key, id);
+        id
+    }
+
+    /// The id of location row `r` without its first `skip` lines.
+    fn location(&mut self, r: &PprofRow, skip: usize) -> u64 {
+        let mapping_id = self.mapping(r);
+        let lines: Vec<(u64, i64)> = lines_of(r)
+            .into_iter()
+            .skip(skip)
+            .map(|(f, line)| (self.function(f), line))
+            .collect();
+        self.intern_location(mapping_id, r.address, lines)
+    }
+
+    fn intern_location(&mut self, mapping_id: u64, address: u64, lines: Vec<(u64, i64)>) -> u64 {
+        let key: LocationKey = (mapping_id, address, lines);
+        if let Some(&id) = self.location_ids.get(&key) {
+            return id;
+        }
+        let id = self.locations.len() as u64 + 1;
+        self.locations.push(Location {
+            id,
+            mapping_id,
+            address,
+            line: key
+                .2
+                .iter()
+                .map(|&(function_id, line)| Line { function_id, line })
+                .collect(),
+            is_folded: false,
+        });
+        self.location_ids.insert(key, id);
+        id
+    }
+
+    /// The cut's stub: a function `other`, and a location of mapping 1
+    /// with one line of it at line 0; mapping 1 is created when there is
+    /// none.
+    fn stub(&mut self) -> u64 {
+        let other = self.function(("other", "other", "", 0));
+        if self.mappings.is_empty() {
+            self.mappings.push(Mapping {
+                id: 1,
+                ..Mapping::default()
+            });
+        }
+        let id = self.locations.len() as u64 + 1;
+        self.locations.push(Location {
+            id,
+            mapping_id: 1,
+            address: 0,
+            line: vec![Line {
+                function_id: other,
+                line: 0,
+            }],
+            is_folded: false,
+        });
+        id
+    }
 }
 
 #[cfg(test)]

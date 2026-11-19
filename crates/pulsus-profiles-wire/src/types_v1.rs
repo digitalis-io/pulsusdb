@@ -162,7 +162,8 @@ pub struct Location {
     pub name: String,
 }
 
-/// `GoPGO`: read, and not served yet (#828).
+/// `GoPGO`: the merged profile's slice to its first `keep_locations`
+/// locations, and its callees merged by function (issue #828).
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GoPgo {

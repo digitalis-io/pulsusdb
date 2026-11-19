@@ -161,9 +161,9 @@ pub struct SelectMergeStacktracesRequest {
     pub span_selector: Vec<String>,
 }
 
-/// `SelectMergeStacktraces`' response: the flame graph, field 1, and the
-/// trimmed tree's bytes, field 2. The DOT and pprof fields are later
-/// parts' (#828, #829).
+/// `SelectMergeStacktraces`' response: the flame graph, field 1, the
+/// trimmed tree's bytes, field 2, and the merged profile, field 5 (issue
+/// #828). The DOT field is a later part's (#829).
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeStacktracesResponse {
@@ -177,38 +177,83 @@ pub struct SelectMergeStacktracesResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub tree: Vec<u8>,
-    #[prost(message, optional, tag = "105")]
+    /// Issue #828: the merged profile, with `PROFILE_FORMAT_PPROF`.
+    #[prost(message, optional, tag = "5")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pprof: Option<PprofProfile>,
 }
 
-/// Issue #828: `SelectMergeProfile`'s request.
+/// Issue #828: `SelectMergeProfile`'s request: the merged profile of a
+/// selection, as pprof.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeProfileRequest {
-    #[prost(string, tag = "101")]
+    #[prost(string, tag = "1")]
+    #[serde(
+        rename = "profileTypeID",
+        alias = "profile_typeID",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub profile_type_id: String,
-    #[prost(string, tag = "102")]
+    #[prost(string, tag = "2")]
+    #[serde(
+        rename = "labelSelector",
+        alias = "label_selector",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub label_selector: String,
-    #[prost(int64, tag = "103")]
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub start: i64,
-    #[prost(int64, tag = "104")]
+    #[prost(int64, tag = "4")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub end: i64,
-    #[prost(int64, optional, tag = "105")]
+    #[prost(int64, optional, tag = "5")]
+    #[serde(
+        rename = "maxNodes",
+        alias = "max_nodes",
+        serialize_with = "crate::int64::ser_opt",
+        deserialize_with = "crate::int64::de_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_nodes: Option<i64>,
-    #[prost(message, optional, tag = "106")]
+    #[prost(message, optional, tag = "6")]
+    #[serde(
+        rename = "stackTraceSelector",
+        alias = "stack_trace_selector",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stack_trace_selector: Option<crate::types_v1::StackTraceSelector>,
-    #[prost(string, repeated, tag = "107")]
+    #[prost(string, repeated, tag = "7")]
+    #[serde(
+        rename = "profileIdSelector",
+        alias = "profile_id_selector",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub profile_id_selector: Vec<String>,
-    #[prost(string, repeated, tag = "108")]
+    #[prost(string, repeated, tag = "8")]
+    #[serde(
+        rename = "traceIdSelector",
+        alias = "trace_id_selector",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub trace_id_selector: Vec<String>,
 }
 
-/// Issue #828: a pprof answer.
+/// Issue #828: a pprof answer of `SelectMergeStacktraces`.
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PprofProfile {
-    #[prost(message, optional, tag = "101")]
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<crate::google_v1::Profile>,
 }
 

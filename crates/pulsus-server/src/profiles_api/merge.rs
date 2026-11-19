@@ -7,7 +7,8 @@
 //! trimmed tree's bytes beside the flame graph; `GET /merge` answers the
 //! flame graph alone and builds no bytes. In the order: the tenant, the
 //! codec and the body, a span selector with a trace selector, the format,
-//! then the planner's own checks.
+//! then the planner's own checks. Issue #828: `PROFILE_FORMAT_PPROF`
+//! answers the merged profile (`super::pprof`) in `pprof.profile`.
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -15,10 +16,12 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use pulsus_model::Tenant;
 use pulsus_profiles_wire::querier_v1::{
-    FlameGraph, Level, ProfileFormat, SelectMergeStacktracesRequest, SelectMergeStacktracesResponse,
+    FlameGraph, Level, PprofProfile, ProfileFormat, SelectMergeStacktracesRequest,
+    SelectMergeStacktracesResponse,
 };
 use pulsus_read::profiles::ProfilesReadConfig;
 use pulsus_read::profiles::flamegraph;
+use pulsus_read::profiles::pprof::PprofRequest;
 use pulsus_read::profiles::tree::{self, TreeRequest, TreeRow};
 
 use crate::app::AppState;
@@ -38,8 +41,7 @@ async fn flame_graph(
     with_tree: bool,
 ) -> Result<(FlameGraph, Vec<u8>), ConnectError> {
     tree::refuse_span_with_trace(&msg.span_selector, &msg.trace_id_selector)?;
-    if let Ok(f @ (ProfileFormat::Tree | ProfileFormat::Dot | ProfileFormat::Pprof)) =
-        ProfileFormat::try_from(msg.format)
+    if let Ok(f @ (ProfileFormat::Tree | ProfileFormat::Dot)) = ProfileFormat::try_from(msg.format)
     {
         return Err(ConnectError::new(
             Code::Unimplemented,
@@ -118,6 +120,9 @@ pub(crate) async fn select_merge_stacktraces(
         Ok(p) => p,
         Err(refused) => return refused.into_response(),
     };
+    if msg.format == ProfileFormat::Pprof as i32 {
+        return finish(codec, pprof_answer(&state, &tenant, msg).await);
+    }
     let answer = flame_graph(&state, &tenant, msg, true)
         .await
         .map(|(g, tree)| SelectMergeStacktracesResponse {
@@ -126,6 +131,35 @@ pub(crate) async fn select_merge_stacktraces(
             pprof: None,
         });
     finish(codec, answer)
+}
+
+/// Issue #828 (D10): `PROFILE_FORMAT_PPROF`: the merged profile of `msg`,
+/// with its span selector, in `pprof.profile`.
+async fn pprof_answer(
+    state: &AppState,
+    tenant: &Tenant,
+    msg: SelectMergeStacktracesRequest,
+) -> Result<SelectMergeStacktracesResponse, ConnectError> {
+    let (call_site, go_pgo) = super::pprof::stack_trace_selector(msg.stack_trace_selector);
+    let req = PprofRequest {
+        profile_type: &msg.profile_type_id,
+        label_selector: &msg.label_selector,
+        start_ms: msg.start,
+        end_ms: msg.end,
+        max_nodes: msg.max_nodes,
+        call_site: &call_site,
+        span_selector: &msg.span_selector,
+        trace_id_selector: &msg.trace_id_selector,
+        profile_id_selector: &msg.profile_id_selector,
+        go_pgo,
+    };
+    let profile = super::pprof::merged_profile(state, tenant, req).await?;
+    Ok(SelectMergeStacktracesResponse {
+        pprof: Some(PprofProfile {
+            profile: Some(profile),
+        }),
+        ..SelectMergeStacktracesResponse::default()
+    })
 }
 
 /// Whether `GET /merge` builds the tree bytes: it answers the flame graph

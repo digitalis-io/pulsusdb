@@ -927,7 +927,7 @@ The full text of all three is `docs/TraceQL/sql-schema.md` §5.4, which is where
 
 ## 5. Profiles
 
-A batch of pushes is one insert of one block into `profile_landing`; five views copy each `kind` to its table. `org_id` leads every sorting key. On a cluster `profile_stacks` and `profile_locations` are one replica set across every shard (`/clickhouse/tables/all/`); the other four are per shard, and a batch's rows sit on the shard that took it. Kinds 5 and 6 are reserved for uploaded files and have no view.
+A batch of pushes is one insert of one block into `profile_landing`; five views copy each `kind` to its table. A sample row carries its profile's pushed `period`, and a location row its mapping's `has_functions`, `has_filenames`, `has_line_numbers` and `has_inline_frames` as bits 0–3 of `mapping_flags` (issue #828). `org_id` leads every sorting key. On a cluster `profile_stacks` and `profile_locations` are one replica set across every shard (`/clickhouse/tables/all/`); the other four are per shard, and a batch's rows sit on the shard that took it. Kinds 5 and 6 are reserved for uploaded files and have no view.
 
 | `kind` | View | Target | Engine | Sorting key | Partition |
 |---|---|---|---|---|---|
@@ -960,6 +960,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
     mapping_start UInt64 CODEC(ZSTD(1)),
     mapping_limit UInt64 CODEC(ZSTD(1)),
     mapping_offset UInt64 CODEC(ZSTD(1)),
+    mapping_flags UInt8 CODEC(ZSTD(1)),
     address UInt64 CODEC(ZSTD(1)),
     line_functions Array(String) CODEC(ZSTD(1)),
     line_system_names Array(String) CODEC(ZSTD(1)),
@@ -979,6 +980,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
     sample_rate UInt32 DEFAULT 0 CODEC(ZSTD(1)),
     units LowCardinality(String) DEFAULT '',
     duration_ns Int64 CODEC(ZSTD(1)),
+    period Int64 CODEC(T64, ZSTD(1)),
     annotation_keys Array(String) CODEC(ZSTD(1)),
     annotation_values Array(String) CODEC(ZSTD(1))
 )
@@ -999,7 +1001,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_samples{{on_cluster}}
     value Int64 CODEC(T64, ZSTD(1)),
     span_id UInt64 CODEC(ZSTD(1)),
     trace_id FixedString(16) CODEC(ZSTD(1)),
-    profile_id UUID CODEC(ZSTD(1))
+    profile_id UUID CODEC(ZSTD(1)),
+    period Int64 CODEC(T64, ZSTD(1))
 )
 ENGINE = MergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
@@ -1071,6 +1074,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_locations{{on_cluster}}
     mapping_start UInt64 CODEC(ZSTD(1)),
     mapping_limit UInt64 CODEC(ZSTD(1)),
     mapping_offset UInt64 CODEC(ZSTD(1)),
+    mapping_flags UInt8 CODEC(ZSTD(1)),
     address UInt64 CODEC(ZSTD(1)),
     line_functions Array(String) CODEC(ZSTD(1)),
     line_system_names Array(String) CODEC(ZSTD(1)),

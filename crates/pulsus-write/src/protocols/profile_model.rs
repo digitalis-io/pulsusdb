@@ -803,6 +803,9 @@ struct ResolvedLocation<'a> {
     start: u64,
     limit: u64,
     offset: u64,
+    /// Issue #828: the mapping's four `has_*` flags as bits 0–3; 0 without
+    /// a mapping.
+    flags: u8,
     address: u64,
     lines: Range<usize>,
 }
@@ -821,6 +824,7 @@ impl ResolvedLocation<'_> {
         for n in [self.start, self.limit, self.offset, self.address] {
             buf.extend_from_slice(&n.to_le_bytes());
         }
+        buf.push(self.flags);
         let lines = &lines[self.lines.clone()];
         buf.extend_from_slice(&(lines.len() as u64).to_le_bytes());
         for l in lines {
@@ -843,6 +847,15 @@ struct Resolved<'a> {
     lines: Vec<ResolvedLine<'a>>,
     samples: Vec<(usize, Range<usize>)>,
     sample_locations: Vec<usize>,
+}
+
+/// Issue #828: a mapping's `has_functions`, `has_filenames`,
+/// `has_line_numbers` and `has_inline_frames` as bits 0–3.
+fn mapping_flags(m: &Mapping) -> u8 {
+    u8::from(m.has_functions)
+        | u8::from(m.has_filenames) << 1
+        | u8::from(m.has_line_numbers) << 2
+        | u8::from(m.has_inline_frames) << 3
 }
 
 /// `sanitizeProfile`'s reference rules (`pkg/pprof/pprof.go:1393-1560`) and
@@ -889,6 +902,7 @@ fn resolve(p: &Profile) -> Resolved<'_> {
                 start: 0,
                 limit: 0,
                 offset: 0,
+                flags: 0,
                 address: l.address,
                 lines,
             },
@@ -898,6 +912,7 @@ fn resolve(p: &Profile) -> Resolved<'_> {
                 start: 0,
                 limit: 0,
                 offset: 0,
+                flags: mapping_flags(m),
                 address: 0,
                 lines,
             },
@@ -907,6 +922,7 @@ fn resolve(p: &Profile) -> Resolved<'_> {
                 start: m.memory_start,
                 limit: m.memory_limit,
                 offset: m.file_offset,
+                flags: mapping_flags(m),
                 address: l.address,
                 lines,
             },
@@ -1179,7 +1195,7 @@ impl Push {
                     profile_id: id,
                     total,
                     duration_ns: profile.duration_nanos,
-                    period: 0,
+                    period: profile.period,
                     annotation_keys: annotation_keys.clone(),
                     annotation_values: annotation_values.clone(),
                 });
@@ -1248,7 +1264,7 @@ impl Push {
                 mapping_start: loc.start,
                 mapping_limit: loc.limit,
                 mapping_offset: loc.offset,
-                mapping_flags: 0,
+                mapping_flags: loc.flags,
                 address: loc.address,
                 line_functions: lines.iter().map(|l| self.intern(l.name)).collect(),
                 line_system_names: lines.iter().map(|l| self.intern(l.system_name)).collect(),

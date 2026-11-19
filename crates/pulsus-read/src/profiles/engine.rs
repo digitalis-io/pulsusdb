@@ -127,14 +127,15 @@ fn read_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Quer
 
 /// Issue #823: the settings S5 carries — [`read_settings`], and the join's
 /// build side kept on the aggregated samples. Issue #827: S7 carries them
-/// too.
+/// too, and issue #828 S9.
 fn tree_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
     read_settings(config, log_comment).set("query_plan_join_swap_table", "false")
 }
 
-/// Issue #828: the settings S9 carries.
+/// Issue #828: the settings S9 carries: [`tree_settings`], which keeps the
+/// merged stacks as the build side of both joins (D3).
 fn pprof_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
-    read_settings(config, log_comment)
+    tree_settings(config, log_comment)
 }
 
 /// The class of a failed profiles statement (plan §6).
@@ -250,11 +251,8 @@ impl ProfilesEngine {
     /// Issue #828: sends S9 (`super::pprof`) and returns its stack and
     /// location rows.
     pub async fn read_pprof(&self, sql: &str) -> Result<Vec<PprofRow>, ProfilesReadError> {
-        let _ = (
-            sql,
-            pprof_settings(&self.config, self.log_comment.as_deref()),
-        );
-        Ok(Vec::new())
+        let settings = pprof_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 
     /// Issue #824: sends S6 (`super::series`) and returns one row per

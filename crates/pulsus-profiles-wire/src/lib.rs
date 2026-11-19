@@ -11,7 +11,9 @@
 //! Issue #824: `double` is a `double` field's JSON form, and
 //! `aggregation_type` and `exemplar_type` are the time series request's
 //! two enums, in the shape of `profile_format`. Issue #825:
-//! `heatmap_query_type`, and `double`'s repeated form.
+//! `heatmap_query_type`, and `double`'s repeated form. Issue #828: the
+//! pprof `Profile`'s JSON mapping, and `uint64`, a `uint64` field's JSON
+//! form.
 
 pub mod connect;
 pub mod google_v1;
@@ -20,31 +22,7 @@ mod json;
 pub mod push_v1;
 pub mod querier_v1;
 pub mod types_v1;
-
-/// Issue #828: the proto3 JSON form of a `uint64`.
-pub mod uint64 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn ser<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
-        v.serialize(s)
-    }
-
-    pub fn de<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-        u64::deserialize(d)
-    }
-
-    pub fn ser_vec<S: Serializer>(v: &[u64], s: S) -> Result<S::Ok, S::Error> {
-        v.serialize(s)
-    }
-
-    pub fn de_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::Error> {
-        Vec::<u64>::deserialize(d)
-    }
-
-    pub fn is_zero(v: &u64) -> bool {
-        *v == 0
-    }
-}
+pub mod uint64;
 
 /// Issue #823: the proto3 JSON form of `querier.v1.ProfileFormat` — written
 /// as its name, read from its name or its number.

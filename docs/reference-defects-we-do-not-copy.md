@@ -102,6 +102,8 @@ replaces one.
 | [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
 | [47](#47-a-jfr-lock-delay-is-stored-as-its-clock-ticks) | profiles reference | ingest | C | A JFR lock or park delay is stored as its clock-tick count labelled nanoseconds: 2.3 times too large in the library's own test recording. |
 | [48](#48-a-jfr-wall-clock-samples-count-is-carried-into-every-later-event) | profiles reference | ingest | C | In a JFR recording holding wall-clock samples, every later CPU, allocation or lock event counts as the last wall-clock sample's count. |
+| [49](#49-the-pprof-export-writes-a-period-nobody-pushed) | profiles reference | queries | C | A CPU profile pushed with a 10 ms period is exported stating a 1 s period. |
+| [50](#50-the-pprof-exports-cut-keeps-a-frame-below-its-threshold-and-drops-unsymbolised-stacks-addresses) | profiles reference | queries | C, D | An export with a node limit keeps a function the limit cut, and replaces every stack of unsymbolised addresses with `other`. |
 
 ---
 
@@ -2554,6 +2556,69 @@ Every event other than a wall-clock sample counts once; a wall-clock sample coun
 Ledger row `ingest-jfr-event-count-not-carried` (the profiles differential's ledger, issue #822).
 Pinned by `j6_an_allocation_counts_once_after_a_wall_sample` in
 `crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
+
+---
+
+## 49. The pprof export writes a period nobody pushed
+
+**The profiles reference · queries · test C**
+
+### What the reference does
+
+The merged profile's header is given the selected profiles' period and then a guess from the profile
+type's name replaces it: 1,000,000,000 for `process_cpu`, 524,288 for `memory`, and 1 for any other type
+(`pkg/pprof/pprof.go:1302-1315`). The code's own comment calls it a guess.
+
+### Why that is wrong rather than different
+
+The period written is a value no client sent (**C**). A CPU profile pushed with a period of 10,000,000
+nanoseconds is exported stating 1,000,000,000.
+
+### What PulsusDB does
+
+Each sample row stores its profile's pushed period, and the export writes the largest period among the
+samples it merges, so the filters that select the samples select the period (`docs/api.md` §5). Owner
+decision, 2026-11-19: "Write the pushed period".
+
+### Evidence
+
+Ledger row `pprof-period-is-the-pushed-one` (the profiles differential's ledger, issue #822). Pinned by
+`p9_period` in `crates/pulsus-read/src/profiles/pprof.rs` and by LP2c and LP2d in
+`crates/pulsus-read/tests/profileql_pprof_live.rs`.
+
+---
+
+## 50. The pprof export's cut keeps a frame below its threshold and drops unsymbolised stacks' addresses
+
+**The profiles reference · queries · tests C, D**
+
+### What the reference does
+
+With a node limit, the reference marks every function node whose total is below the limit's value
+(`pkg/phlaredb/symdb/resolver_pprof_tree.go:135-146`) and replaces each stack's marked frames, from the
+leaf, with a location named `other`. Its cut walks the stack's locations from the root while the frames
+it has not passed number at least the marked ones (`:212-229`), so one marked frame stays below the last
+kept one, and a location whose inlined lines are partly marked stays whole. A stack with no function at
+all, every location an address with no symbols, counts as wholly cut (`:150-157`, `:185-197`).
+
+### Why that is wrong rather than different
+
+The answer keeps a node the limit cut (**D**): on the fixture of the profiles differential with a limit
+of 3, the stack `e d main` is answered as `other d main`, though `d`'s total of 4 is below the limit's
+10. And addresses the limit never measured are dropped without a word (**C**): the exploration app sends
+a limit of 16,384 with every export, so every stack of an unsymbolised library becomes `other`.
+
+### What PulsusDB does
+
+A stack is cut at its first kept function from the leaf: the locations holding only cut functions go, a
+location holding cut and kept lines keeps its kept lines, and a location `other` takes the leaf's place;
+a stack with no function is kept as it is (`docs/api.md` §5). Owner decision, 2026-11-19: "Cut exactly".
+
+### Evidence
+
+Ledger row `pprof-cut-keeps-max-nodes-exactly` (the profiles differential's ledger, issue #822). Pinned
+by `p2_cut_three`, `p3_cut_16384` and `p11_inlined_lines_count_as_frames` in
+`crates/pulsus-read/src/profiles/pprof.rs`.
 
 ---
 

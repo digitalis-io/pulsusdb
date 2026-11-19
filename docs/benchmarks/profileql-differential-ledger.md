@@ -291,3 +291,33 @@ own error, as PulsusDB does.
   function the reference does not mount.
 - **Why:** was defects entry 47, withdrawn by #827 part B.
 - **Case:** `none`.
+
+### `pprof-period-is-the-pushed-one`
+
+- **Route:** `SelectMergeProfile`, `SelectMergeStacktraces` with
+  `PROFILE_FORMAT_PPROF`, `GET /api/profiles/v1/export`.
+- **Request:** any selection holding samples.
+- **PulsusDB:** `period` is the largest period the selected samples were
+  pushed with: 10,000,000 for the fixture's CPU profile.
+- **Reference:** 1,000,000,000 for `process_cpu`, 524,288 for `memory`, else
+  1, whatever was pushed.
+- **Why:** owner, 2026-11-19, "Write the pushed period";
+  `docs/reference-defects-we-do-not-copy.md` entry 49.
+- **Case:** C31 to C36, rule R4 in
+  `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `pprof-cut-keeps-max-nodes-exactly`
+
+- **Route:** `SelectMergeProfile`, `SelectMergeStacktraces` with
+  `PROFILE_FORMAT_PPROF`, `GET /api/profiles/v1/export`.
+- **Request:** a `max_nodes` above 0; for example 3 on the fixture, or the
+  16,384 the exploration app sends with every export.
+- **PulsusDB:** each stack is cut at its first kept function from the leaf: a
+  location holding only cut functions goes, a location holding cut and kept
+  lines keeps its kept lines, and a stack with no function is kept as it is.
+- **Reference:** one cut frame more is kept below the last kept one, a partly
+  cut location is kept whole, and every stack with no function is folded
+  into `other`.
+- **Why:** owner, 2026-11-19, "Cut exactly";
+  `docs/reference-defects-we-do-not-copy.md` entry 50.
+- **Case:** `C31` and `C32` in `crates/pulsus-server/tests/profileql_differential.rs`.

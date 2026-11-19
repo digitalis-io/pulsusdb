@@ -3489,7 +3489,7 @@ mod trace_landing_tests {
 /// which is the one block shape a profiles push inserts.
 ///
 /// `kind` says which row it is; a row sets that kind's columns and leaves the
-/// rest at the type's default. The fields are the landing table's 41 columns
+/// rest at the type's default. The fields are the landing table's 43 columns
 /// **less the ten upload columns** (`upload_id` to `units`), in the table's
 /// own order: the insert's column list is this type's `COLUMN_NAMES`, so the
 /// server fills those ten with their type defaults. They belong to the
@@ -3520,6 +3520,7 @@ pub struct ProfileLandingRow {
     pub mapping_start: u64,
     pub mapping_limit: u64,
     pub mapping_offset: u64,
+    /// Issue #828: a location's mapping flags, bits 0–3.
     pub mapping_flags: u8,
     pub address: u64,
     pub line_functions: Vec<Arc<str>>,
@@ -3532,6 +3533,7 @@ pub struct ProfileLandingRow {
     /// ([`Self::profile_id_of`]).
     pub profile_id: (u64, u64),
     pub duration_ns: i64,
+    /// Issue #828: a sample's profile's pprof `period`.
     pub period: i64,
     pub annotation_keys: Vec<String>,
     pub annotation_values: Vec<String>,
@@ -3680,13 +3682,14 @@ impl ProfileLandingRow {
     }
 
     /// A kind-0 row: one stack's value in one entry, with the entry's series
-    /// columns and id.
+    /// columns, id and period.
     pub(crate) fn sample(
         org_id: &Arc<str>,
         received_ms: i64,
         series: &ProfileSeriesColumns,
         s: LandingSample,
         profile_id: (u64, u64),
+        period: i64,
     ) -> Self {
         ProfileLandingRow {
             type_id: Arc::clone(&series.type_id),
@@ -3698,6 +3701,7 @@ impl ProfileLandingRow {
             span_id: s.span_id,
             trace_id: s.trace_id,
             profile_id,
+            period,
             ..Self::of_kind(org_id, received_ms, Self::KIND_SAMPLE)
         }
     }
@@ -3757,6 +3761,7 @@ impl ProfileLandingRow {
             mapping_start: l.mapping_start,
             mapping_limit: l.mapping_limit,
             mapping_offset: l.mapping_offset,
+            mapping_flags: l.mapping_flags,
             address: l.address,
             line_functions: l.line_functions,
             line_system_names: l.line_system_names,
@@ -3800,6 +3805,7 @@ impl SpoolEncode for ProfileLandingRow {
                 "span_id": self.span_id,
                 "trace_id": hex_lower(&self.trace_id),
                 "profile_id": profile_id,
+                "period": self.period,
             }),
             Self::KIND_STACK => serde_json::json!({
                 "org_id": &*self.org_id,
@@ -3847,6 +3853,7 @@ impl SpoolEncode for ProfileLandingRow {
                 "mapping_start": self.mapping_start,
                 "mapping_limit": self.mapping_limit,
                 "mapping_offset": self.mapping_offset,
+                "mapping_flags": self.mapping_flags,
                 "address": self.address,
                 "line_functions": texts_of(&self.line_functions),
                 "line_system_names": texts_of(&self.line_system_names),
@@ -3873,6 +3880,7 @@ impl SpoolEncode for ProfileLandingRow {
                 o.str_field("fingerprint", &fingerprint).await?;
                 o.field("kind", &self.kind).await?;
                 o.str_field("org_id", &self.org_id).await?;
+                o.field("period", &self.period).await?;
                 o.str_field("profile_id", &profile_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("service", &self.service).await?;
@@ -3939,6 +3947,7 @@ impl SpoolEncode for ProfileLandingRow {
                 o.str_field("mapping_build_id", &self.mapping_build_id)
                     .await?;
                 o.str_field("mapping_file", &self.mapping_file).await?;
+                o.field("mapping_flags", &self.mapping_flags).await?;
                 o.field("mapping_limit", &self.mapping_limit).await?;
                 o.field("mapping_offset", &self.mapping_offset).await?;
                 o.field("mapping_start", &self.mapping_start).await?;
@@ -3954,7 +3963,7 @@ impl SpoolEncode for ProfileLandingRow {
 mod profile_landing_tests {
     use super::*;
 
-    /// **W8.** The insert's column list is `profile_landing`'s 41 columns
+    /// **W8.** The insert's column list is `profile_landing`'s 43 columns
     /// less the ten upload columns, in the table's own order, so the server
     /// fills those ten with their type defaults.
     #[test]

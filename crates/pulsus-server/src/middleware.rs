@@ -63,7 +63,8 @@ pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
 /// Issue #821: the profiles Connect paths, named one by one (#823 adds
 /// `SelectMergeStacktraces`'s two, #824 `SelectSeries`'s two, #827
-/// `Diff`'s two, #825 `SelectHeatmap`'s two). They
+/// `Diff`'s two, #825 `SelectHeatmap`'s two, #828 `SelectMergeProfile`'s
+/// two). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -84,6 +85,8 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/Diff",
     "/querier.v1.QuerierService/SelectHeatmap",
     "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
+    "/querier.v1.QuerierService/SelectMergeProfile",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
 ];
 
 /// Issue #816: the four OTLP gRPC export paths. They answer a deadline
@@ -98,7 +101,7 @@ pub(crate) const DEADLINE_GRPC_PATHS: &[&str] = &[
 ];
 
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
-/// adds `/merge`, #824 `/select_series`).
+/// adds `/merge`, #824 `/select_series`, #828 `/export`).
 /// They answer a deadline as the reference's HTTP read handlers answer one
 /// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
 /// [`DEADLINE_CONNECT_PATHS`].
@@ -109,6 +112,7 @@ pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/series",
     "/api/profiles/v1/merge",
     "/api/profiles/v1/select_series",
+    "/api/profiles/v1/export",
 ];
 
 /// `path` matches `template`, whose one `{name}` is a non-empty segment.
@@ -602,15 +606,15 @@ mod tests {
         );
     }
 
-    /// Issue #821 review note 1: the class names the sixteen Connect paths
+    /// Issue #821 review note 1: the class names the eighteen Connect paths
     /// exactly. Another method under either service prefix, and a deeper
     /// path under the values route, keep the class they had.
     #[test]
     fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
         for path in [
-            "/querier.v1.QuerierService/SelectMergeProfile",
+            "/querier.v1.QuerierService/GetProfileStats",
             "/querier.v1.QuerierService/LabelNamesX",
-            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
+            "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
             "/api/profiles/v1/querier.v1.QuerierService/",
             "/api/profiles/v1/render",
             "/api/profiles/v1/label/a/b/values",
