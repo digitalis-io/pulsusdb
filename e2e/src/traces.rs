@@ -3078,8 +3078,17 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `retry_through_cut` — the by-ID gate's bounded reference-side
-    // re-ask. Short bounds (200ms/20ms) keep these hermetic and fast; the
-    // shipped bounds are `TEMPO_CUT_RETRY_CEILING`/`_INTERVAL`.
+    // re-ask. Short bounds (200ms/20ms) keep these fast; the shipped
+    // bounds are `TEMPO_CUT_RETRY_CEILING`/`_INTERVAL`.
+    //
+    // The timing tests run on tokio's paused clock: time moves only when
+    // every task is waiting on a timer, and then straight to the next
+    // timer. Each attempt therefore lands at an exact multiple of the
+    // interval and every elapsed figure is the loop's own arithmetic,
+    // whatever the machine's load. On the wall clock a busy machine
+    // stretched a 20ms sleep past the 200ms ceiling, and a delay between
+    // the test's `started` and the function's `deadline` could let a late body
+    // land inside the deadline.
     // -----------------------------------------------------------------
 
     const TEST_CEILING: Duration = Duration::from_millis(200);
@@ -3130,9 +3139,9 @@ mod tests {
     /// and the failure says it answered late rather than claiming the
     /// trace was absent. Unreachable through a real HTTP fetch (a fresh
     /// request is never already-ready), hence the ready-future stand-in.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn body_arriving_after_the_deadline_is_rejected_as_late() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
             // Absent until the ceiling has passed, then instantly ready —
             // so the final attempt polls a ready future at an expired
@@ -3157,9 +3166,9 @@ mod tests {
 
     /// The other half: a body inside the ceiling is still accepted, so the
     /// guard has not simply made late-but-valid answers fail.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn body_arriving_before_the_deadline_is_accepted() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let got = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
             let visible = started.elapsed() >= TEST_CEILING / 4;
             std::future::ready(Ok(visible.then(body)))
@@ -3175,9 +3184,9 @@ mod tests {
 
     /// A trace that never appears still fails, bounded, and the failure
     /// carries the 404 tally rather than a verdict about it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn permanently_absent_trace_fails_bounded_with_attempts_and_elapsed() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
             std::future::ready(Ok(None))
         })
@@ -3227,9 +3236,9 @@ mod tests {
     /// A slow attempt is cancelled at the deadline rather than being
     /// allowed to run to its own (much longer) timeout — the overrun the
     /// round-1 review found.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slow_attempt_is_cancelled_at_the_deadline() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || async {
             // Far longer than the ceiling, standing in for a reference
             // that accepts the connection and then never answers.
