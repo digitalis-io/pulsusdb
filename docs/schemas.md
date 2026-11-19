@@ -846,14 +846,14 @@ the replica path in the last column.
 |---|---|---|---|---|---|---|
 | `trace_landing` | `MergeTree` | `(org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)` | hour of `received_ms` | `received_ms` + `{{trace_landing_retention_hours}}` h | per shard | `schema/schema.sql:431-491` |
 | `spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:346-399` |
-| `error_spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:892-914` |
+| `error_spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:896-918` |
 | `traces` | `AggregatingMergeTree` | `(org_id, trace_id)` | `day` | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:493-511` |
 | `resources` | `ReplacingMergeTree` | `(org_id, service, resource_id)` | `day` | end of `day` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:326-344` |
 | `tag_names` | `ReplacingMergeTree(last_start_ns)` | `(org_id, scope, key)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:401-413` |
 | `tag_values` | `ReplacingMergeTree(last_start_ns)` | `(org_id, scope, key, value, val_type)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:415-429` |
-| `tag_bucket_values` | `AggregatingMergeTree` | `(org_id, service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:875-890` |
-| `service_bucket_resources` | `ReplacingMergeTree` | `(org_id, service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:1188-1201` |
-| `service_edges` | `ReplacingMergeTree(ver)` | `(org_id, conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:778-796` |
+| `tag_bucket_values` | `AggregatingMergeTree` | `(org_id, service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:879-894` |
+| `service_bucket_resources` | `ReplacingMergeTree` | `(org_id, service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:1194-1207` |
+| `service_edges` | `ReplacingMergeTree(ver)` | `(org_id, conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:782-800` |
 
 - Every TTL is the saturating form `toDateTime(least(… , 4294967295))`. Every table but `tag_names` and
   `tag_values` sets `ttl_only_drop_parts = 1`; those two carry `last_start_ns`, the latest start of a span carrying
@@ -866,7 +866,7 @@ the replica path in the last column.
   (`schema/schema.sql:408-410`; `docs/configuration.md` §3).
 - `trace_landing` sets `async_insert = 0` (`schema/schema.sql:510`).
 - Clustered, `spans`, `traces` and `error_spans` have a `_dist` wrapper sharded on `cityHash64(trace_id)`
-  (`schema/schema.sql:720-722`, `:724-726`, `:1186-1188`); no other trace table has one (§7).
+  (`schema/schema.sql:724-726`, `:728-730`, `:1192-1194`); no other trace table has one (§7).
 
 - Every table's first column is `org_id`, the tenant (issue #738), and the first column of its sorting key; the
   `_dist` wrappers are `AS` their table and carry it.
@@ -877,15 +877,15 @@ it, and reads and writes its markers under the empty tenant (`org_id = ''`), one
 
 | view | target | reads | filter | statement |
 |---|---|---|---|---|
-| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:724-756` |
-| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:952-956` |
-| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:848-873` |
-| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:949-966` |
-| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:960-964` |
-| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:734-746` |
-| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:953-960` |
-| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:947-956` |
-| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:1071-1119` |
+| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:728-760` |
+| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:956-960` |
+| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:852-877` |
+| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:953-970` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:964-968` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:738-750` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:957-964` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:951-960` |
+| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:1077-1125` |
 
 So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
 readers of each kind.

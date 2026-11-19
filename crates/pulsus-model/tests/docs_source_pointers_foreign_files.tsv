@@ -131,6 +131,8 @@ pkg/pattern/ingester_querier.go
 pkg/pattern/iter/batch.go
 pkg/pattern/iter/merge.go
 pkg/pattern/stream.go
+pkg/phlaredb/symdb/resolver_pprof_tree.go
+pkg/pprof/pprof.go
 pkg/push/push.pb.go
 pkg/querier/intervals.go
 pkg/querier/limits/validation.go
