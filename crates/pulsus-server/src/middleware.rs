@@ -622,7 +622,7 @@ mod tests {
             "/querier.v1.QuerierService/LabelNamesX",
             "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
             "/api/profiles/v1/querier.v1.QuerierService/",
-            "/api/profiles/v1/render",
+            "/api/profiles/v1/export",
             "/api/profiles/v1/label/a/b/values",
             "/api/profiles/v1/label//values",
             "/settings.v1.SettingsService/Get",
