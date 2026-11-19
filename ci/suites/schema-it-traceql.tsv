@@ -114,9 +114,15 @@ profileql_diff	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	
 # with HEATMAP_QUERY_TYPE_SPAN over its samples. Reuses this job's
 # ClickHouse container.
 profileql_heatmap_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profileql_heatmap_live
+# Issue #828: the pprof export's statement on fixture P, each stack and
+# location row stored three times. Reuses this job's ClickHouse container.
+profileql_pprof_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profileql_pprof_live
 # Issue #825: SelectHeatmap over the Connect protocol, against the spawned
 # binary. Reuses this job's ClickHouse container.
 profileql_heatmap	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_heatmap
+# Issue #828: the pprof export's routes against the binary, statements
+# counted per request.
+profileql_pprof	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_pprof
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

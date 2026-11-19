@@ -557,8 +557,8 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823, #824, #827, #825): the sixteen Connect paths answer a
-    /// deadline as a Connect error, the six `GET` routes (`{name}` as `env`) as the
+    /// C6 (issue #821, #823, #824, #827, #825, #828): the eighteen Connect paths answer a
+    /// deadline as a Connect error, the seven `GET` routes (`{name}` as `env`) as the
     /// reference's HTTP handlers do; the profiles ingest path keeps the bare
     /// `408`.
     #[test]
@@ -580,6 +580,8 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/Diff",
             "/querier.v1.QuerierService/SelectHeatmap",
             "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
+            "/querier.v1.QuerierService/SelectMergeProfile",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -590,6 +592,7 @@ mod tests {
             "/api/profiles/v1/series",
             "/api/profiles/v1/merge",
             "/api/profiles/v1/select_series",
+            "/api/profiles/v1/export",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }

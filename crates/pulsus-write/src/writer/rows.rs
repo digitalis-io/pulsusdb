@@ -3520,6 +3520,7 @@ pub struct ProfileLandingRow {
     pub mapping_start: u64,
     pub mapping_limit: u64,
     pub mapping_offset: u64,
+    pub mapping_flags: u8,
     pub address: u64,
     pub line_functions: Vec<Arc<str>>,
     pub line_system_names: Vec<Arc<str>>,
@@ -3531,6 +3532,7 @@ pub struct ProfileLandingRow {
     /// ([`Self::profile_id_of`]).
     pub profile_id: (u64, u64),
     pub duration_ns: i64,
+    pub period: i64,
     pub annotation_keys: Vec<String>,
     pub annotation_values: Vec<String>,
 }
@@ -3661,6 +3663,7 @@ impl ProfileLandingRow {
             mapping_start: 0,
             mapping_limit: 0,
             mapping_offset: 0,
+            mapping_flags: 0,
             address: 0,
             line_functions: Vec::new(),
             line_system_names: Vec::new(),
@@ -3670,6 +3673,7 @@ impl ProfileLandingRow {
             labels: String::new(),
             profile_id: (0, 0),
             duration_ns: 0,
+            period: 0,
             annotation_keys: Vec::new(),
             annotation_values: Vec::new(),
         }
@@ -3979,6 +3983,7 @@ mod profile_landing_tests {
                 "mapping_start",
                 "mapping_limit",
                 "mapping_offset",
+                "mapping_flags",
                 "address",
                 "line_functions",
                 "line_system_names",
@@ -3988,6 +3993,7 @@ mod profile_landing_tests {
                 "labels",
                 "profile_id",
                 "duration_ns",
+                "period",
                 "annotation_keys",
                 "annotation_values",
             ][..]

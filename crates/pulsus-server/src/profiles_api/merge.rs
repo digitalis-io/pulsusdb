@@ -123,6 +123,7 @@ pub(crate) async fn select_merge_stacktraces(
         .map(|(g, tree)| SelectMergeStacktracesResponse {
             flamegraph: Some(g),
             tree,
+            pprof: None,
         });
     finish(codec, answer)
 }

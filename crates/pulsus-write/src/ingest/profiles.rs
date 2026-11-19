@@ -111,6 +111,8 @@ pub struct LandingEntry {
     pub profile_id: Option<[u8; 16]>,
     pub total: i64,
     pub duration_ns: i64,
+    /// Issue #828: the profile's pprof `period`.
+    pub period: i64,
     pub annotation_keys: Vec<String>,
     pub annotation_values: Vec<String>,
 }
@@ -148,6 +150,10 @@ pub struct LandingLocation {
     pub mapping_start: u64,
     pub mapping_limit: u64,
     pub mapping_offset: u64,
+    /// Issue #828: the mapping's `has_functions`, `has_filenames`,
+    /// `has_line_numbers` and `has_inline_frames` as bits 0–3; 0 without a
+    /// mapping.
+    pub mapping_flags: u8,
     pub address: u64,
     pub line_functions: Vec<Arc<str>>,
     pub line_system_names: Vec<Arc<str>>,

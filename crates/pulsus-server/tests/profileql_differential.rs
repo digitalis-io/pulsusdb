@@ -4,7 +4,8 @@
 //! app send is compared between the two, and against what the fixture says
 //! the answer must be. Part B of issues #823, #824, #825 and #827 adds
 //! the flame graph, the series, the heatmap and the diff (C15–C30) over a
-//! second pair of tenants holding the query fixture.
+//! second pair of tenants holding the query fixture. Issue #828 adds the
+//! pprof export (C31–C36), compared decoded (rule R4).
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -24,6 +25,8 @@
 
 #[path = "support/live_db.rs"]
 mod live_db;
+#[path = "../../pulsus-read/tests/profileql_pprof_nf/mod.rs"]
+mod nf;
 
 use live_db::ScopedDb;
 
@@ -48,13 +51,14 @@ use pulsus_profiles_wire::google_v1;
 use pulsus_profiles_wire::push_v1::{PushRequest, PushResponse, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
     DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileTypesRequest,
-    ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
+    ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse, SelectMergeProfileRequest,
     SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
     SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
-    LabelValuesRequest, LabelValuesResponse, Point, Series,
+    GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
+    LabelValuesRequest, LabelValuesResponse, Location as CallSite, Point, Series,
+    StackTraceSelector,
 };
 use serde_json::{Value, json};
 
@@ -117,7 +121,7 @@ const SERVICES: [&str; 15] = [
 ];
 
 /// The query fixture's `rx` values (§3.2), sorted.
-const Q_RX: [&str; 15] = [
+const Q_RX: [&str; 16] = [
     "q-allother",
     "q-d4l",
     "q-d4r",
@@ -125,6 +129,7 @@ const Q_RX: [&str; 15] = [
     "q-d5r",
     "q-d7",
     "q-other",
+    "q-pprof",
     "q-span",
     "q-trim",
     "q-ts-1",
@@ -141,6 +146,10 @@ const SPAN_2: &str = "1112131415161718";
 
 /// The `cpu` value of one count under `q1`; `q2` holds 100 times it.
 const Q1_UNIT: i64 = 10_000_000;
+
+/// Issue #828 (R4): the period the reference writes for `process_cpu`,
+/// whatever was pushed (ledger `pprof-period-is-the-pushed-one`).
+const REFERENCE_CPU_PERIOD: i64 = 1_000_000_000;
 
 // ---------------------------------------------------------------------
 // The case table
@@ -204,6 +213,17 @@ enum Method {
         left_max_nodes: Option<i64>,
         right_max_nodes: Option<i64>,
     },
+    /// Issue #828: the merged profile of `TYPE_A` over `W` as pprof:
+    /// `SelectMergeProfile`, or with `pprof_format` `SelectMergeStacktraces`
+    /// with `PROFILE_FORMAT_PPROF`. `go_pgo` is `(keep_locations,
+    /// aggregate_callees)`.
+    MergeProfile {
+        selector: &'static str,
+        max_nodes: Option<i64>,
+        call_site: &'static [&'static str],
+        go_pgo: Option<(u32, bool)>,
+        pprof_format: bool,
+    },
 }
 
 impl Method {
@@ -217,6 +237,10 @@ impl Method {
             Method::SelectSeries { .. } => "SelectSeries",
             Method::Heatmap { .. } => "SelectHeatmap",
             Method::Diff { .. } => "Diff",
+            Method::MergeProfile {
+                pprof_format: true, ..
+            } => "SelectMergeStacktraces",
+            Method::MergeProfile { .. } => "SelectMergeProfile",
         }
     }
 
@@ -312,6 +336,9 @@ enum Fixture {
     Points(&'static [SeriesPoints]),
     /// Exactly this heatmap series.
     Slots(&'static Slots),
+    /// Issue #828: this merged profile, §3.6's samples of fixture P, each
+    /// `(path, count)`, compared decoded (R4).
+    Pprof(&'static [(&'static str, i64)]),
 }
 
 /// One pinned answer of a ledger case: its status, and its body when the
@@ -336,6 +363,14 @@ enum Expect {
         row: &'static str,
         ours: &'static Graph,
         theirs: &'static Graph,
+    },
+    /// Issue #828: a ledger case on a merged profile (R4): each server's
+    /// decoded profile is its own, and the two differ once `period` is set
+    /// aside.
+    LedgerPprof {
+        row: &'static str,
+        ours: &'static [(&'static str, i64)],
+        theirs: &'static [(&'static str, i64)],
     },
 }
 
@@ -380,6 +415,21 @@ const fn merge(selector: &'static str, max_nodes: Option<i64>) -> Method {
         selector,
         max_nodes,
         span: &[],
+    }
+}
+
+/// Issue #828: `SelectMergeProfile` of `q-pprof`.
+const fn merge_profile(
+    max_nodes: Option<i64>,
+    call_site: &'static [&'static str],
+    go_pgo: Option<(u32, bool)>,
+) -> Method {
+    Method::MergeProfile {
+        selector: r#"{service_name="q-pprof"}"#,
+        max_nodes,
+        call_site,
+        go_pgo,
+        pprof_format: false,
     }
 }
 
@@ -865,6 +915,61 @@ static CASES: &[Case] = &[
         )),
         expect: Expect::Parity(Fixture::DiffGraph(&D4_RIGHT_CUT)),
     },
+    Case {
+        id: "C31",
+        client: "exploration app, export as pprof",
+        request: query(merge_profile(Some(16_384), &[], None)),
+        expect: Expect::LedgerPprof {
+            row: "pprof-cut-keeps-max-nodes-exactly",
+            ours: &nf::P1,
+            theirs: &nf::P3_REF,
+        },
+    },
+    Case {
+        id: "C32",
+        client: "max nodes set",
+        request: query(merge_profile(Some(3), &[], None)),
+        expect: Expect::LedgerPprof {
+            row: "pprof-cut-keeps-max-nodes-exactly",
+            ours: &nf::P2,
+            theirs: &nf::P2_REF,
+        },
+    },
+    Case {
+        id: "C33",
+        client: "the CLI's go_pgo default",
+        request: query(merge_profile(None, &[], Some((5, true)))),
+        expect: Expect::Parity(Fixture::Pprof(&nf::P5)),
+    },
+    Case {
+        id: "C34",
+        client: "exploration app, function details",
+        request: Request {
+            method: merge_profile(Some(500), &["main", "a"], None),
+            encoding: Encoding::Json,
+            utf8: false,
+            tenancy: Tenancy::Query,
+        },
+        expect: Expect::Parity(Fixture::Pprof(&nf::P4)),
+    },
+    Case {
+        id: "C35",
+        client: "merged profile, no max nodes",
+        request: query(merge_profile(None, &[], None)),
+        expect: Expect::Parity(Fixture::Pprof(&nf::P1)),
+    },
+    Case {
+        id: "C36",
+        client: "SelectMergeStacktraces, pprof format",
+        request: query(Method::MergeProfile {
+            selector: r#"{service_name="q-pprof"}"#,
+            max_nodes: None,
+            call_site: &[],
+            go_pgo: None,
+            pprof_format: true,
+        }),
+        expect: Expect::Parity(Fixture::Pprof(&nf::P1)),
+    },
 ];
 
 // ---------------------------------------------------------------------
@@ -939,7 +1044,9 @@ fn the_ledger_and_the_cases_name_each_other() {
     let mut problems: Vec<String> = Vec::new();
 
     for case in CASES {
-        if let Expect::Ledger { row, .. } | Expect::LedgerGraph { row, .. } = case.expect
+        if let Expect::Ledger { row, .. }
+        | Expect::LedgerGraph { row, .. }
+        | Expect::LedgerPprof { row, .. } = case.expect
             && !headings.contains(row)
         {
             problems.push(format!(
@@ -958,7 +1065,10 @@ fn the_ledger_and_the_cases_name_each_other() {
         };
         match CASES.iter().find(|c| c.id == case_id) {
             Some(Case {
-                expect: Expect::Ledger { row, .. } | Expect::LedgerGraph { row, .. },
+                expect:
+                    Expect::Ledger { row, .. }
+                    | Expect::LedgerGraph { row, .. }
+                    | Expect::LedgerPprof { row, .. },
                 ..
             }) if row == id => {}
             Some(_) => problems.push(format!(
@@ -2076,6 +2186,24 @@ fn query_pushes(t0_s: i64, s0_s: i64, q1: bool) -> Vec<Push> {
             answer: PushAnswer::Connect,
         },
     });
+    // Issue #828: fixture P (#828 plan §8.1).
+    out.push(Push {
+        rx: "q-pprof",
+        transport: Transport::Http {
+            path: "/push.v1.PusherService/Push".to_string(),
+            headers: vec![("Content-Type", "application/proto".to_string())],
+            body: push_request(
+                &[
+                    ("__name__", "process_cpu"),
+                    ("service_name", "q-pprof"),
+                    ("rx", "q-pprof"),
+                ],
+                gzip(&nf::profile(scale, nf::PERIOD, (t0_s + 9) * 1_000_000_000).encode_to_vec()),
+            )
+            .encode_to_vec(),
+            answer: PushAnswer::Connect,
+        },
+    });
     out
 }
 
@@ -2108,6 +2236,9 @@ fn decoded(method: &str, encoding: Encoding, body: &[u8]) -> String {
         "SelectSeries" => SelectSeriesResponse::decode(body).map(|r| format!("{:?}", r.series)),
         "SelectHeatmap" => SelectHeatmapResponse::decode(body).map(|r| format!("{:?}", r.series)),
         "Diff" => DiffResponse::decode(body).map(|r| format!("{:?}", r.flamegraph)),
+        "SelectMergeProfile" => {
+            google_v1::Profile::decode(body).map(|p| format!("{:?}", nf::nf(&p)))
+        }
         "Push" => PushResponse::decode(body).map(|r| format!("{r:?}")),
         "Export" => ExportProfilesServiceResponse::decode(body).map(|r| format!("{r:?}")),
         _ => return String::from_utf8_lossy(body).into_owned(),
@@ -2294,6 +2425,51 @@ fn fixture_failure(
     check_fixture(fixture, case, t1, s0_ms, &res.body)
 }
 
+/// Issue #828 (R4): the period each server writes.
+fn period_of(ours: bool) -> i64 {
+    if ours {
+        nf::PERIOD
+    } else {
+        REFERENCE_CPU_PERIOD
+    }
+}
+
+/// A merged-profile answer decoded as `NF`.
+fn pprof_nf(method: &Method, encoding: Encoding, body: &[u8]) -> Result<nf::Nf, String> {
+    let profile = match method {
+        Method::MergeProfile {
+            pprof_format: true, ..
+        } => decode_as::<SelectMergeStacktracesResponse>(encoding, body)?
+            .pprof
+            .and_then(|p| p.profile)
+            .ok_or_else(|| "no pprof.profile".to_string())?,
+        _ => decode_as::<google_v1::Profile>(encoding, body)?,
+    };
+    Ok(nf::nf(&profile))
+}
+
+/// Issue #828 (R4): a merged-profile answer against §3.6's `samples` in the
+/// tenant's unit, `time_nanos` the window's end, and the server's period;
+/// `None` when it holds.
+fn pprof_failure(
+    samples: &[(&str, i64)],
+    case: &Case,
+    t1: bool,
+    w_end_ms: i64,
+    ours: bool,
+    res: &Res,
+) -> Option<String> {
+    if res.status != 200 {
+        return Some(format!("status {}, want 200", res.status));
+    }
+    let want = nf::expected(samples, unit(t1), period_of(ours), w_end_ms * 1_000_000);
+    match pprof_nf(&case.request.method, case.request.encoding, &res.body) {
+        Ok(got) if got == want => None,
+        Ok(got) => Some(format!("profile {got:?}, want {want:?}")),
+        Err(e) => Some(format!("undecodable: {e}")),
+    }
+}
+
 /// Checks a decoded answer against `fixture`, `None` when it holds.
 fn check_fixture(
     fixture: Fixture,
@@ -2458,6 +2634,7 @@ fn check_fixture(
         }
         Fixture::LandingSets
         | Fixture::PushProtoSets
+        | Fixture::Pprof(_)
         | Fixture::Merged
         | Fixture::Graph(_)
         | Fixture::DiffGraph(_)
@@ -2666,6 +2843,72 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
             };
             encoded(&msg, encoding)
         }
+        (
+            Method::MergeProfile {
+                selector,
+                max_nodes,
+                call_site,
+                go_pgo,
+                pprof_format,
+            },
+            Encoding::Proto,
+        ) => {
+            let stack_trace_selector =
+                (!call_site.is_empty() || go_pgo.is_some()).then(|| StackTraceSelector {
+                    call_site: call_site
+                        .iter()
+                        .map(|n| CallSite {
+                            name: n.to_string(),
+                        })
+                        .collect(),
+                    go_pgo: go_pgo.map(|(keep_locations, aggregate_callees)| GoPgo {
+                        keep_locations,
+                        aggregate_callees,
+                    }),
+                });
+            if *pprof_format {
+                SelectMergeStacktracesRequest {
+                    format: 4,
+                    stack_trace_selector,
+                    ..side(selector, *max_nodes)
+                }
+                .encode_to_vec()
+            } else {
+                SelectMergeProfileRequest {
+                    profile_type_id: TYPE_A.to_string(),
+                    label_selector: selector.to_string(),
+                    start: w.0,
+                    end: w.1,
+                    max_nodes: *max_nodes,
+                    stack_trace_selector,
+                    ..SelectMergeProfileRequest::default()
+                }
+                .encode_to_vec()
+            }
+        }
+        // The exploration app's function-details body, as it writes it
+        // (C34).
+        (
+            Method::MergeProfile {
+                selector,
+                max_nodes,
+                call_site,
+                ..
+            },
+            Encoding::Json,
+        ) => {
+            let mut v = json!({
+                "profile_typeID": TYPE_A, "label_selector": selector, "start": w.0, "end": w.1,
+            });
+            if !call_site.is_empty() {
+                let names: Vec<Value> = call_site.iter().map(|n| json!({"name": n})).collect();
+                v["stackTraceSelector"] = json!({"call_site": names});
+            }
+            if let Some(n) = max_nodes {
+                v["maxNodes"] = json!(n);
+            }
+            v.to_string().into_bytes()
+        }
         (Method::ProfileTypes(window), Encoding::Proto) => {
             let (start, end) = match window {
                 Window::Default => w,
@@ -2816,6 +3059,21 @@ fn parity(request: &Request, ours: &Res, theirs: &Res) -> Option<&'static str> {
         return Some("status differs");
     }
     match (&request.method, request.encoding) {
+        // Issue #828 (R4): decoded, `period` set aside; bodies are not
+        // compared.
+        (method @ Method::MergeProfile { .. }, encoding) => {
+            if ours.content_type != theirs.content_type {
+                return Some("Content-Type differs");
+            }
+            match (
+                pprof_nf(method, encoding, &ours.body),
+                pprof_nf(method, encoding, &theirs.body),
+            ) {
+                (Ok(a), Ok(b)) if a.without_period() == b.without_period() => None,
+                (Ok(_), Ok(_)) => Some("decoded profiles differ"),
+                _ => Some("a profile is undecodable"),
+            }
+        }
         (Method::Series { .. }, Encoding::Json) => {
             let (a, b) = (
                 label_sets(Encoding::Json, &ours.body),
@@ -3206,7 +3464,7 @@ async fn profileql_matches_the_reference() {
     }
     drop(filler);
 
-    // §4: C0–C30.
+    // §4: C0–C36.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {
@@ -3226,6 +3484,45 @@ async fn profileql_matches_the_reference() {
             let a = send(&ours, &case.request, tenant, win);
             let b = send(&reference, &case.request, tenant, win);
             match case.expect {
+                Expect::LedgerPprof {
+                    row,
+                    ours: po,
+                    theirs: pt,
+                } => {
+                    let failures: Vec<String> =
+                        [(&a, po, &ours, true), (&b, pt, &reference, false)]
+                            .into_iter()
+                            .filter_map(|(res, samples, server, is_ours)| {
+                                pprof_failure(samples, case, is_t1, w.1, is_ours, res)
+                                    .map(|w| format!("{}: {w}", server.name))
+                            })
+                            .collect();
+                    if !failures.is_empty() {
+                        mismatches.both(
+                            &what,
+                            &format!(
+                                "ledger row `{row}`: an answer is not its pin: {}",
+                                failures.join("; ")
+                            ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    } else if parity(&case.request, &a, &b).is_none() {
+                        mismatches.both(
+                            &what,
+                            &format!(
+                                "ledger row `{row}`: the two agree, so the reference changed \
+                                 and the row is retired"
+                            ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    }
+                }
                 Expect::LedgerGraph {
                     row,
                     ours: go,
@@ -3302,7 +3599,18 @@ async fn profileql_matches_the_reference() {
                         mismatches.both(&what, why, &a, &b, method, enc);
                     }
                     for (res, server) in [(&a, &ours), (&b, &reference)] {
-                        if let Some(why) = fixture_failure(fixture, case, is_t1, s0_ms, res) {
+                        let failure = match fixture {
+                            Fixture::Pprof(samples) => pprof_failure(
+                                samples,
+                                case,
+                                is_t1,
+                                w.1,
+                                server.name == ours.name,
+                                res,
+                            ),
+                            _ => fixture_failure(fixture, case, is_t1, s0_ms, res),
+                        };
+                        if let Some(why) = failure {
                             mismatches.one(
                                 &what,
                                 &format!("{}: not what the fixture says: {why}", server.name),

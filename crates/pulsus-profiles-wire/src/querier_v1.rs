@@ -164,7 +164,7 @@ pub struct SelectMergeStacktracesRequest {
 /// `SelectMergeStacktraces`' response: the flame graph, field 1, and the
 /// trimmed tree's bytes, field 2. The DOT and pprof fields are later
 /// parts' (#828, #829).
-#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeStacktracesResponse {
     #[prost(message, optional, tag = "1")]
@@ -177,6 +177,39 @@ pub struct SelectMergeStacktracesResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub tree: Vec<u8>,
+    #[prost(message, optional, tag = "105")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pprof: Option<PprofProfile>,
+}
+
+/// Issue #828: `SelectMergeProfile`'s request.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectMergeProfileRequest {
+    #[prost(string, tag = "101")]
+    pub profile_type_id: String,
+    #[prost(string, tag = "102")]
+    pub label_selector: String,
+    #[prost(int64, tag = "103")]
+    pub start: i64,
+    #[prost(int64, tag = "104")]
+    pub end: i64,
+    #[prost(int64, optional, tag = "105")]
+    pub max_nodes: Option<i64>,
+    #[prost(message, optional, tag = "106")]
+    pub stack_trace_selector: Option<crate::types_v1::StackTraceSelector>,
+    #[prost(string, repeated, tag = "107")]
+    pub profile_id_selector: Vec<String>,
+    #[prost(string, repeated, tag = "108")]
+    pub trace_id_selector: Vec<String>,
+}
+
+/// Issue #828: a pprof answer.
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PprofProfile {
+    #[prost(message, optional, tag = "101")]
+    pub profile: Option<crate::google_v1::Profile>,
 }
 
 /// A flame graph: the names, and per level the nodes as

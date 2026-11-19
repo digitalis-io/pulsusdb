@@ -1066,6 +1066,7 @@ mod tests {
             profile_id: None,
             total: 1,
             duration_ns: 1,
+            period: 1,
             annotation_keys: Vec::new(),
             annotation_values: Vec::new(),
         };
@@ -1097,6 +1098,7 @@ mod tests {
                     mapping_start: 0,
                     mapping_limit: 0,
                     mapping_offset: 0,
+                    mapping_flags: 0,
                     address: 0,
                     line_functions: vec![Arc::from("f")],
                     line_system_names: vec![Arc::from("f")],

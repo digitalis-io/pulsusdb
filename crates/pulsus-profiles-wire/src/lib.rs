@@ -21,6 +21,31 @@ pub mod push_v1;
 pub mod querier_v1;
 pub mod types_v1;
 
+/// Issue #828: the proto3 JSON form of a `uint64`.
+pub mod uint64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn ser<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        v.serialize(s)
+    }
+
+    pub fn de<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        u64::deserialize(d)
+    }
+
+    pub fn ser_vec<S: Serializer>(v: &[u64], s: S) -> Result<S::Ok, S::Error> {
+        v.serialize(s)
+    }
+
+    pub fn de_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::Error> {
+        Vec::<u64>::deserialize(d)
+    }
+
+    pub fn is_zero(v: &u64) -> bool {
+        *v == 0
+    }
+}
+
 /// Issue #823: the proto3 JSON form of `querier.v1.ProfileFormat` — written
 /// as its name, read from its name or its number.
 pub mod profile_format {

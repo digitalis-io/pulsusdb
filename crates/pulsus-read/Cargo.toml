@@ -73,8 +73,12 @@ tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
 # (architect plan) — the same `tracing::warn!` convention every other crate
 # in this workspace uses.
 tracing.workspace = true
+# Issue #828: the pprof export builds `google.v1.Profile`.
+pulsus-profiles-wire = { path = "../pulsus-profiles-wire" }
 
 [dev-dependencies]
+# Issue #828: the pprof tests encode and decode the built profile.
+prost.workspace = true
 http.workspace = true
 pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
 # Issue #320: the shared live-gate guard for the environment-gated

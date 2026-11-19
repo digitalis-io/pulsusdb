@@ -11,6 +11,9 @@
 //! issue #824 the time series', issue #827 the diff's, issue #825 the
 //! heatmap's, issue #826 the exemplar's.
 //!
+//! W12 (issue #828): `SelectMergeProfile`'s request, `PprofProfile`, and
+//! `SelectMergeStacktracesResponse.pprof`.
+//!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
 //! `proto/push/v1/push.proto`.
@@ -22,10 +25,10 @@ use pulsus_profiles_wire::google_v1::{
 };
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
-    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
+    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, PprofProfile, ProfileFormat,
     ProfileTypesRequest, ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
-    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
-    SelectSeriesResponse, SeriesRequest, SeriesResponse,
+    SelectMergeProfileRequest, SelectMergeStacktracesRequest, SelectMergeStacktracesResponse,
+    SelectSeriesRequest, SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
     Exemplar, GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
@@ -469,6 +472,7 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
     let m = SelectMergeStacktracesResponse {
         flamegraph: Some(flame_graph()),
         tree: vec![0, 0, 1],
+        pprof: None,
     };
     let mut b = Vec::new();
     nested(1, &flame_graph_bytes(&flame_graph()), &mut b);
@@ -877,4 +881,58 @@ fn every_exemplar_field_encodes_under_the_proto_tag() {
     let mut b = heatmap_slot_bytes(&heatmap_slot());
     nested(4, &exemplar_bytes(&exemplar()), &mut b);
     check("HeatmapSlot with an exemplar", &slot, b);
+}
+
+/// **W12** (issue #828): `SelectMergeProfile`'s request, `PprofProfile`
+/// and `SelectMergeStacktracesResponse.pprof`, against
+/// `proto/querier/v1/querier.proto`'s tags.
+#[test]
+fn every_pprof_message_field_encodes_under_the_proto_tag() {
+    let m = SelectMergeProfileRequest {
+        profile_type_id: "process_cpu:cpu:nanoseconds:cpu:nanoseconds".to_string(),
+        label_selector: "{service_name=\"a\"}".to_string(),
+        start: 1000,
+        end: 2000,
+        max_nodes: Some(16_384),
+        stack_trace_selector: Some(selector()),
+        profile_id_selector: strings(&["7c9e6679-7425-40de-944b-e07fc1f90ae7"]),
+        trace_id_selector: strings(&["0102030405060708090a0b0c0d0e0f10"]),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(1, &m.profile_type_id, &mut b);
+    encoding::string::encode(2, &m.label_selector, &mut b);
+    encoding::int64::encode(3, &m.start, &mut b);
+    encoding::int64::encode(4, &m.end, &mut b);
+    encoding::int64::encode(5, &16_384, &mut b);
+    nested(6, &selector_bytes(&selector()), &mut b);
+    encoding::string::encode_repeated(7, &m.profile_id_selector, &mut b);
+    encoding::string::encode_repeated(8, &m.trace_id_selector, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "SelectMergeProfileRequest");
+    let zero = SelectMergeProfileRequest {
+        max_nodes: Some(0),
+        ..SelectMergeProfileRequest::default()
+    };
+    let mut b = Vec::new();
+    encoding::int64::encode(5, &0, &mut b);
+    assert_eq!(zero.encode_to_vec(), b, "an explicit max_nodes 0 is sent");
+
+    let p = PprofProfile {
+        profile: Some(profile()),
+    };
+    let mut b = Vec::new();
+    nested(1, &profile_bytes(&profile()), &mut b);
+    assert_eq!(p.encode_to_vec(), b, "PprofProfile");
+
+    let r = SelectMergeStacktracesResponse {
+        flamegraph: None,
+        tree: Vec::new(),
+        pprof: Some(PprofProfile {
+            profile: Some(profile()),
+        }),
+    };
+    let mut inner = Vec::new();
+    nested(1, &profile_bytes(&profile()), &mut inner);
+    let mut b = Vec::new();
+    nested(5, &inner, &mut b);
+    assert_eq!(r.encode_to_vec(), b, "SelectMergeStacktracesResponse.pprof");
 }

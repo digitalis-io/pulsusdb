@@ -1179,6 +1179,7 @@ impl Push {
                     profile_id: id,
                     total,
                     duration_ns: profile.duration_nanos,
+                    period: 0,
                     annotation_keys: annotation_keys.clone(),
                     annotation_values: annotation_values.clone(),
                 });
@@ -1247,6 +1248,7 @@ impl Push {
                 mapping_start: loc.start,
                 mapping_limit: loc.limit,
                 mapping_offset: loc.offset,
+                mapping_flags: 0,
                 address: loc.address,
                 line_functions: lines.iter().map(|l| self.intern(l.name)).collect(),
                 line_system_names: lines.iter().map(|l| self.intern(l.system_name)).collect(),
@@ -2195,5 +2197,67 @@ mod tests {
         let set = labels_of(&l.series[0].labels);
         assert!(!set.contains_key("pod"));
         assert!(!set.contains_key("__period_type__"));
+    }
+
+    /// A24 (issue #828): a location stores its mapping's four flags as bits
+    /// 0–3, 0 without a mapping, and the flags are part of its content id;
+    /// every entry carries its profile's period.
+    #[test]
+    fn a24_a_location_keeps_its_mapping_flags_and_an_entry_its_period() {
+        let mut b = Pb::new();
+        b.sample_type("cpu", "nanoseconds")
+            .period("cpu", "nanoseconds");
+        b.p.period = 10_000_000;
+        let app = b.s("app");
+        let libx = b.s("libx.so");
+        b.p.mapping = vec![
+            Mapping {
+                id: 1,
+                memory_start: 0x40_0000,
+                memory_limit: 0x80_0000,
+                filename: app,
+                has_functions: true,
+                has_filenames: true,
+                has_line_numbers: true,
+                has_inline_frames: true,
+                ..Mapping::default()
+            },
+            Mapping {
+                id: 2,
+                memory_start: 0x7f_0000,
+                memory_limit: 0x7f_ffff,
+                filename: libx,
+                ..Mapping::default()
+            },
+        ];
+        b.func(1, "main", "main.go")
+            .loc(1, 1, 0x40_0110, &[1])
+            .loc(2, 2, 0x7f_0100, &[])
+            .loc(3, 0, 0x50, &[1])
+            .sample(&[1], &[10_000_000], &[])
+            .sample(&[2], &[20_000_000], &[])
+            .sample(&[3], &[30_000_000], &[]);
+        let all = b.build();
+        let l = parse_one(PUSH, all.clone());
+        let flags: Vec<(&str, u8)> = l
+            .locations
+            .iter()
+            .map(|loc| (&*loc.mapping_file, loc.mapping_flags))
+            .collect();
+        assert_eq!(flags, [("app", 15), ("libx.so", 0), ("", 0)]);
+        assert!(
+            l.entries.iter().all(|e| e.period == 10_000_000),
+            "{:?}",
+            l.entries
+        );
+
+        // The same location under a mapping with other flags is another
+        // location.
+        let mut other = all.clone();
+        other.mapping[0].has_inline_frames = false;
+        let o = parse_one(PUSH, other);
+        assert_eq!(o.locations[0].mapping_flags, 7);
+        assert_ne!(o.locations[0].location_id, l.locations[0].location_id);
+        assert_eq!(o.locations[1].location_id, l.locations[1].location_id);
     }
 }

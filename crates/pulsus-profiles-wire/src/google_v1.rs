@@ -3,7 +3,8 @@
 //! `string_table` are indices into `string_table`.
 
 /// A profile: its sample types, samples, and the tables they index.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Profile {
     #[prost(message, repeated, tag = "1")]
     pub sample_type: Vec<ValueType>,
@@ -36,7 +37,8 @@ pub struct Profile {
 }
 
 /// A value's type and unit, both string-table indices.
-#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ValueType {
     #[prost(int64, tag = "1")]
     pub r#type: i64,
@@ -45,7 +47,8 @@ pub struct ValueType {
 }
 
 /// One stack (leaf first) with one value per sample type.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Sample {
     #[prost(uint64, repeated, tag = "1")]
     pub location_id: Vec<u64>,
@@ -56,7 +59,8 @@ pub struct Sample {
 }
 
 /// A sample label: a string value (`str`) or a number (`num`).
-#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Label {
     #[prost(int64, tag = "1")]
     pub key: i64,
@@ -69,7 +73,8 @@ pub struct Label {
 }
 
 /// A mapped binary.
-#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Mapping {
     #[prost(uint64, tag = "1")]
     pub id: u64,
@@ -94,7 +99,8 @@ pub struct Mapping {
 }
 
 /// A program location, with its lines innermost first.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Location {
     #[prost(uint64, tag = "1")]
     pub id: u64,
@@ -109,7 +115,8 @@ pub struct Location {
 }
 
 /// One line of a location.
-#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Line {
     #[prost(uint64, tag = "1")]
     pub function_id: u64,
@@ -118,7 +125,8 @@ pub struct Line {
 }
 
 /// A function; its names and file are string-table indices.
-#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, ::prost::Message, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Function {
     #[prost(uint64, tag = "1")]
     pub id: u64,

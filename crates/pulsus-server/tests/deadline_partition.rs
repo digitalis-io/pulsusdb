@@ -174,10 +174,13 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/Diff",
     "/querier.v1.QuerierService/SelectHeatmap",
     "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
+    "/querier.v1.QuerierService/SelectMergeProfile",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
 ];
 
-/// Issue #821 (#823 adds `/merge`, #824 `/select_series`): the six profiles
-/// `GET` routes, which answer it as the reference's HTTP read handlers do.
+/// Issue #821 (#823 adds `/merge`, #824 `/select_series`, #828 `/export`):
+/// the seven profiles `GET` routes, which answer it as the reference's HTTP
+/// read handlers do.
 const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/types",
     "/api/profiles/v1/labels",
@@ -185,6 +188,7 @@ const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/series",
     "/api/profiles/v1/merge",
     "/api/profiles/v1/select_series",
+    "/api/profiles/v1/export",
 ];
 
 fn mounted_of(surface: Surface) -> BTreeSet<String> {

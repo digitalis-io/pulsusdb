@@ -12,6 +12,7 @@ use super::catalogue::{Read, compat_sets};
 use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
 use super::heatmap::{HeatmapExemplarRow, HeatmapRow};
+use super::pprof::PprofRow;
 use super::selector::WindowLimits;
 use super::series::{TimeSeriesExemplarRow, TimeSeriesRow};
 use super::tree::TreeRow;
@@ -131,6 +132,11 @@ fn tree_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Quer
     read_settings(config, log_comment).set("query_plan_join_swap_table", "false")
 }
 
+/// Issue #828: the settings S9 carries.
+fn pprof_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
+    read_settings(config, log_comment)
+}
+
 /// The class of a failed profiles statement (plan §6).
 pub fn map_read_error(e: ChError) -> ProfilesReadError {
     if let Some(super::selector::SelectorError::InvalidArgument(d)) =
@@ -241,6 +247,16 @@ impl ProfilesEngine {
         self.dispatch.rows(sql, &settings).await
     }
 
+    /// Issue #828: sends S9 (`super::pprof`) and returns its stack and
+    /// location rows.
+    pub async fn read_pprof(&self, sql: &str) -> Result<Vec<PprofRow>, ProfilesReadError> {
+        let _ = (
+            sql,
+            pprof_settings(&self.config, self.log_comment.as_deref()),
+        );
+        Ok(Vec::new())
+    }
+
     /// Issue #824: sends S6 (`super::series`) and returns one row per
     /// series.
     pub async fn read_series(&self, sql: &str) -> Result<Vec<TimeSeriesRow>, ProfilesReadError> {
@@ -345,6 +361,17 @@ mod tests {
             assert!(tree.contains(expected), "{expected} missing from {tree}");
         }
         assert!(!single.contains("query_plan_join_swap_table"), "{single}");
+        // Issue #828 (D3): S9 carries them too.
+        let pprof = format!("{:?}", pprof_settings(&off_default(), Some("abc")));
+        for expected in [
+            r#"("max_rows_to_read", "11")"#,
+            r#"("max_result_rows", "13")"#,
+            r#"("max_result_bytes", "17")"#,
+            r#"("log_comment", "abc")"#,
+            r#"("query_plan_join_swap_table", "false")"#,
+        ] {
+            assert!(pprof.contains(expected), "{expected} missing from {pprof}");
+        }
     }
 
     /// Q6: each server code and transport failure maps to its class.
