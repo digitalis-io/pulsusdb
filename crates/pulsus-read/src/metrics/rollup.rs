@@ -2134,7 +2134,7 @@ mod tests {
     fn the_replica_delay_statement_skips_an_unreachable_replica() {
         assert_eq!(
             replica_delay_sql("pulsus_test_cluster", "pulsus"),
-            "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1"
+            "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1, connect_timeout_with_failover_ms = 100, connect_timeout_with_failover_secure_ms = 100"
         );
     }
 

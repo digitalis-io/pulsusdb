@@ -1885,4 +1885,43 @@ mod tests {
         let one = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
         assert_eq!(one.bind_read_avoiding(Some(0)), 0, "the only endpoint");
     }
+
+    /// **T1 (issue #888): the readiness ping answers while every workload
+    /// lease is held.** The ping takes its lease from a gate of its own; the
+    /// workload semaphore stays as full as it was, so a write still waits.
+    #[tokio::test]
+    async fn ping_answers_while_every_workload_lease_is_held() {
+        use crate::stub_server::{Mode, StubServer};
+        let stub = StubServer::start(Mode::Silent);
+        let pool = ChPool::connect(ChConnConfig {
+            server: "127.0.0.1".to_string(),
+            http_port: stub.addr.port(),
+            database: "default".to_string(),
+            proto: ChProto::Http,
+            pool_size: 8,
+            query_timeout: Duration::from_secs(10),
+            ..ChConnConfig::default()
+        })
+        .await
+        .expect("connect to the stub");
+        let _held = pool
+            .semaphore
+            .try_acquire_many(8)
+            .expect("all eight workload leases");
+        assert_eq!(pool.semaphore.available_permits(), 0);
+
+        let ping = tokio::time::timeout(Duration::from_millis(500), pool.ping()).await;
+        assert!(
+            matches!(ping, Ok(Ok(()))),
+            "the ping must not wait for a workload lease: {ping:?}"
+        );
+        let write =
+            tokio::time::timeout(Duration::from_millis(100), pool.get(StatementClass::Write))
+                .await;
+        assert!(
+            write.is_err(),
+            "a write must still wait for a workload lease; the ping's capacity \
+             is its own, not one more permit for everyone"
+        );
+    }
 }

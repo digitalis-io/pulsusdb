@@ -46,6 +46,19 @@ pub const MAX_JSON_PATHS_PER_VALUE: u64 = 100_000;
 /// its spans and resources absent from the new tables.
 pub const MAX_PARTITIONS_PER_INSERT_BLOCK: u64 = 100;
 
+/// How long a statement's server waits to open a connection to another
+/// server of the cluster, in milliseconds, plain and TLS (issue #888). The
+/// server's own default is 1000 per try, three tries per replica.
+pub const REPLICA_CONNECT_TIMEOUT_MS: u64 = 100;
+
+/// The same two settings as [`QuerySettings::replica_connect_timeout`], for
+/// a statement that carries its settings in its text:
+/// `connect_timeout_with_failover_ms = 100,
+/// connect_timeout_with_failover_secure_ms = 100`.
+pub fn replica_connect_timeout_clause() -> String {
+    String::new()
+}
+
 /// The settings that can turn a read into a partial or changed answer that
 /// still succeeds (#603 plan, "Answer pins"). Every read of every signal sends them.
 pub const ANSWER_PIN_NAMES: [&str; 17] = [
@@ -222,6 +235,13 @@ impl QuerySettings {
     /// not.
     pub fn without(mut self, key: &str) -> Self {
         self.0.retain(|(k, _)| k != key);
+        self
+    }
+
+    /// `connect_timeout_with_failover_ms` and
+    /// `connect_timeout_with_failover_secure_ms` at
+    /// [`REPLICA_CONNECT_TIMEOUT_MS`].
+    pub fn replica_connect_timeout(self) -> Self {
         self
     }
 
@@ -894,7 +914,7 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            21,
+            23,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
@@ -921,6 +941,23 @@ mod tests {
         for (key, value) in PINS {
             assert_eq!(landing.get(key), Some(value), "landing_insert: {key}");
             assert_eq!(traces.get(key), Some(value), "trace_landing_insert: {key}");
+        }
+    }
+
+    /// **T3 (issue #888): every landing insert pins the replica connect
+    /// timeout**, logs and metrics through [`QuerySettings::landing_insert`]
+    /// and traces through [`QuerySettings::trace_landing_insert`], both
+    /// names at 100 ms.
+    #[test]
+    fn every_landing_insert_pins_the_replica_connect_timeout() {
+        let landing = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        for key in [
+            "connect_timeout_with_failover_ms",
+            "connect_timeout_with_failover_secure_ms",
+        ] {
+            assert_eq!(landing.get(key), Some("100"), "landing_insert: {key}");
+            assert_eq!(traces.get(key), Some("100"), "trace_landing_insert: {key}");
         }
     }
 

@@ -682,6 +682,8 @@ mod tests {
              timeout_overflow_mode = throw, \
              max_partitions_per_insert_block = 100, \
              throw_on_max_partitions_per_insert_block = 1, \
+             connect_timeout_with_failover_ms = 100, \
+             connect_timeout_with_failover_secure_ms = 100, \
              max_execution_time = 120.000"
         );
     }

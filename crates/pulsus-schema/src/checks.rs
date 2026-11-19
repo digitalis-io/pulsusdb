@@ -708,6 +708,8 @@ mod tests {
             "timeout_overflow_mode",
             "max_partitions_per_insert_block",
             "throw_on_max_partitions_per_insert_block",
+            "connect_timeout_with_failover_ms",
+            "connect_timeout_with_failover_secure_ms",
         ]);
 
         // The trace landing insert's own five pins are rows too (issues
@@ -791,7 +793,8 @@ mod tests {
                      'distributed_foreground_insert', 'parallel_view_processing', \
                      'insert_shard_id', \
                      'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
-                     'timeout_overflow_mode')"
+                     'timeout_overflow_mode', 'connect_timeout_with_failover_ms', \
+                     'connect_timeout_with_failover_secure_ms')"
                         .to_string()
                 ),
                 (

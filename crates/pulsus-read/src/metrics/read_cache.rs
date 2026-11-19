@@ -3442,4 +3442,25 @@ mod tests {
             "no kept point served"
         );
     }
+
+    /// **T6 (issue #888): the poll statements that read every replica cap a
+    /// connect to one.** A replica whose address drops packets costs each
+    /// 0.3 s, not 3 s; the single-node identity statement names no replica
+    /// and carries no setting.
+    #[test]
+    fn the_every_replica_poll_statements_cap_a_replica_connect() {
+        assert_eq!(
+            lag_sql("c", "db"),
+            "SELECT max(absolute_delay) AS lag_s FROM clusterAllReplicas('c', system.replicas) WHERE database = 'db' AND startsWith(table, 'metric_') SETTINGS skip_unavailable_shards = 1, connect_timeout_with_failover_ms = 100, connect_timeout_with_failover_secure_ms = 100"
+        );
+        assert_eq!(
+            identity_sql(Some("c"), "db"),
+            "SELECT arraySort(groupUniqArray(toString(uuid))) AS ids FROM clusterAllReplicas('c', system.databases) WHERE name = 'db' SETTINGS skip_unavailable_shards = 1, connect_timeout_with_failover_ms = 100, connect_timeout_with_failover_secure_ms = 100"
+        );
+        assert!(
+            identity_sql(None, "db").ends_with("WHERE name = 'db'"),
+            "{}",
+            identity_sql(None, "db")
+        );
+    }
 }

@@ -34,9 +34,14 @@ pub use pool::{ChPool, PooledConn, ServerFailure, spawn_reprobe_loop};
 pub use request::{Attempt, run_read_request};
 pub use settings::{
     ANSWER_FAMILIES, ANSWER_PIN_NAMES, AnswerFamily, MAX_JSON_PATHS_PER_VALUE,
-    MAX_PARTITIONS_PER_INSERT_BLOCK, QuerySettings,
+    MAX_PARTITIONS_PER_INSERT_BLOCK, QuerySettings, REPLICA_CONNECT_TIMEOUT_MS,
+    replica_connect_timeout_clause,
 };
 pub use tls::ca_root_store;
+
+#[cfg(test)]
+#[path = "../tests/common/stub_server.rs"]
+mod stub_server;
 
 #[cfg(test)]
 mod tests {
