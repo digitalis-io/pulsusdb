@@ -1,6 +1,7 @@
 //! The Connect protocol's error rule, shared by every profiles route: a
 //! code, its HTTP status (`protocol_connect.go:1269-1308` of the Connect
-//! library), and the JSON error body.
+//! library), and the JSON error body. Issue #829: the string escaping it
+//! uses ([`go_string`]), shared with the render routes' answers.
 
 /// A Connect error code: the ones the profiles routes answer, ingest and
 /// query alike.
@@ -93,8 +94,21 @@ pub fn go_string(out: &mut String, s: &str) {
 /// Issue #829: `v` as Go's `json.Encoder` writes a `[]string`: `null` when
 /// empty, else the strings in order, each by [`go_string`]; then `\n`.
 pub fn go_string_array(v: &[String]) -> String {
-    let _ = v;
-    String::new()
+    if v.is_empty() {
+        return "null\n".to_string();
+    }
+    let mut out = String::with_capacity(v.iter().map(|s| s.len() + 3).sum::<usize>() + 3);
+    out.push('[');
+    for (i, s) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        go_string(&mut out, s);
+        out.push('"');
+    }
+    out.push_str("]\n");
+    out
 }
 
 #[cfg(test)]

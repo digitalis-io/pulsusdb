@@ -98,7 +98,8 @@ pub(crate) const DEADLINE_GRPC_PATHS: &[&str] = &[
 ];
 
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
-/// adds `/merge`, #824 `/select_series`).
+/// adds `/merge`, #824 `/select_series`, #829 the three render routes and
+/// their compat paths).
 /// They answer a deadline as the reference's HTTP read handlers answer one
 /// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
 /// [`DEADLINE_CONNECT_PATHS`].
@@ -109,6 +110,12 @@ pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/series",
     "/api/profiles/v1/merge",
     "/api/profiles/v1/select_series",
+    "/api/profiles/v1/render",
+    "/api/profiles/v1/render-diff",
+    "/api/profiles/v1/label-values",
+    "/pyroscope/render",
+    "/pyroscope/render-diff",
+    "/pyroscope/label-values",
 ];
 
 /// `path` matches `template`, whose one `{name}` is a non-empty segment.

@@ -5,6 +5,9 @@
 //! [`crate::connect::go_string`], no whitespace and a trailing `\n`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+use crate::connect::go_string;
 
 /// A flame graph, or a diff's (`double`), with its metadata's type id, its
 /// timeline and its groups.
@@ -41,15 +44,107 @@ pub struct Timeline {
 /// The metadata's `units`, `sampleRate` and `name` for a type id
 /// (`pkg/model/flamegraph.go:128-138`).
 pub fn metadata(type_id: &str) -> (&str, u32, &str) {
-    let _ = type_id;
-    ("", 0, "")
+    let mut parts = type_id.split(':');
+    let sample_type = parts.nth(1).unwrap_or_default();
+    let sample_unit = parts.next().unwrap_or_default();
+    match sample_type {
+        "inuse_objects" | "alloc_objects" | "goroutine" | "samples" => {
+            ("objects", 100, sample_type)
+        }
+        "cpu" => ("samples", 1_000_000_000, sample_type),
+        _ => (sample_unit, 100, sample_type),
+    }
 }
 
 impl Flamebearer {
     /// The answer's bytes, as the reference writes them, ending `\n`.
     pub fn to_json(&self) -> String {
-        String::new()
+        let values: usize = self.levels.iter().map(Vec::len).sum();
+        let mut out = String::with_capacity(256 + 12 * values + 24 * self.names.len());
+        out.push_str(r#"{"version":1,"flamebearer":{"names":["#);
+        for (i, name) in self.names.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            quoted(&mut out, name);
+        }
+        out.push_str(r#"],"levels":["#);
+        for (i, level) in self.levels.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            join(&mut out, level);
+            out.push(']');
+        }
+        let (units, sample_rate, name) = metadata(&self.type_id);
+        let format = if self.double { "double" } else { "single" };
+        let _ = write!(
+            out,
+            r#"],"numTicks":{},"maxSelf":{}}},"metadata":{{"format":"{format}","spyName":"","sampleRate":{sample_rate},"units":"#,
+            self.num_ticks, self.max_self
+        );
+        quoted(&mut out, units);
+        out.push_str(r#","name":"#);
+        quoted(&mut out, name);
+        out.push_str(r#"},"timeline":"#);
+        match &self.timeline {
+            Some(t) => timeline(&mut out, t),
+            None => out.push_str("null"),
+        }
+        out.push_str(r#","groups":"#);
+        match &self.groups {
+            Some(groups) => {
+                out.push('{');
+                for (i, (key, t)) in groups.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    quoted(&mut out, key);
+                    out.push(':');
+                    timeline(&mut out, t);
+                }
+                out.push('}');
+            }
+            None => out.push_str("null"),
+        }
+        out.push_str(r#","heatmap":null"#);
+        if self.left_ticks != 0 {
+            let _ = write!(out, r#","leftTicks":{}"#, self.left_ticks);
+        }
+        if self.right_ticks != 0 {
+            let _ = write!(out, r#","rightTicks":{}"#, self.right_ticks);
+        }
+        out.push_str("}\n");
+        out
     }
+}
+
+/// `s` as a JSON string, escaped as the reference escapes it.
+fn quoted(out: &mut String, s: &str) {
+    out.push('"');
+    go_string(out, s);
+    out.push('"');
+}
+
+/// `values` written comma-separated.
+fn join<T: std::fmt::Display>(out: &mut String, values: &[T]) {
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{v}");
+    }
+}
+
+fn timeline(out: &mut String, t: &Timeline) {
+    let _ = write!(out, r#"{{"startTime":{},"samples":["#, t.start_time);
+    join(out, &t.samples);
+    let _ = write!(
+        out,
+        r#"],"durationDelta":{},"watermarks":null}}"#,
+        t.duration_delta
+    );
 }
 
 #[cfg(test)]

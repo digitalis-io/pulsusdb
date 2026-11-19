@@ -238,8 +238,8 @@ impl ProfilesEngine {
     /// Issue #829: sends the render statement (`super::render`) and returns
     /// the merged tree's rows and the series' rows, tagged by `part`.
     pub async fn read_render(&self, sql: &str) -> Result<Vec<RenderRow>, ProfilesReadError> {
-        let _ = sql;
-        Ok(Vec::new())
+        let settings = tree_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 
     /// Issue #827: sends S7 (`super::diff`) and returns one row per node of

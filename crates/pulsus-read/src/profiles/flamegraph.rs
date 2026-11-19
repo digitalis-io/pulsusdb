@@ -180,8 +180,7 @@ pub fn flame_graph_with_tree(
 /// Issue #829: the trimmed tree's bytes alone ([`tree_bytes`]), steps 1
 /// and 2 with `m`, for `PROFILE_FORMAT_TREE`.
 pub fn tree_only(rows: &[TreeRow], m: i64) -> Result<Vec<u8>, ProfilesReadError> {
-    let _ = (rows, m);
-    Ok(Vec::new())
+    Ok(tree_bytes(&truncated(merged_tree(rows, m)?, m)))
 }
 
 /// The tree's bytes as the reference's `MarshalTruncate` writes them
