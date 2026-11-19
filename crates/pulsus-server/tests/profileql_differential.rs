@@ -3148,12 +3148,67 @@ fn json_value(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(body).ok()
 }
 
+/// R4 (#826 part B §5): two `SelectHeatmap` answers of one status and
+/// `Content-Type`, `None` when equal with each slot's exemplars taken as a
+/// set. A success in proto: each body is the encoding of its own decoded
+/// answer, and the two re-encode equal with each slot's exemplars sorted
+/// ([`sort_exemplars`]). In JSON: the parsed values are equal with each
+/// `series[].slots[].exemplars` array sorted by its elements' text.
+/// Anything else compares as bytes.
+fn heatmap_parity(encoding: Encoding, ours: &Res, theirs: &Res) -> Option<&'static str> {
+    if ours.content_type != theirs.content_type {
+        return Some("Content-Type differs");
+    }
+    if ours.status != 200 {
+        return (ours.body != theirs.body).then_some("bodies differ");
+    }
+    match encoding {
+        Encoding::Proto => {
+            let decoded = |res: &Res| {
+                SelectHeatmapResponse::decode(&res.body[..])
+                    .ok()
+                    .filter(|r| r.encode_to_vec() == res.body)
+            };
+            let (Some(mut a), Some(mut b)) = (decoded(ours), decoded(theirs)) else {
+                return Some("a body is not the encoding of its decoded answer");
+            };
+            for r in [&mut a, &mut b] {
+                for slot in r.series.iter_mut().flat_map(|s| s.slots.iter_mut()) {
+                    sort_exemplars(&mut slot.exemplars);
+                }
+            }
+            (a.encode_to_vec() != b.encode_to_vec())
+                .then_some("bodies differ, each slot's exemplars as a set")
+        }
+        Encoding::Json => {
+            let sorted = |res: &Res| {
+                let mut v = json_value(&res.body)?;
+                for series in v["series"].as_array_mut().into_iter().flatten() {
+                    for slot in series["slots"].as_array_mut().into_iter().flatten() {
+                        if let Some(xs) = slot["exemplars"].as_array_mut() {
+                            xs.sort_by_key(|x| x.to_string());
+                        }
+                    }
+                }
+                Some(v)
+            };
+            match (sorted(ours), sorted(theirs)) {
+                (Some(a), Some(b)) if a == b => None,
+                (Some(_), Some(_)) => Some("JSON bodies differ, each slot's exemplars as a set"),
+                _ if ours.body == theirs.body => None,
+                _ => Some("bodies differ"),
+            }
+        }
+    }
+}
+
 /// `None` when two answers are equal under the case's rule (§5).
 fn parity(request: &Request, ours: &Res, theirs: &Res) -> Option<&'static str> {
     if ours.status != theirs.status {
         return Some("status differs");
     }
     match (&request.method, request.encoding) {
+        (Method::Heatmap { .. }, encoding) => heatmap_parity(encoding, ours, theirs),
         (Method::Series { .. }, Encoding::Json) => {
             let (a, b) = (
                 label_sets(Encoding::Json, &ours.body),

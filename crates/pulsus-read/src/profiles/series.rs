@@ -390,14 +390,27 @@ pub(super) type LabelsByFingerprint = HashMap<u128, Vec<(String, String)>>;
 
 /// Issue #826: an exemplar statement's rows split into the series rows,
 /// those `is_series` holds for, and the map each other row's
-/// `(fingerprint, labels)` makes.
+/// `(fingerprint, labels)` makes. Each label list takes the reference's
+/// order: `__profile_type__` first, `__service_name__` second, the rest by
+/// name.
 pub(super) fn split_labels<R>(
     rows: Vec<R>,
     is_series: impl Fn(&R) -> bool,
     labels: impl Fn(R) -> (u128, Vec<(String, String)>),
 ) -> (Vec<R>, LabelsByFingerprint) {
     let (series, other): (Vec<R>, Vec<R>) = rows.into_iter().partition(|r| is_series(r));
-    (series, other.into_iter().map(labels).collect())
+    let by_fingerprint = other
+        .into_iter()
+        .map(|r| {
+            let (fingerprint, mut pairs) = labels(r);
+            pairs.sort_by(|(a, _), (b, _)| {
+                let key = |n: &str| (n != "__profile_type__", n != "__service_name__");
+                key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+            });
+            (fingerprint, pairs)
+        })
+        .collect();
+    (series, by_fingerprint)
 }
 
 /// A series' labels: the `group_by` names it holds a value for, in request
