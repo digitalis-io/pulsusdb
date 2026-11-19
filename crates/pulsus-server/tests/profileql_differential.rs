@@ -2776,6 +2776,46 @@ fn rx_values(server: &Server, tenant: &str, w: (i64, i64)) -> Option<Vec<String>
         .map(|r| r.names)
 }
 
+/// The stack total of each `(rx, profile type)` row over `w`, as
+/// `tenant`: `None` when any answer is not a flame graph, or any row has
+/// none yet.
+fn row_totals(
+    server: &Server,
+    tenant: &str,
+    rows: &[(&str, &str)],
+    w: (i64, i64),
+) -> Option<Vec<i64>> {
+    rows.iter()
+        .map(|(rx, ty)| {
+            let body = SelectMergeStacktracesRequest {
+                profile_type_id: ty.to_string(),
+                label_selector: format!("{{rx=\"{rx}\"}}"),
+                start: w.0,
+                end: w.1,
+                ..SelectMergeStacktracesRequest::default()
+            }
+            .encode_to_vec();
+            let res = call(
+                server,
+                "POST",
+                "/querier.v1.QuerierService/SelectMergeStacktraces",
+                &[
+                    ("Content-Type", "application/proto"),
+                    ("Connect-Protocol-Version", "1"),
+                    ("X-Scope-OrgID", tenant),
+                ],
+                &body,
+            );
+            (res.status == 200)
+                .then(|| SelectMergeStacktracesResponse::decode(&res.body[..]).ok())
+                .flatten()
+                .and_then(|r| r.flamegraph)
+                .map(|f| f.total)
+                .filter(|t| *t > 0)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------
 // Comparison
 // ---------------------------------------------------------------------
@@ -3182,9 +3222,13 @@ async fn profileql_matches_the_reference() {
         mismatches.0.join("\n\n")
     );
 
-    // Visible before compared, with the filler writer running.
+    // Visible before compared, with the filler writer running: each
+    // tenant's labels, then the stacks of every row its cases read. The
+    // reference can list a fixture's labels a minute before it serves its
+    // stacks, so the labels alone do not show that a case can read it.
     let filler = Filler::start(reference.clone(), format!("filler-{run}"));
-    let deadline = Instant::now() + Duration::from_secs(240);
+    let settling = Instant::now();
+    let deadline = settling + Duration::from_secs(240);
     let jfr_rx: &[&str] = &["ingest-jfr"];
     let all: [(&String, &[&str]); 6] = [
         (&t1, &RX),
@@ -3204,6 +3248,35 @@ async fn profileql_matches_the_reference() {
             );
         }
     }
+    let t_rows = |t1: bool| -> Vec<(&str, &str)> {
+        value_checks(t1)
+            .into_iter()
+            .map(|(rx, ty, _)| (rx, ty))
+            .collect()
+    };
+    let q_rows: Vec<(&str, &str)> = Q_RX.iter().map(|rx| (*rx, TYPE_A)).collect();
+    let j_rows: Vec<(&str, &str)> = jfr_totals()
+        .into_iter()
+        .map(|(ty, _)| ("ingest-jfr", ty))
+        .collect();
+    for (tenant, rows) in [
+        (&t1, t_rows(true)),
+        (&t2, t_rows(false)),
+        (&q1, q_rows.clone()),
+        (&q2, q_rows),
+        (&j1, j_rows.clone()),
+        (&j2, j_rows),
+    ] {
+        for server in [&ours, &reference] {
+            pulsus_testkit::settle_by(
+                deadline,
+                Duration::from_secs(2),
+                &format!("{} stacks of every row under {tenant}", server.name),
+                || row_totals(server, tenant, &rows, w),
+            );
+        }
+    }
+    eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
     // §4: C0–C30.
