@@ -18,6 +18,8 @@ pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
 pulsus-model = { path = "../pulsus-model" }
 pulsus-profiles-wire = { path = "../pulsus-profiles-wire" }
+# Issue #819: the JFR reader's symbol rules.
+regex.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true

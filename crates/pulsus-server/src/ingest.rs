@@ -474,8 +474,8 @@ pub(crate) async fn ingest_profile_push(
 }
 
 /// `POST /ingest`, its second compat path and `POST /api/profiles/v1/ingest`
-/// (docs/api.md §1.3, issues #817 and #818): `/ingest` in every format but
-/// JFR. Pulls `AppState`'s
+/// (docs/api.md §1.3, issues #817 to #819): `/ingest` in every format.
+/// Pulls `AppState`'s
 /// `ProfileWriterSink` and hands straight into
 /// `pulsus_write::ingest_profile_legacy`.
 pub(crate) async fn ingest_profile_legacy(
