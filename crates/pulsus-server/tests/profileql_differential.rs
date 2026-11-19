@@ -2725,8 +2725,14 @@ fn value_checks(t1: bool) -> Vec<(&'static str, &'static str, i64)> {
 // ---------------------------------------------------------------------
 
 /// The run's windows, in milliseconds: `W` and `Q` (§3, D6), and issue
-/// #829's `R`, the render routes' window: `W` with its start moved 7.5 s
-/// past a 15 s boundary, so the timeline's alignment is always tested.
+/// #829's `R`, the render routes' window: `W` with its start moved to 1 ms
+/// before a 15 s boundary. The start is never on a boundary, so the
+/// timeline's alignment is always tested. And each step of the series ends
+/// 1 ms before a boundary, so a point falls in the 15 s slot of the
+/// profiles it holds: the reference, asked for a window that starts before
+/// the tenant's oldest profile, places the point at that profile's own
+/// time (`pkg/frontend/readpath/router.go:92-113` starts its series there),
+/// and the two then land in one slot.
 #[derive(Debug, Clone, Copy)]
 struct Windows {
     w: (i64, i64),
@@ -3373,7 +3379,7 @@ async fn profileql_matches_the_reference() {
     let win = Windows {
         w,
         q: (s0_ms, s0_ms + 60_500),
-        r: (w.0.div_euclid(15_000) * 15_000 + 7_500, w.1),
+        r: (w.0.div_euclid(15_000) * 15_000 + 14_999, w.1),
     };
     let mut mismatches = Mismatches::default();
 
