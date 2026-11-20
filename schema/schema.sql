@@ -553,6 +553,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
     mapping_start UInt64 CODEC(ZSTD(1)),
     mapping_limit UInt64 CODEC(ZSTD(1)),
     mapping_offset UInt64 CODEC(ZSTD(1)),
+    mapping_flags UInt8 CODEC(ZSTD(1)),
     address UInt64 CODEC(ZSTD(1)),
     line_functions Array(String) CODEC(ZSTD(1)),
     line_system_names Array(String) CODEC(ZSTD(1)),
@@ -572,6 +573,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
     sample_rate UInt32 DEFAULT 0 CODEC(ZSTD(1)),
     units LowCardinality(String) DEFAULT '',
     duration_ns Int64 CODEC(ZSTD(1)),
+    period Int64 CODEC(T64, ZSTD(1)),
     annotation_keys Array(String) CODEC(ZSTD(1)),
     annotation_values Array(String) CODEC(ZSTD(1))
 )
@@ -594,7 +596,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_samples{{on_cluster}}
     value Int64 CODEC(T64, ZSTD(1)),
     span_id UInt64 CODEC(ZSTD(1)),
     trace_id FixedString(16) CODEC(ZSTD(1)),
-    profile_id UUID CODEC(ZSTD(1))
+    profile_id UUID CODEC(ZSTD(1)),
+    period Int64 CODEC(T64, ZSTD(1))
 )
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.profile_samples', '{replica}')
@@ -674,6 +677,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_locations{{on_cluster}}
     mapping_start UInt64 CODEC(ZSTD(1)),
     mapping_limit UInt64 CODEC(ZSTD(1)),
     mapping_offset UInt64 CODEC(ZSTD(1)),
+    mapping_flags UInt8 CODEC(ZSTD(1)),
     address UInt64 CODEC(ZSTD(1)),
     line_functions Array(String) CODEC(ZSTD(1)),
     line_system_names Array(String) CODEC(ZSTD(1)),
@@ -986,7 +990,8 @@ AS SELECT
     value AS value,
     span_id AS span_id,
     trace_id AS trace_id,
-    profile_id AS profile_id
+    profile_id AS profile_id,
+    period AS period
 FROM {{db}}.profile_landing
 WHERE kind = 0;
 
@@ -1038,6 +1043,7 @@ AS SELECT
     mapping_start AS mapping_start,
     mapping_limit AS mapping_limit,
     mapping_offset AS mapping_offset,
+    mapping_flags AS mapping_flags,
     address AS address,
     line_functions AS line_functions,
     line_system_names AS line_system_names,

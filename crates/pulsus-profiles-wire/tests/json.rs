@@ -6,13 +6,15 @@
 //! series' messages, a `double` written as the reference writes it. W8
 //! (issue #827): the diff's messages. W9 and W10 (issue #825): the
 //! heatmap's messages. W11 (#823 part B): the flame graph's tree bytes.
-//! W11 (issue #826): an exemplar.
+//! W11 (issue #826): an exemplar. W12 (issue #828): the pprof `Profile`'s
+//! JSON, and `SelectMergeProfile`'s request as the exploration app sends it.
 
+use pulsus_profiles_wire::google_v1::Profile;
 use pulsus_profiles_wire::querier_v1::{
     DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
     ProfileTypesRequest, ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
-    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
-    SelectSeriesResponse, SeriesRequest, SeriesResponse,
+    SelectMergeProfileRequest, SelectMergeStacktracesRequest, SelectMergeStacktracesResponse,
+    SelectSeriesRequest, SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
     Exemplar, GoPgo, HeatmapSeries, HeatmapSlot, LabelPair, Labels, Location, Point, ProfileType,
@@ -109,6 +111,7 @@ fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
             max_self: 17,
         }),
         tree: Vec::new(),
+        pprof: None,
     };
     assert_eq!(
         serde_json::to_string(&row1).expect("encode"),
@@ -122,6 +125,7 @@ fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
             max_self: 0,
         }),
         tree: Vec::new(),
+        pprof: None,
     };
     assert_eq!(
         serde_json::to_string(&empty).expect("encode"),
@@ -143,6 +147,7 @@ fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
     let with = SelectMergeStacktracesResponse {
         flamegraph: Some(graph.clone()),
         tree: vec![0, 0, 1],
+        pprof: None,
     };
     let text = serde_json::to_string(&with).expect("encode");
     assert_eq!(
@@ -156,6 +161,7 @@ fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
     let without = SelectMergeStacktracesResponse {
         flamegraph: Some(graph.clone()),
         tree: Vec::new(),
+        pprof: None,
     };
     assert!(
         !serde_json::to_string(&without)
@@ -166,6 +172,7 @@ fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
     let graph_bytes = SelectMergeStacktracesResponse {
         flamegraph: Some(graph),
         tree: Vec::new(),
+        pprof: None,
     }
     .encode_to_vec();
     let mut want = graph_bytes.clone();
@@ -455,5 +462,68 @@ fn w11_an_exemplar_is_written_as_the_reference_writes_it() {
     assert_eq!(
         serde_json::to_string(&zero).expect("encode"),
         r#"{"timestamp":"1794819625000","profileId":"00000000-0000-0000-0000-0000000000c2","spanId":"0a00000000000000","labels":[{"name":"pod","value":"e"}],"traceId":"00000000000000000000000000000002"}"#
+    );
+}
+
+/// The reference's JSON answer to the exploration app's function-details
+/// request on plan §8.1's fixture (#828 plan §4), captured.
+const REFERENCE_PROFILE_JSON: &str = r#"{"sampleType":[{"type":"9","unit":"8"}],"sample":[{"locationId":["1","2"],"value":["60000000"]},{"locationId":["3","1","2"],"value":["20000000"]},{"locationId":["4","2"],"value":["40000000"]},{"locationId":["5","4","2"],"value":["200000000"]}],"mapping":[{"id":"1","filename":"2","buildId":"1","hasFunctions":true,"hasFilenames":true,"hasLineNumbers":true,"hasInlineFrames":true}],"location":[{"id":"1","mappingId":"1","line":[{"functionId":"2","line":"21"}]},{"id":"2","mappingId":"1","line":[{"functionId":"1","line":"10"}]},{"id":"3","mappingId":"1","line":[{"functionId":"4","line":"40"}]},{"id":"4","mappingId":"1","line":[{"functionId":"2","line":"20"}]},{"id":"5","mappingId":"1","line":[{"functionId":"3","line":"30"}]}],"function":[{"id":"1","name":"3","systemName":"3","filename":"4","startLine":"1"},{"id":"2","name":"5","systemName":"5","filename":"4","startLine":"2"},{"id":"3","name":"6","systemName":"6","filename":"4","startLine":"3"},{"id":"4","name":"7","systemName":"7","filename":"4","startLine":"4"}],"stringTable":["","bid","app","main","main.go","a","b","c","nanoseconds","cpu"],"timeNanos":"1795085995000000000","periodType":{"type":"9","unit":"8"},"period":"1000000000","defaultSampleType":"9"}"#;
+
+/// **W12** (issue #828): the reference's JSON `Profile` decodes, every
+/// field read, and re-encodes to the same JSON; every name of the mapping
+/// is the proto3 JSON one.
+#[test]
+fn w12_the_pprof_profile_is_written_as_the_reference_writes_it() {
+    let p: Profile = serde_json::from_str(REFERENCE_PROFILE_JSON).expect("decode");
+    assert_eq!(p.sample.len(), 4);
+    assert_eq!(p.sample[1].location_id, [3, 1, 2]);
+    assert_eq!(p.sample[3].value, [200_000_000]);
+    assert_eq!(p.mapping[0].build_id, 1);
+    assert!(p.mapping[0].has_inline_frames);
+    assert_eq!(p.location[0].line[0].line, 21);
+    assert_eq!(p.function[3].start_line, 4);
+    assert_eq!(p.time_nanos, 1_795_085_995_000_000_000);
+    assert_eq!(p.period, 1_000_000_000);
+    assert_eq!(p.default_sample_type, 9);
+    assert_eq!(p.period_type.map(|t| (t.r#type, t.unit)), Some((9, 8)));
+    let again: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&p).expect("encode")).expect("JSON");
+    let want: serde_json::Value = serde_json::from_str(REFERENCE_PROFILE_JSON).expect("JSON");
+    assert_eq!(again, want);
+    assert_eq!(
+        serde_json::to_string(&Profile::default()).expect("encode"),
+        "{}"
+    );
+}
+
+/// **W12** (issue #828): the exploration app's function-details request:
+/// the proto names it sends, the call site and `maxNodes` read.
+#[test]
+fn w12_the_apps_merge_profile_request_is_read() {
+    let text = r#"{"profile_typeID":"process_cpu:cpu:nanoseconds:cpu:nanoseconds","label_selector":"{service_name=\"q-pprof\"}","start":1000,"end":2000,"stackTraceSelector":{"call_site":[{"name":"main"},{"name":"a"}]},"maxNodes":500}"#;
+    let m: SelectMergeProfileRequest = serde_json::from_str(text).expect("decode");
+    assert_eq!(
+        m.profile_type_id,
+        "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+    );
+    assert_eq!(m.label_selector, r#"{service_name="q-pprof"}"#);
+    assert_eq!((m.start, m.end, m.max_nodes), (1000, 2000, Some(500)));
+    let names: Vec<String> = m
+        .stack_trace_selector
+        .expect("a selector")
+        .call_site
+        .into_iter()
+        .map(|l| l.name)
+        .collect();
+    assert_eq!(names, ["main", "a"]);
+    let camel = r#"{"profileTypeID":"a:b:c:d:e","labelSelector":"{}","start":"1","end":"2","maxNodes":"3","profileIdSelector":["x"],"traceIdSelector":["y"]}"#;
+    let m: SelectMergeProfileRequest = serde_json::from_str(camel).expect("decode");
+    assert_eq!(
+        (m.profile_type_id.as_str(), m.start, m.end, m.max_nodes),
+        ("a:b:c:d:e", 1, 2, Some(3))
+    );
+    assert_eq!(
+        (m.profile_id_selector, m.trace_id_selector),
+        (vec!["x".to_string()], vec!["y".to_string()])
     );
 }

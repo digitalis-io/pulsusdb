@@ -422,12 +422,13 @@ fn check_sample(
 
 /// One service group's pprof profile, its strings interned as they are
 /// first used and its functions, mappings and locations numbered from 1 in
-/// the order they are first reached.
+/// the order they are first reached. Issue #828: a mapping is one per
+/// dictionary mapping and flags (bits 0–3, [`Builder::mapping_flags`]).
 struct Builder<'d> {
     dict: &'d otlp::ProfilesDictionary,
     strings: HashMap<Cow<'d, str>, i64>,
     functions: HashMap<i32, u64>,
-    mappings: HashMap<i32, u64>,
+    mappings: HashMap<(i32, u8), u64>,
     locations: HashMap<i32, u64>,
     profile: pprof::Profile,
 }
@@ -524,8 +525,9 @@ impl<'d> Builder<'d> {
         }
         let mut location_id = Vec::new();
         if let Some(stack) = at(&dict.stack_table, s.stack_index) {
+            let flags = Self::mapping_flags(dict, &stack.location_indices);
             for &li in &stack.location_indices {
-                location_id.push(self.location(li)?);
+                location_id.push(self.location(li, &flags)?);
             }
         }
         self.profile.sample.push(pprof::Sample {
@@ -536,7 +538,47 @@ impl<'d> Builder<'d> {
         Ok(())
     }
 
-    fn location(&mut self, li: i32) -> Result<u64, String> {
+    /// Issue #828: each mapping's flags as one sample's stack shows them, as
+    /// the reference converts a mapping (`convertMappingBack`): all four set,
+    /// a location with no lines clears them all, and for line `i` of a
+    /// location `has_functions` needs a function, `has_line_numbers` a line
+    /// above 0, `has_inline_frames` `i ≥ 1`, and `has_filenames` the
+    /// function's file.
+    fn mapping_flags(dict: &otlp::ProfilesDictionary, locations: &[i32]) -> HashMap<i32, u8> {
+        const ALL: u8 = 0b1111;
+        let mut flags: HashMap<i32, u8> = HashMap::new();
+        for &li in locations {
+            let Some(location) = at(&dict.location_table, li) else {
+                continue;
+            };
+            let f = flags.entry(location.mapping_index).or_insert(ALL);
+            if location.lines.is_empty() {
+                *f = 0;
+            }
+            for (i, line) in location.lines.iter().enumerate() {
+                if line.function_index <= 0 {
+                    *f &= !0b0001;
+                }
+                if line.line <= 0 {
+                    *f &= !0b0100;
+                }
+                if i == 0 {
+                    *f &= !0b1000;
+                }
+                if line.function_index > 0
+                    && let Some(function) = at(&dict.function_table, line.function_index)
+                    && function.filename_strindex <= 0
+                {
+                    *f &= !0b0010;
+                }
+            }
+        }
+        flags
+    }
+
+    /// A location's id; a location keeps the mapping of the first sample
+    /// that names it.
+    fn location(&mut self, li: i32, flags: &HashMap<i32, u8>) -> Result<u64, String> {
         if let Some(&id) = self.locations.get(&li) {
             return Ok(id);
         }
@@ -544,7 +586,8 @@ impl<'d> Builder<'d> {
         let location = at(&dict.location_table, li).ok_or_else(|| {
             format!("could not access location at index {li}: index {li} out of bounds")
         })?;
-        let mapping_id = self.mapping(location.mapping_index)?;
+        let mi = location.mapping_index;
+        let mapping_id = self.mapping(mi, flags.get(&mi).copied().unwrap_or(0))?;
         let mut line = Vec::with_capacity(location.lines.len());
         for l in &location.lines {
             line.push(pprof::Line {
@@ -564,8 +607,8 @@ impl<'d> Builder<'d> {
         Ok(id)
     }
 
-    fn mapping(&mut self, mi: i32) -> Result<u64, String> {
-        if let Some(&id) = self.mappings.get(&mi) {
+    fn mapping(&mut self, mi: i32, flags: u8) -> Result<u64, String> {
+        if let Some(&id) = self.mappings.get(&(mi, flags)) {
             return Ok(id);
         }
         let dict = self.dict;
@@ -583,9 +626,12 @@ impl<'d> Builder<'d> {
             file_offset: m.file_offset,
             filename,
             build_id,
-            ..pprof::Mapping::default()
+            has_functions: flags & 0b0001 != 0,
+            has_filenames: flags & 0b0010 != 0,
+            has_line_numbers: flags & 0b0100 != 0,
+            has_inline_frames: flags & 0b1000 != 0,
         });
-        self.mappings.insert(mi, id);
+        self.mappings.insert((mi, flags), id);
         Ok(id)
     }
 

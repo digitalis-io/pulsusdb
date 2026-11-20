@@ -12,6 +12,8 @@
 //! only, in one statement.
 //! Issue #825: `SelectHeatmap`, the heatmap of profile and span totals, at
 //! the two Connect paths, in one statement.
+//! Issue #828: `SelectMergeProfile`, the merged profile as pprof, at the two
+//! Connect paths and `GET /api/profiles/v1/export`, in one statement.
 //! Issue #829: `GET /api/profiles/v1/render`, `/render-diff` and
 //! `/label-values`, and their compat paths `/pyroscope/render`,
 //! `/pyroscope/render-diff` and `/pyroscope/label-values`, each in one
@@ -22,6 +24,7 @@ mod diff;
 mod engine;
 mod heatmap;
 mod merge;
+mod pprof;
 mod render;
 pub(crate) mod routes;
 mod series;
@@ -67,6 +70,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
             post(heatmap::select_heatmap),
         )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
+            post(pprof::select_merge_profile),
+        )
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
             "/api/profiles/v1/labels",
@@ -85,6 +92,7 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/profiles/v1/select_series",
             get(series::select_series_get),
         )
+        .route("/api/profiles/v1/export", get(pprof::export_get))
         .route("/api/profiles/v1/render", get(render::render_get))
         .route("/api/profiles/v1/render-diff", get(render::render_diff_get))
         .route(
@@ -123,6 +131,10 @@ pub(crate) fn compat_router() -> Router<AppState> {
         .route(
             "/querier.v1.QuerierService/SelectHeatmap",
             post(heatmap::select_heatmap),
+        )
+        .route(
+            "/querier.v1.QuerierService/SelectMergeProfile",
+            post(pprof::select_merge_profile),
         )
         .route("/pyroscope/render", get(render::render_get))
         .route("/pyroscope/render-diff", get(render::render_diff_get))

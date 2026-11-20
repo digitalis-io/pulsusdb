@@ -1916,7 +1916,7 @@ LIMIT 20
 Ran, returning 20 rows; read 200,000 rows and 7.63 MiB — no attribute-index read at all.
 
 **What it avoids.** Both conditions are columns of `trace_spans`, so there is no join and no second
-table. `duration_ns` carries a minmax skip index at granularity 4 (`schema/schema.sql:585`), so granules
+table. `duration_ns` carries a minmax skip index at granularity 4 (`schema/schema.sql:587`), so granules
 whose largest duration is at or below two seconds are skipped without reading a row. Today
 **neither** condition is in the statement: the golden `nested_set_root.sql` shows a first statement
 with no predicate, and the root test is applied after the read.

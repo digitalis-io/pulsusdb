@@ -445,7 +445,7 @@ impl ProfileWriter {
         );
 
         let mut minted: HashMap<u32, (u64, u64)> = HashMap::new();
-        let mut entry_meta: Vec<(u32, (u64, u64))> = Vec::with_capacity(entries.len());
+        let mut entry_meta: Vec<(u32, (u64, u64), i64)> = Vec::with_capacity(entries.len());
         for e in entries {
             let id = match &e.profile_id {
                 Some(bytes) => ProfileLandingRow::profile_id_of(bytes),
@@ -453,14 +453,21 @@ impl ProfileWriter {
                     .entry(e.input)
                     .or_insert_with(|| self.mint_profile_id(received_ms)),
             };
-            entry_meta.push((e.series, id));
+            entry_meta.push((e.series, id, e.period));
             let cols = &columns[e.series as usize];
             rows.push(ProfileLandingRow::entry(org_id, received_ms, cols, e, id));
         }
 
         rows.extend(samples.into_iter().map(|s| {
-            let (series, id) = entry_meta[s.entry as usize];
-            ProfileLandingRow::sample(org_id, received_ms, &columns[series as usize], s, id)
+            let (series, id, period) = entry_meta[s.entry as usize];
+            ProfileLandingRow::sample(
+                org_id,
+                received_ms,
+                &columns[series as usize],
+                s,
+                id,
+                period,
+            )
         }));
         rows.extend(
             stacks
@@ -1066,6 +1073,7 @@ mod tests {
             profile_id: None,
             total: 1,
             duration_ns: 1,
+            period: 1,
             annotation_keys: Vec::new(),
             annotation_values: Vec::new(),
         };
@@ -1097,6 +1105,7 @@ mod tests {
                     mapping_start: 0,
                     mapping_limit: 0,
                     mapping_offset: 0,
+                    mapping_flags: 0,
                     address: 0,
                     line_functions: vec![Arc::from("f")],
                     line_system_names: vec![Arc::from("f")],

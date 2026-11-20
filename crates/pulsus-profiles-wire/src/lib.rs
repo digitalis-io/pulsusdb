@@ -11,8 +11,9 @@
 //! Issue #824: `double` is a `double` field's JSON form, and
 //! `aggregation_type` and `exemplar_type` are the time series request's
 //! two enums, in the shape of `profile_format`. Issue #825:
-//! `heatmap_query_type`, and `double`'s repeated form. Issue #829:
-//! `flamebearer`, the render routes' JSON answer.
+//! `heatmap_query_type`, and `double`'s repeated form. Issue #828: the
+//! pprof `Profile`'s JSON mapping, and `uint64`, a `uint64` field's JSON
+//! form. Issue #829: `flamebearer`, the render routes' JSON answer.
 
 pub mod connect;
 pub mod flamebearer;
@@ -22,6 +23,7 @@ mod json;
 pub mod push_v1;
 pub mod querier_v1;
 pub mod types_v1;
+pub mod uint64;
 
 /// Issue #823: the proto3 JSON form of `querier.v1.ProfileFormat` — written
 /// as its name, read from its name or its number.

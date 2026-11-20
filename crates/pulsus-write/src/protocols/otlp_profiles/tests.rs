@@ -545,3 +545,170 @@ fn m9_the_sdk_language_decides_the_go_fix_ups() {
         "pkg.F[go.shape.int]"
     );
 }
+
+/// **M10** (issue #828): each mapping's flags are what its locations in a
+/// sample's stack show, as the reference converts them: symbolised lines
+/// with files and `line > 0` set `has_functions`, `has_filenames` and
+/// `has_line_numbers` (never `has_inline_frames`, which a first line
+/// clears); an address-only location clears all four; a `line` of 0 clears
+/// `has_line_numbers`. A `has_functions` mapping then loses its bounds and
+/// addresses at ingest, as a pprof push's does.
+#[test]
+fn m10_a_mapping_carries_its_locations_flags() {
+    let dict = ProfilesDictionary {
+        string_table: st(&[
+            "",
+            "samples",
+            "count",
+            "cpu",
+            "nanoseconds",
+            "main",
+            "a",
+            "main.go",
+            "app",
+            "libx.so",
+            "lib3",
+        ]),
+        mapping_table: vec![
+            Mapping::default(),
+            Mapping {
+                memory_start: 0x40_0000,
+                memory_limit: 0x80_0000,
+                filename_strindex: 8,
+                ..Mapping::default()
+            },
+            Mapping {
+                memory_start: 0x7f_0000,
+                memory_limit: 0x7f_ffff,
+                filename_strindex: 9,
+                ..Mapping::default()
+            },
+            Mapping {
+                memory_start: 0x90_0000,
+                memory_limit: 0x9f_ffff,
+                filename_strindex: 10,
+                ..Mapping::default()
+            },
+        ],
+        function_table: vec![
+            Function::default(),
+            Function {
+                name_strindex: 5,
+                filename_strindex: 7,
+                ..Function::default()
+            },
+            Function {
+                name_strindex: 6,
+                filename_strindex: 7,
+                ..Function::default()
+            },
+        ],
+        location_table: vec![
+            Location::default(),
+            Location {
+                mapping_index: 1,
+                address: 0x40_1000,
+                lines: vec![Line {
+                    function_index: 1,
+                    line: 10,
+                    ..Line::default()
+                }],
+                ..Location::default()
+            },
+            Location {
+                mapping_index: 1,
+                address: 0x40_2000,
+                lines: vec![Line {
+                    function_index: 2,
+                    line: 20,
+                    ..Line::default()
+                }],
+                ..Location::default()
+            },
+            Location {
+                mapping_index: 2,
+                address: 0x7f_0100,
+                ..Location::default()
+            },
+            Location {
+                mapping_index: 3,
+                address: 0x90_0100,
+                lines: vec![Line {
+                    function_index: 1,
+                    line: 0,
+                    ..Line::default()
+                }],
+                ..Location::default()
+            },
+        ],
+        stack_table: vec![
+            Stack::default(),
+            Stack {
+                location_indices: vec![2, 1],
+            },
+            Stack {
+                location_indices: vec![3],
+            },
+            Stack {
+                location_indices: vec![4],
+            },
+        ],
+        link_table: vec![Link::default()],
+        attribute_table: vec![KeyValueAndUnit::default()],
+    };
+    let profile = Profile {
+        samples: (1..=3)
+            .map(|stack_index| Sample {
+                stack_index,
+                values: vec![1],
+                ..Sample::default()
+            })
+            .collect(),
+        ..profile(now_ms() as u64 * 1_000_000)
+    };
+    let req = request(dict, vec![string_kv("service.name", "otlp-svc")], profile);
+    let ins = inputs(&req);
+    let p = &ins[0].profile;
+    let flags: BTreeMap<&str, (bool, bool, bool, bool)> = p
+        .mapping
+        .iter()
+        .map(|m| {
+            (
+                p.string_table[m.filename as usize].as_str(),
+                (
+                    m.has_functions,
+                    m.has_filenames,
+                    m.has_line_numbers,
+                    m.has_inline_frames,
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        BTreeMap::from([
+            ("app", (true, true, true, false)),
+            ("libx.so", (false, false, false, false)),
+            ("lib3", (true, true, false, false)),
+        ])
+    );
+
+    let rows = parse(&req, now_ms());
+    let stored: BTreeMap<&str, Vec<(u8, u64, u64)>> =
+        rows.locations.iter().fold(BTreeMap::new(), |mut m, l| {
+            m.entry(&*l.mapping_file).or_default().push((
+                l.mapping_flags,
+                l.address,
+                l.mapping_start,
+            ));
+            m
+        });
+    assert_eq!(
+        stored,
+        BTreeMap::from([
+            ("app", vec![(7, 0, 0), (7, 0, 0)]),
+            ("libx.so", vec![(0, 0x7f_0100, 0x7f_0000)]),
+            ("lib3", vec![(3, 0, 0)]),
+        ])
+    );
+}
