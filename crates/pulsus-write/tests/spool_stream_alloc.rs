@@ -887,6 +887,7 @@ fn wide_stack_profile_push(bytes: usize) -> pulsus_write::ParsedProfileLanding {
             profile_id: None,
             total: 1,
             duration_ns: 1,
+            period: 1,
             annotation_keys: Vec::new(),
             annotation_values: Vec::new(),
         }],

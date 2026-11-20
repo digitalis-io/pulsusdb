@@ -1745,6 +1745,7 @@ mod tests {
                         trace_id: [0xab; 16],
                     },
                     id,
+                    10_000_000,
                 ),
             ),
             (
@@ -1773,6 +1774,7 @@ mod tests {
                         profile_id: None,
                         total: 40,
                         duration_ns: 10,
+                        period: 10_000_000,
                         annotation_keys: vec!["k".to_string()],
                         annotation_values: vec!["\"v\"\n".to_string()],
                     },
@@ -1791,6 +1793,7 @@ mod tests {
                         mapping_start: 1,
                         mapping_limit: 2,
                         mapping_offset: 3,
+                        mapping_flags: 15,
                         address: u64::MAX,
                         line_functions: vec![Arc::from("f")],
                         line_system_names: vec![Arc::from("f_sys")],

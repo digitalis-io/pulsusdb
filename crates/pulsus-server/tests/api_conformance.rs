@@ -966,6 +966,20 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 );
             }
         }
+        (Surface::ProfilesQuery, _) if spec.path == "/api/profiles/v1/export" => {
+            // Issue #828: the export answers the gzip of the empty
+            // `Profile`, which is no bytes.
+            assert_eq!(
+                res.content_type(),
+                Some("application/octet-stream"),
+                "{ctx}: export content-type"
+            );
+            let mut plain = Vec::new();
+            GzDecoder::new(&res.body[..])
+                .read_to_end(&mut plain)
+                .unwrap_or_else(|e| panic!("{ctx}: the export body is not gzip: {e}"));
+            assert!(plain.is_empty(), "{ctx}: export body {plain:?}");
+        }
         (Surface::ProfilesQuery, _) | (Surface::ProfilesConnect, _) => {
             // Issue #821: the base window ends before the lookback floor, so
             // the method's response message is empty and nothing is read.

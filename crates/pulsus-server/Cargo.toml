@@ -70,6 +70,9 @@ reqwest = { version = "0.12", default-features = false }
 # real dependencies.
 opentelemetry-proto.workspace = true
 prost.workspace = true
+# Issue #828: `GET /api/profiles/v1/export` answers the gzip of the pprof
+# `Profile`, the file pprof readers take as it is.
+flate2.workspace = true
 # Inbound TLS termination on the listener (issue #174, `tls.rs`): rustls
 # server config (explicit `ring` provider — see the `builder_with_provider`
 # note there), tokio-rustls for the async accept-side handshake, and
@@ -125,10 +128,6 @@ pulsus-testkit = { path = "../pulsus-testkit" }
 # (`clickhouse.workspace = true` there too).
 clickhouse.workspace = true
 tower = { workspace = true, features = ["util"] }
-# gzip-decodes `CompressionLayer` response bodies in the poll-after-end
-# regression coverage for issue #24 — dev-only, never a runtime dependency
-# (the server itself only ever *encodes* gzip, via tower-http).
-flate2.workspace = true
 # Issue #36: `tests/api_conformance.rs` snappy-compresses
 # `prompb.WriteRequest` bodies for `/api/v1/write` (its OTLP protobuf
 # fixtures use the `opentelemetry-proto`/`prost` real dependencies above,

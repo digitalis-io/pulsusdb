@@ -989,7 +989,7 @@ docs/query-to-sql.md	schema/schema.sql:550-632	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:555	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:572	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:584-604	pinned_to_another_version
-docs/query-to-sql.md	schema/schema.sql:585	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:587	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:1227	not_in_this_repository
 docs/query-to-sql.md	search_eval.rs:2443	not_in_this_repository
 docs/query-to-sql.md	search_eval.rs:3143	not_in_this_repository
@@ -1110,6 +1110,11 @@ docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/batch.go:9-38	not_in_t
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:50-78	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/stream.go:133	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/phlaredb/symdb/resolver_pprof_tree.go:135-146	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/phlaredb/symdb/resolver_pprof_tree.go:150-157	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/phlaredb/symdb/resolver_pprof_tree.go:185-197	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/phlaredb/symdb/resolver_pprof_tree.go:212-229	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/pprof/pprof.go:1302-1315	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/http.go:57	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/intervals.go:32-40	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1101	not_in_this_repository
