@@ -53,3 +53,7 @@ pulsus-logql = { path = "../crates/pulsus-logql" }
 # crate enters the lockfile.
 pulsus-model = { path = "../crates/pulsus-model" }
 pulsus-read = { path = "../crates/pulsus-read" }
+# `test-util` enables `#[tokio::test(start_paused = true)]`, so the
+# `retry_through_cut` timing tests in `traces.rs` run on a clock that only
+# the test advances.
+tokio = { workspace = true, features = ["test-util"] }
