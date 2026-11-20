@@ -13,6 +13,7 @@ use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
 use super::heatmap::{HeatmapExemplarRow, HeatmapRow};
 use super::pprof::PprofRow;
+use super::render::RenderRow;
 use super::selector::WindowLimits;
 use super::series::{TimeSeriesExemplarRow, TimeSeriesRow};
 use super::tree::TreeRow;
@@ -127,7 +128,7 @@ fn read_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Quer
 
 /// Issue #823: the settings S5 carries — [`read_settings`], and the join's
 /// build side kept on the aggregated samples. Issue #827: S7 carries them
-/// too, and issue #828 S9.
+/// too, issue #828 S9, and issue #829 the render statement.
 fn tree_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
     read_settings(config, log_comment).set("query_plan_join_swap_table", "false")
 }
@@ -237,6 +238,13 @@ impl ProfilesEngine {
     /// Issue #823: sends S5 (`super::tree`) and returns the merged tree's
     /// rows.
     pub async fn read_tree(&self, sql: &str) -> Result<Vec<TreeRow>, ProfilesReadError> {
+        let settings = tree_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #829: sends the render statement (`super::render`) and returns
+    /// the merged tree's rows and the series' rows, tagged by `part`.
+    pub async fn read_render(&self, sql: &str) -> Result<Vec<RenderRow>, ProfilesReadError> {
         let settings = tree_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
     }

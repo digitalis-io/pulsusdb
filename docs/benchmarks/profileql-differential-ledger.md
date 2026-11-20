@@ -292,6 +292,27 @@ own error, as PulsusDB does.
 - **Why:** was defects entry 47, withdrawn by #827 part B.
 - **Case:** `none`.
 
+### `label-values-passes-the-name`
+
+- **Route:** `/pyroscope/label-values`.
+- **Request:** a label other than `__name__`.
+- **PulsusDB:** `200`, the label's values over the last hour.
+- **Reference:** `400`: it sends `LabelValues` with no name
+  (`pkg/querier/http.go:57`).
+- **Why:** defects entry 49.
+- **Case:** `C37` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `render-timeline-keeps-the-window-grid`
+
+- **Route:** `/pyroscope/render`.
+- **Request:** a window that starts before the tenant's first profile.
+- **PulsusDB:** the timeline's points on the window's own steps.
+- **Reference:** the points on steps starting at the tenant's first
+  profile, so a sample can fall one slot earlier
+  (`pkg/frontend/readpath/router.go:92-113`).
+- **Why:** owner, 2026-11-19, "Record the difference"; defects entry 50.
+- **Case:** `C38` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
 ### `pprof-period-is-the-pushed-one`
 
 - **Route:** `SelectMergeProfile`, `SelectMergeStacktraces` with
@@ -302,8 +323,8 @@ own error, as PulsusDB does.
 - **Reference:** 1,000,000,000 for `process_cpu`, 524,288 for `memory`, else
   1, whatever was pushed.
 - **Why:** owner, 2026-11-19, "Write the pushed period";
-  `docs/reference-defects-we-do-not-copy.md` entry 49.
-- **Case:** C31 to C36, rule R4 in
+  `docs/reference-defects-we-do-not-copy.md` entry 51.
+- **Case:** C39 to C44, rule R4 in
   `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ### `pprof-cut-keeps-max-nodes-exactly`
@@ -319,5 +340,5 @@ own error, as PulsusDB does.
   cut location is kept whole, and every stack with no function is folded
   into `other`.
 - **Why:** owner, 2026-11-19, "Cut exactly";
-  `docs/reference-defects-we-do-not-copy.md` entry 50.
-- **Case:** `C31` and `C32` in `crates/pulsus-server/tests/profileql_differential.rs`.
+  `docs/reference-defects-we-do-not-copy.md` entry 52.
+- **Case:** `C39` and `C40` in `crates/pulsus-server/tests/profileql_differential.rs`.

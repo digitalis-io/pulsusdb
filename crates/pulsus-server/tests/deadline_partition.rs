@@ -26,8 +26,8 @@
 //! ## The profiles query paths (issue #821)
 //!
 //! Two more classes: the sixteen profiles Connect paths answer the reference's
-//! Connect error (`DEADLINE_CONNECT_PATHS`), and the six profiles `GET`
-//! routes answer as the reference's HTTP read handlers do
+//! Connect error (`DEADLINE_CONNECT_PATHS`), and the twelve profiles `GET`
+//! paths answer as the reference's HTTP read handlers do
 //! (`DEADLINE_PROFILES_HTTP_PATHS`). Both constants are source-scanned and
 //! compared with the manifest's `ProfilesConnect` and `ProfilesQuery` rows
 //! in both directions.
@@ -178,9 +178,10 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
 ];
 
-/// Issue #821 (#823 adds `/merge`, #824 `/select_series`, #828 `/export`):
-/// the seven profiles `GET` routes, which answer it as the reference's HTTP
-/// read handlers do.
+/// Issue #821 (#823 adds `/merge`, #824 `/select_series`, #828 `/export`, #829
+/// the three render routes and their three compat paths): the thirteen
+/// profiles `GET` routes, which answer it as the reference's HTTP read
+/// handlers do.
 const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/types",
     "/api/profiles/v1/labels",
@@ -189,6 +190,12 @@ const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/merge",
     "/api/profiles/v1/select_series",
     "/api/profiles/v1/export",
+    "/api/profiles/v1/render",
+    "/api/profiles/v1/render-diff",
+    "/api/profiles/v1/label-values",
+    "/pyroscope/render",
+    "/pyroscope/render-diff",
+    "/pyroscope/label-values",
 ];
 
 fn mounted_of(surface: Surface) -> BTreeSet<String> {

@@ -4,8 +4,9 @@
 //! app send is compared between the two, and against what the fixture says
 //! the answer must be. Part B of issues #823, #824, #825 and #827 adds
 //! the flame graph, the series, the heatmap and the diff (C15–C30) over a
-//! second pair of tenants holding the query fixture. Issue #828 adds the
-//! pprof export (C31–C36), compared decoded (rule R4).
+//! second pair of tenants holding the query fixture. Issue #829 part A adds
+//! the tree format, the render routes and `label-values` (C31–C38). Issue
+//! #828 adds the pprof export (C39–C44), compared decoded (rule R4).
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -224,6 +225,28 @@ enum Method {
         go_pgo: Option<(u32, bool)>,
         pprof_format: bool,
     },
+    /// Issue #829: `SelectMergeStacktraces` of `TYPE_A` over `W`, format
+    /// `PROFILE_FORMAT_TREE`.
+    Tree {
+        selector: &'static str,
+        max_nodes: Option<i64>,
+    },
+    /// Issue #829: `GET /pyroscope/render` of `TYPE_A` over `R`, or with
+    /// `early` over `E`.
+    Render {
+        selector: &'static str,
+        max_nodes: Option<i64>,
+        early: bool,
+    },
+    /// Issue #829: `GET /pyroscope/render-diff` of two `TYPE_A` selections,
+    /// both over `R`.
+    RenderDiff {
+        left: &'static str,
+        right: &'static str,
+        max_nodes: Option<i64>,
+    },
+    /// Issue #829: `GET /pyroscope/label-values?label=<label>`.
+    LabelValuesGet(&'static str),
 }
 
 impl Method {
@@ -241,7 +264,20 @@ impl Method {
                 pprof_format: true, ..
             } => "SelectMergeStacktraces",
             Method::MergeProfile { .. } => "SelectMergeProfile",
+            Method::Tree { .. } => "SelectMergeStacktraces",
+            Method::Render { .. } => "render",
+            Method::RenderDiff { .. } => "render-diff",
+            Method::LabelValuesGet(_) => "label-values",
         }
+    }
+
+    /// Issue #829: a `GET` route under `/pyroscope`, compared by status,
+    /// `Content-Type` and body bytes.
+    fn is_get(&self) -> bool {
+        matches!(
+            self,
+            Method::Render { .. } | Method::RenderDiff { .. } | Method::LabelValuesGet(_)
+        )
     }
 
     /// One of #822's four catalogue methods.
@@ -339,6 +375,16 @@ enum Fixture {
     /// Issue #828: this merged profile, §3.6's samples of fixture P, each
     /// `(path, count)`, compared decoded (R4).
     Pprof(&'static [(&'static str, i64)]),
+    /// Issue #829: the tree bytes decoded, per node in the order written:
+    /// its name, its self in the tenant's unit, and its child count.
+    Tree(&'static [(&'static str, i64, u64)]),
+    /// Issue #829: a render answer: this flame graph with the `cpu`
+    /// metadata, and a timeline of one non-zero sample summing to its
+    /// total.
+    Render(&'static Graph),
+    /// Issue #829: a render-diff answer: this diff with the `cpu` metadata
+    /// and no timeline.
+    RenderDiff(&'static DiffGraph),
 }
 
 /// One pinned answer of a ledger case: its status, and its body when the
@@ -371,6 +417,15 @@ enum Expect {
         row: &'static str,
         ours: &'static [(&'static str, i64)],
         theirs: &'static [(&'static str, i64)],
+    },
+    /// Issue #829: a ledger case on a render answer: both answers are
+    /// `Render(graph)`, and each timeline's one non-zero sample is at its
+    /// own index.
+    LedgerTimeline {
+        row: &'static str,
+        graph: &'static Graph,
+        ours: usize,
+        theirs: usize,
     },
 }
 
@@ -405,6 +460,16 @@ const fn query(method: Method) -> Request {
     Request {
         method,
         encoding: Encoding::Proto,
+        utf8: false,
+        tenancy: Tenancy::Query,
+    }
+}
+
+/// Issue #829: a `GET` request under the query fixture's pair.
+const fn get_query(method: Method) -> Request {
+    Request {
+        method,
+        encoding: Encoding::Json,
         utf8: false,
         tenancy: Tenancy::Query,
     }
@@ -582,6 +647,30 @@ static D4_RIGHT_CUT: DiffGraph = DiffGraph {
     left_ticks: 9,
     right_ticks: 10,
 };
+
+/// C31: `q-trim` as the tree, uncut.
+static Q_TRIM_TREE: &[(&str, i64, u64)] = &[
+    ("", 0, 1),
+    ("main", 0, 4),
+    ("other", 0, 1),
+    ("x", 4, 0),
+    ("e", 0, 1),
+    ("f", 1, 0),
+    ("d", 3, 0),
+    ("a", 2, 2),
+    ("c", 5, 0),
+    ("b", 17, 0),
+];
+
+/// C32: C17's `Q_TRIM_4` as the tree.
+static Q_TRIM_4_TREE: &[(&str, i64, u64)] = &[
+    ("", 0, 1),
+    ("main", 0, 2),
+    ("other", 8, 0),
+    ("a", 2, 2),
+    ("other", 5, 0),
+    ("b", 17, 0),
+];
 
 static Q_TS_POINTS: &[(i64, i64)] = &[(0, 6), (15, 12), (30, 42)];
 
@@ -917,6 +1006,91 @@ static CASES: &[Case] = &[
     },
     Case {
         id: "C31",
+        client: "reference CLI, tree format",
+        request: query(Method::Tree {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: None,
+        }),
+        expect: Expect::Parity(Fixture::Tree(Q_TRIM_TREE)),
+    },
+    Case {
+        id: "C32",
+        client: "reference CLI, tree format, max nodes set",
+        request: query(Method::Tree {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: Some(4),
+        }),
+        expect: Expect::Parity(Fixture::Tree(Q_TRIM_4_TREE)),
+    },
+    Case {
+        id: "C33",
+        client: "exploration app, export",
+        request: get_query(Method::Render {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: None,
+            early: false,
+        }),
+        expect: Expect::Parity(Fixture::Render(&Q_TRIM)),
+    },
+    Case {
+        id: "C34",
+        client: "exploration app, export, max nodes set",
+        request: get_query(Method::Render {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: Some(4),
+            early: false,
+        }),
+        expect: Expect::Parity(Fixture::Render(&Q_TRIM_4)),
+    },
+    Case {
+        id: "C35",
+        client: "exploration app, diff view",
+        request: get_query(Method::RenderDiff {
+            left: r#"{service_name="q-d4l"}"#,
+            right: r#"{service_name="q-d4r"}"#,
+            max_nodes: Some(3),
+        }),
+        expect: Expect::Parity(Fixture::RenderDiff(&D4)),
+    },
+    Case {
+        id: "C36",
+        client: "reference API, profile types",
+        request: get_query(Method::LabelValuesGet("__name__")),
+        expect: Expect::Parity(Fixture::Includes(&[TYPE_A])),
+    },
+    Case {
+        id: "C37",
+        client: "reference API, a label's values",
+        request: get_query(Method::LabelValuesGet("service_name")),
+        expect: Expect::Ledger {
+            row: "label-values-passes-the-name",
+            ours: Pin {
+                status: 200,
+                body: None,
+            },
+            theirs: Pin {
+                status: 400,
+                body: None,
+            },
+        },
+    },
+    Case {
+        id: "C38",
+        client: "exploration app, export, a window from before the first profile",
+        request: get_query(Method::Render {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: None,
+            early: true,
+        }),
+        expect: Expect::LedgerTimeline {
+            row: "render-timeline-keeps-the-window-grid",
+            graph: &Q_TRIM,
+            ours: 1,
+            theirs: 0,
+        },
+    },
+    Case {
+        id: "C39",
         client: "exploration app, export as pprof",
         request: query(merge_profile(Some(16_384), &[], None)),
         expect: Expect::LedgerPprof {
@@ -926,7 +1100,7 @@ static CASES: &[Case] = &[
         },
     },
     Case {
-        id: "C32",
+        id: "C40",
         client: "max nodes set",
         request: query(merge_profile(Some(3), &[], None)),
         expect: Expect::LedgerPprof {
@@ -936,13 +1110,13 @@ static CASES: &[Case] = &[
         },
     },
     Case {
-        id: "C33",
+        id: "C41",
         client: "the CLI's go_pgo default",
         request: query(merge_profile(None, &[], Some((5, true)))),
         expect: Expect::Parity(Fixture::Pprof(&nf::P5)),
     },
     Case {
-        id: "C34",
+        id: "C42",
         client: "exploration app, function details",
         request: Request {
             method: merge_profile(Some(500), &["main", "a"], None),
@@ -953,13 +1127,13 @@ static CASES: &[Case] = &[
         expect: Expect::Parity(Fixture::Pprof(&nf::P4)),
     },
     Case {
-        id: "C35",
+        id: "C43",
         client: "merged profile, no max nodes",
         request: query(merge_profile(None, &[], None)),
         expect: Expect::Parity(Fixture::Pprof(&nf::P1)),
     },
     Case {
-        id: "C36",
+        id: "C44",
         client: "SelectMergeStacktraces, pprof format",
         request: query(Method::MergeProfile {
             selector: r#"{service_name="q-pprof"}"#,
@@ -1046,7 +1220,8 @@ fn the_ledger_and_the_cases_name_each_other() {
     for case in CASES {
         if let Expect::Ledger { row, .. }
         | Expect::LedgerGraph { row, .. }
-        | Expect::LedgerPprof { row, .. } = case.expect
+        | Expect::LedgerPprof { row, .. }
+        | Expect::LedgerTimeline { row, .. } = case.expect
             && !headings.contains(row)
         {
             problems.push(format!(
@@ -1068,7 +1243,8 @@ fn the_ledger_and_the_cases_name_each_other() {
                 expect:
                     Expect::Ledger { row, .. }
                     | Expect::LedgerGraph { row, .. }
-                    | Expect::LedgerPprof { row, .. },
+                    | Expect::LedgerPprof { row, .. }
+                    | Expect::LedgerTimeline { row, .. },
                 ..
             }) if row == id => {}
             Some(_) => problems.push(format!(
@@ -2285,6 +2461,9 @@ fn values(method: &Method, encoding: Encoding, body: &[u8]) -> Result<Vec<String
                 .map(|r| r.names)
                 .map_err(|x| e(&x))
         }
+        (Method::LabelValuesGet(_), _) => serde_json::from_slice::<Option<Vec<String>>>(body)
+            .map(Option::unwrap_or_default)
+            .map_err(|x| e(&x)),
         (Method::Series { .. }, _) => Err("a Series answer has label sets".to_string()),
         _ => Err(format!("{} is not a catalogue method", method.name())),
     }
@@ -2333,6 +2512,129 @@ fn graph_failure(graph: &Graph, b: i64, encoding: Encoding, body: &[u8]) -> Opti
         Ok(r) => Some(format!("flame graph {:?}, want {want:?}", r.flamegraph)),
         Err(e) => Some(format!("undecodable: {e}")),
     }
+}
+
+/// Issue #829: tree bytes read back: per node in the order written, its
+/// name, its self and its child count.
+fn decode_tree(mut b: &[u8]) -> Vec<(String, i64, u64)> {
+    fn uv(b: &mut &[u8]) -> Option<u64> {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let (&byte, rest) = b.split_first()?;
+            *b = rest;
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte < 0x80 {
+                return Some(v);
+            }
+            shift += 7;
+        }
+    }
+    let mut out = Vec::new();
+    while !b.is_empty() {
+        let Some(len) = uv(&mut b).map(|l| l as usize).filter(|l| *l <= b.len()) else {
+            out.push(("<truncated>".to_string(), 0, 0));
+            break;
+        };
+        let name = String::from_utf8_lossy(&b[..len]).into_owned();
+        b = &b[len..];
+        let (Some(self_value), Some(children)) = (uv(&mut b), uv(&mut b)) else {
+            out.push(("<truncated>".to_string(), 0, 0));
+            break;
+        };
+        out.push((name, self_value as i64, children));
+    }
+    out
+}
+
+/// Issue #829: the `cpu` metadata as the render routes write it.
+fn cpu_metadata(format: &str) -> Value {
+    json!({"format": format, "spyName": "", "sampleRate": 1_000_000_000u64,
+           "units": "samples", "name": "cpu"})
+}
+
+/// Issue #829: a render answer against `graph` in the unit `b`.
+fn render_failure(graph: &Graph, b: i64, body: &[u8]) -> Option<String> {
+    let Some(v) = json_value(body) else {
+        return Some("not JSON".to_string());
+    };
+    let levels: Vec<Vec<i64>> = graph
+        .levels
+        .iter()
+        .map(|l| {
+            l.chunks(4)
+                .flat_map(|c| [c[0] * b, c[1] * b, c[2] * b, c[3]])
+                .collect()
+        })
+        .collect();
+    let want = json!({"names": graph.names, "levels": levels,
+                      "numTicks": graph.total * b, "maxSelf": graph.max_self * b});
+    if v["flamebearer"] != want {
+        return Some(format!("flamebearer {}, want {want}", v["flamebearer"]));
+    }
+    if v["metadata"] != cpu_metadata("single") {
+        return Some(format!("metadata {}", v["metadata"]));
+    }
+    let samples: Vec<u64> = v["timeline"]["samples"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    let non_zero = samples.iter().filter(|x| **x != 0).count();
+    let sum: u64 = samples.iter().sum();
+    if non_zero != 1 || i64::try_from(sum).ok() != Some(graph.total * b) {
+        return Some(format!(
+            "timeline {}: want one non-zero sample summing to {}",
+            v["timeline"],
+            graph.total * b
+        ));
+    }
+    if v["groups"] != Value::Null || v["heatmap"] != Value::Null {
+        return Some(format!("groups {}, heatmap {}", v["groups"], v["heatmap"]));
+    }
+    None
+}
+
+/// Issue #829: the index of a render answer's first non-zero timeline
+/// sample.
+fn timeline_index(body: &[u8]) -> Option<usize> {
+    json_value(body)?["timeline"]["samples"]
+        .as_array()?
+        .iter()
+        .position(|v| v.as_u64() != Some(0))
+}
+
+/// Issue #829: a render-diff answer against `g` in the unit `b`.
+fn render_diff_failure(g: &DiffGraph, b: i64, body: &[u8]) -> Option<String> {
+    let Some(v) = json_value(body) else {
+        return Some("not JSON".to_string());
+    };
+    let levels: Vec<Vec<i64>> = g
+        .levels
+        .iter()
+        .map(|l| {
+            l.chunks(7)
+                .flat_map(|c| {
+                    [
+                        c[0] * b,
+                        c[1] * b,
+                        c[2] * b,
+                        c[3] * b,
+                        c[4] * b,
+                        c[5] * b,
+                        c[6],
+                    ]
+                })
+                .collect()
+        })
+        .collect();
+    let want = json!({
+        "version": 1,
+        "flamebearer": {"names": g.names, "levels": levels,
+                        "numTicks": g.total * b, "maxSelf": g.max_self * b},
+        "metadata": cpu_metadata("double"),
+        "timeline": null, "groups": null, "heatmap": null,
+        "leftTicks": g.left_ticks * b, "rightTicks": g.right_ticks * b,
+    });
+    (v != want).then(|| format!("render-diff {v}, want {want}"))
 }
 
 fn label_pairs(labels: &[(&str, &str)]) -> Vec<LabelPair> {
@@ -2498,6 +2800,21 @@ fn check_fixture(
             };
         }
         Fixture::Graph(graph) => return graph_failure(graph, b, encoding, body),
+        Fixture::Tree(want) => {
+            let want: Vec<(String, i64, u64)> = want
+                .iter()
+                .map(|(n, s, c)| (n.to_string(), s * b, *c))
+                .collect();
+            return match decode_as::<SelectMergeStacktracesResponse>(encoding, body) {
+                Ok(r) => {
+                    let got = decode_tree(&r.tree);
+                    (got != want).then(|| format!("tree {got:?}, want {want:?}"))
+                }
+                Err(e) => Some(format!("undecodable: {e}")),
+            };
+        }
+        Fixture::Render(graph) => return render_failure(graph, b, body),
+        Fixture::RenderDiff(g) => return render_diff_failure(g, b, body),
         Fixture::DiffGraph(g) => {
             let want = FlameGraphDiff {
                 names: g.names.iter().map(|n| n.to_string()).collect(),
@@ -2639,7 +2956,10 @@ fn check_fixture(
         | Fixture::Graph(_)
         | Fixture::DiffGraph(_)
         | Fixture::Points(_)
-        | Fixture::Slots(_) => None,
+        | Fixture::Slots(_)
+        | Fixture::Tree(_)
+        | Fixture::Render(_)
+        | Fixture::RenderDiff(_) => None,
     }
 }
 
@@ -2740,11 +3060,24 @@ fn value_checks(t1: bool) -> Vec<(&'static str, &'static str, i64)> {
 // Requests
 // ---------------------------------------------------------------------
 
-/// The run's two windows, in milliseconds: `W` and `Q` (§3, D6).
+/// The run's windows, in milliseconds: `W` and `Q` (§3, D6), and issue
+/// #829's `R`, the render routes' window: `W` with its start moved to 1 ms
+/// before a 15 s boundary. The start is never on a boundary, so the
+/// timeline's alignment is always tested. And each step of the series ends
+/// 1 ms before a boundary, so a point falls in the 15 s slot of the
+/// profiles it holds: the reference, asked for a window that starts before
+/// the tenant's oldest profile, places the point at that profile's own
+/// time (`pkg/frontend/readpath/router.go:92-113` starts its series there),
+/// and the two then land in one slot. `E`, C38's window, starts 1 ms after
+/// the 15 s boundary before `q-trim`, the query tenants' first profile, so
+/// each step ends 1 ms after a boundary and our point falls in the slot
+/// after the profile's own (the fixture keeps that profile off a boundary).
 #[derive(Debug, Clone, Copy)]
 struct Windows {
     w: (i64, i64),
     q: (i64, i64),
+    r: (i64, i64),
+    e: (i64, i64),
 }
 
 /// `msg` in `encoding`.
@@ -2782,6 +3115,24 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
                 ..side(selector, *max_nodes)
             };
             encoded(&msg, encoding)
+        }
+        (
+            Method::Tree {
+                selector,
+                max_nodes,
+            },
+            _,
+        ) => {
+            let msg = SelectMergeStacktracesRequest {
+                // `PROFILE_FORMAT_TREE`.
+                format: 2,
+                ..side(selector, *max_nodes)
+            };
+            encoded(&msg, encoding)
+        }
+        // Issue #829: a `GET` route's parameters are its query string.
+        (Method::Render { .. } | Method::RenderDiff { .. } | Method::LabelValuesGet(_), _) => {
+            Vec::new()
         }
         (Method::SelectSeries { selector, group_by }, _) => {
             let msg = SelectSeriesRequest {
@@ -2887,7 +3238,7 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
             }
         }
         // The exploration app's function-details body, as it writes it
-        // (C34).
+        // (C42).
         (
             Method::MergeProfile {
                 selector,
@@ -2976,8 +3327,66 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
     }
 }
 
+/// Issue #829: a `GET` route's path and query string, `max-nodes` as the
+/// exploration app sends it.
+fn get_target(method: &Method, win: Windows) -> String {
+    let (from, until) = match method {
+        Method::Render { early: true, .. } => win.e,
+        _ => win.r,
+    };
+    let mut params: Vec<(&str, String)> = Vec::new();
+    let max = |n: &Option<i64>| n.map(|n| ("max-nodes", n.to_string()));
+    let route = match method {
+        Method::Render {
+            selector,
+            max_nodes,
+            ..
+        } => {
+            params.push(("query", format!("{TYPE_A}{selector}")));
+            params.push(("from", from.to_string()));
+            params.push(("until", until.to_string()));
+            params.extend(max(max_nodes));
+            "render"
+        }
+        Method::RenderDiff {
+            left,
+            right,
+            max_nodes,
+        } => {
+            params.push(("leftQuery", format!("{TYPE_A}{left}")));
+            params.push(("leftFrom", from.to_string()));
+            params.push(("leftUntil", until.to_string()));
+            params.push(("rightQuery", format!("{TYPE_A}{right}")));
+            params.push(("rightFrom", from.to_string()));
+            params.push(("rightUntil", until.to_string()));
+            params.extend(max(max_nodes));
+            "render-diff"
+        }
+        Method::LabelValuesGet(label) => {
+            params.push(("label", label.to_string()));
+            "label-values"
+        }
+        _ => panic!("{} is not a GET route", method.name()),
+    };
+    let query: Vec<String> = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", encode_query(v)))
+        .collect();
+    format!("/pyroscope/{route}?{}", query.join("&"))
+}
+
 /// Sends `request` to `server` as `tenant` (`None`: no header).
 fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) -> Res {
+    if request.method.is_get() {
+        let headers: Vec<(&str, &str)> = tenant.map(|t| ("X-Scope-OrgID", t)).into_iter().collect();
+        return call(
+            server,
+            "GET",
+            &get_target(&request.method, win),
+            &headers,
+            &[],
+        );
+    }
     let body = request_body(&request.method, request.encoding, win);
     let (content_type, accept) = match (request.encoding, request.utf8) {
         (Encoding::Proto, false) => ("application/proto", None),
@@ -3010,7 +3419,17 @@ fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) 
 /// `LabelValues` proto for `rx` over `w`, as `tenant`.
 fn rx_values(server: &Server, tenant: &str, w: (i64, i64)) -> Option<Vec<String>> {
     let request = proto(Method::LabelValues("rx", &["{}"]), false);
-    let res = send(server, &request, Some(tenant), Windows { w, q: w });
+    let res = send(
+        server,
+        &request,
+        Some(tenant),
+        Windows {
+            w,
+            q: w,
+            r: w,
+            e: w,
+        },
+    );
     if res.status != 200 {
         return None;
     }
@@ -3097,6 +3516,16 @@ fn json_value(body: &[u8]) -> Option<Value> {
 fn parity(request: &Request, ours: &Res, theirs: &Res) -> Option<&'static str> {
     if ours.status != theirs.status {
         return Some("status differs");
+    }
+    // Issue #829: a `GET` route's answer is compared byte for byte.
+    if request.method.is_get() {
+        return if ours.content_type != theirs.content_type {
+            Some("Content-Type differs")
+        } else if ours.body != theirs.body {
+            Some("bodies differ")
+        } else {
+            None
+        };
     }
     match (&request.method, request.encoding) {
         // Issue #828 (R4): decoded, `period` set aside; bodies are not
@@ -3420,13 +3849,20 @@ async fn profileql_matches_the_reference() {
     };
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let t0_s = (now_ms - 5 * 60_000).div_euclid(1000);
+    let mut t0_s = (now_ms - 5 * 60_000).div_euclid(1000);
+    // Issue #829: `q-trim`, pushed at `t0_s + 1`, is kept off a 15 s
+    // boundary, where C38's two timelines could not differ.
+    if (t0_s + 1) % 15 == 0 {
+        t0_s -= 1;
+    }
     let w = (now_ms - HOUR_MS, now_ms + HOUR_MS);
     let s0_s = t0_s + 180;
     let s0_ms = s0_s * 1000;
     let win = Windows {
         w,
         q: (s0_ms, s0_ms + 60_500),
+        r: (w.0.div_euclid(15_000) * 15_000 + 14_999, w.1),
+        e: (((t0_s + 1) * 1000).div_euclid(15_000) * 15_000 + 1, w.1),
     };
     let mut mismatches = Mismatches::default();
 
@@ -3537,7 +3973,7 @@ async fn profileql_matches_the_reference() {
     eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
-    // §4: C0–C36.
+    // §4: C0–C44.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {
@@ -3588,6 +4024,42 @@ async fn profileql_matches_the_reference() {
                             &format!(
                                 "ledger row `{row}`: the two agree, so the reference changed \
                                  and the row is retired"
+                            ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    }
+                }
+                Expect::LedgerTimeline {
+                    row,
+                    graph,
+                    ours: io,
+                    theirs: it,
+                } => {
+                    let unit = unit(is_t1);
+                    let failures: Vec<String> = [(&a, io, &ours), (&b, it, &reference)]
+                        .into_iter()
+                        .filter_map(|(res, index, server)| {
+                            let why = if res.status != 200 {
+                                Some(format!("status {}, want 200", res.status))
+                            } else {
+                                render_failure(graph, unit, &res.body).or_else(|| {
+                                    let at = timeline_index(&res.body);
+                                    (at != Some(index))
+                                        .then(|| format!("non-zero sample at {at:?}, want {index}"))
+                                })
+                            };
+                            why.map(|w| format!("{}: {w}", server.name))
+                        })
+                        .collect();
+                    if !failures.is_empty() {
+                        mismatches.both(
+                            &what,
+                            &format!(
+                                "ledger row `{row}`: an answer is not its pin: {}",
+                                failures.join("; ")
                             ),
                             &a,
                             &b,

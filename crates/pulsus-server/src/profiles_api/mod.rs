@@ -14,6 +14,10 @@
 //! the two Connect paths, in one statement.
 //! Issue #828: `SelectMergeProfile`, the merged profile as pprof, at the two
 //! Connect paths and `GET /api/profiles/v1/export`, in one statement.
+//! Issue #829: `GET /api/profiles/v1/render`, `/render-diff` and
+//! `/label-values`, and their compat paths `/pyroscope/render`,
+//! `/pyroscope/render-diff` and `/pyroscope/label-values`, each in one
+//! statement; `SelectMergeStacktraces` with `PROFILE_FORMAT_TREE`.
 
 pub(crate) mod connect;
 mod diff;
@@ -21,6 +25,7 @@ mod engine;
 mod heatmap;
 mod merge;
 mod pprof;
+mod render;
 pub(crate) mod routes;
 mod series;
 
@@ -88,10 +93,17 @@ pub(crate) fn router() -> Router<AppState> {
             get(series::select_series_get),
         )
         .route("/api/profiles/v1/export", get(pprof::export_get))
+        .route("/api/profiles/v1/render", get(render::render_get))
+        .route("/api/profiles/v1/render-diff", get(render::render_diff_get))
+        .route(
+            "/api/profiles/v1/label-values",
+            get(render::label_values_get),
+        )
 }
 
-/// The compat surface: the Connect paths at the root. Mounting it is
-/// `crate::compat::apply_aliases`'s job.
+/// The compat surface: the Connect paths at the root, and the render
+/// routes under `/pyroscope`. Mounting it is `crate::compat::apply_aliases`'s
+/// job.
 pub(crate) fn compat_router() -> Router<AppState> {
     Router::new()
         .route(
@@ -124,6 +136,9 @@ pub(crate) fn compat_router() -> Router<AppState> {
             "/querier.v1.QuerierService/SelectMergeProfile",
             post(pprof::select_merge_profile),
         )
+        .route("/pyroscope/render", get(render::render_get))
+        .route("/pyroscope/render-diff", get(render::render_diff_get))
+        .route("/pyroscope/label-values", get(render::label_values_get))
 }
 
 #[cfg(test)]

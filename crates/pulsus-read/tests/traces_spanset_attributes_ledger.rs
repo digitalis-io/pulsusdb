@@ -397,7 +397,7 @@ fn the_mixed_type_defect_is_indexed_and_explained_in_the_defects_document() {
 /// issue #601 part 1 entry 37, issue #649 entry 38, issue #493 part 2 entry 39,
 /// issue #764 entry 40, issue #823 entry 41, issue #824 entry 42, issue #818
 /// entries 43–46, issue #827 entry 47, withdrawn in its part B, issue #819 entries 47–48,
-/// issue #828 entries 49–50).
+/// issue #829 entries 49–50, issue #828 entries 51–52).
 ///
 /// *RED when:* two entries carry the same number, which is exactly what
 /// both branches of this merge wrote (each added its own entry 23), or an
@@ -416,16 +416,16 @@ fn the_defects_document_numbers_its_entries_once_each_and_holds_fifty() {
     };
     let headings = numbers(|l| l.strip_prefix("## ")?.split('.').next());
     let index_rows = numbers(|l| l.strip_prefix("| [")?.split(']').next());
-    let want: Vec<u32> = (1..=50).collect();
+    let want: Vec<u32> = (1..=52).collect();
     assert_eq!(
         headings, want,
-        "the defects document's `## <n>.` headings must be 1..=50, once each and in order — \
+        "the defects document's `## <n>.` headings must be 1..=52, once each and in order — \
          a duplicated number is what a merge of two branches that each wrote entry 23 \
          produces"
     );
     assert_eq!(
         index_rows, want,
-        "the index table's rows must be 1..=50, once each and in order — the heading and the \
+        "the index table's rows must be 1..=52, once each and in order — the heading and the \
          index row are two separate edits"
     );
 }

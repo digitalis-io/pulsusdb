@@ -13,9 +13,10 @@
 //! two enums, in the shape of `profile_format`. Issue #825:
 //! `heatmap_query_type`, and `double`'s repeated form. Issue #828: the
 //! pprof `Profile`'s JSON mapping, and `uint64`, a `uint64` field's JSON
-//! form.
+//! form. Issue #829: `flamebearer`, the render routes' JSON answer.
 
 pub mod connect;
+pub mod flamebearer;
 pub mod google_v1;
 pub mod int64;
 mod json;

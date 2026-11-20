@@ -53,12 +53,12 @@ fn tree_request<'a>(
 }
 
 /// The diff `msg` asks for, in one statement, or none when both windows
-/// end before the lookback floor.
-async fn flame_graph_diff(
+/// end before the lookback floor. Issue #829: `render-diff` answers it too.
+pub(super) async fn flame_graph_diff(
     state: &AppState,
     tenant: &Tenant,
     msg: DiffRequest,
-) -> Result<FlameGraphDiff, ConnectError> {
+) -> Result<flamegraph_diff::FlameGraphDiff, ConnectError> {
     let left = msg.left.unwrap_or_default();
     let right = msg.right.unwrap_or_default();
     let (left_call_site, right_call_site) = (call_site(&left), call_site(&right));
@@ -71,18 +71,18 @@ async fn flame_graph_diff(
         now_ms(),
     )?
     else {
-        return Ok(wire(flamegraph_diff::flame_graph_diff(&[], 0, 0)?));
+        return Ok(flamegraph_diff::flame_graph_diff(&[], 0, 0)?);
     };
     let sql = planned.sql.as_str();
     let rows = with_engine(state, tenant, |engine| async move {
         Ok(engine.read_diff(sql).await?)
     })
     .await?;
-    Ok(wire(flamegraph_diff::flame_graph_diff(
+    Ok(flamegraph_diff::flame_graph_diff(
         &rows,
         planned.left_max_nodes,
         planned.right_max_nodes,
-    )?))
+    )?)
 }
 
 fn wire(g: flamegraph_diff::FlameGraphDiff) -> FlameGraphDiff {
@@ -114,7 +114,7 @@ pub(crate) async fn diff(
     let answer = flame_graph_diff(&state, &tenant, msg)
         .await
         .map(|g| DiffResponse {
-            flamegraph: Some(g),
+            flamegraph: Some(wire(g)),
         });
     finish(codec, answer)
 }

@@ -6,7 +6,8 @@
 //! series of profile totals (`series`). Issue #827: the diff of two
 //! selections, its statement (`diff`) and its trim (`flamegraph_diff`).
 //! Issue #825: the heatmap of profile and span totals (`heatmap`). Issue
-//! #828: the merged profile as pprof (`pprof`).
+//! #828: the merged profile as pprof (`pprof`). Issue #829: the render
+//! route's one statement and its timeline (`render`).
 
 pub mod catalogue;
 pub mod diff;
@@ -16,6 +17,7 @@ pub mod flamegraph;
 pub mod flamegraph_diff;
 pub mod heatmap;
 pub mod pprof;
+pub mod render;
 pub mod selector;
 pub mod series;
 pub mod tenant_scope;

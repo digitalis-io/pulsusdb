@@ -101,7 +101,8 @@ pub(crate) const DEADLINE_GRPC_PATHS: &[&str] = &[
 ];
 
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
-/// adds `/merge`, #824 `/select_series`, #828 `/export`).
+/// adds `/merge`, #824 `/select_series`, #828 `/export`, #829 the three
+/// render routes and their compat paths).
 /// They answer a deadline as the reference's HTTP read handlers answer one
 /// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
 /// [`DEADLINE_CONNECT_PATHS`].
@@ -113,6 +114,12 @@ pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/merge",
     "/api/profiles/v1/select_series",
     "/api/profiles/v1/export",
+    "/api/profiles/v1/render",
+    "/api/profiles/v1/render-diff",
+    "/api/profiles/v1/label-values",
+    "/pyroscope/render",
+    "/pyroscope/render-diff",
+    "/pyroscope/label-values",
 ];
 
 /// `path` matches `template`, whose one `{name}` is a non-empty segment.
@@ -561,10 +568,10 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823, #824, #827, #825, #828): the eighteen Connect paths answer a
-    /// deadline as a Connect error, the seven `GET` routes (`{name}` as `env`) as the
-    /// reference's HTTP handlers do; the profiles ingest path keeps the bare
-    /// `408`.
+    /// C6 (issue #821, #823, #824, #827, #825, #828, #829): the eighteen Connect
+    /// paths answer a deadline as a Connect error, the thirteen `GET` paths
+    /// (`{name}` as `env`) as the reference's HTTP handlers do; the profiles
+    /// ingest path keeps the bare `408`.
     #[test]
     fn c6_the_profiles_query_paths_answer_a_connect_deadline() {
         for path in [
@@ -597,6 +604,12 @@ mod tests {
             "/api/profiles/v1/merge",
             "/api/profiles/v1/select_series",
             "/api/profiles/v1/export",
+            "/api/profiles/v1/render",
+            "/api/profiles/v1/render-diff",
+            "/api/profiles/v1/label-values",
+            "/pyroscope/render",
+            "/pyroscope/render-diff",
+            "/pyroscope/label-values",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
@@ -616,7 +629,7 @@ mod tests {
             "/querier.v1.QuerierService/LabelNamesX",
             "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
             "/api/profiles/v1/querier.v1.QuerierService/",
-            "/api/profiles/v1/render",
+            "/api/profiles/v1/render/x",
             "/api/profiles/v1/label/a/b/values",
             "/api/profiles/v1/label//values",
             "/settings.v1.SettingsService/Get",

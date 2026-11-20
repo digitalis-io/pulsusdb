@@ -287,12 +287,14 @@ pub enum Surface {
     /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
-    /// The profiles query API's six `GET` routes (issue #821, docs/api.md
+    /// The profiles query API's twelve `GET` routes (issue #821, docs/api.md
     /// §5): `types`, `labels`, `label/{name}/values` and `series`, `merge`
-    /// (#823) and `select_series` (#824). Success is
-    /// the method's JSON response message; against this suite's empty
+    /// (#823), `select_series` (#824), and `render`, `render-diff` and
+    /// `label-values` (#829), native and at their three compat paths. Success
+    /// is the method's JSON response message; against this suite's empty
     /// databases the base window ends before the lookback floor, so the
-    /// body is `{}` and nothing is read. Errors are the Connect JSON body
+    /// body is `{}` and nothing is read, except the render routes' answers
+    /// (`api_conformance.rs`). Errors are the Connect JSON body
     /// `{"code","message"}`.
     ProfilesQuery,
     /// The profiles query API's sixteen Connect paths (issue #821): the
@@ -1808,6 +1810,17 @@ const PROFILES_GET_BASE_QUERY: &str = "from=1000&until=4000";
 /// Issue #821: the same window as a Connect JSON body, in milliseconds.
 const PROFILES_CONNECT_BASE_BODY: &str = r#"{"start":"1000","end":"4000"}"#;
 
+/// Issue #829: `render`'s base request: a type, the empty selector and the
+/// same window, in seconds.
+const PROFILES_RENDER_BASE_QUERY: &str =
+    "query=process_cpu:cpu:nanoseconds:cpu:nanoseconds%7B%7D&from=1000&until=4000";
+
+/// Issue #829: that request on both sides of `render-diff`.
+const PROFILES_RENDER_DIFF_BASE_QUERY: &str = "leftQuery=process_cpu:cpu:nanoseconds:cpu:nanoseconds%7B%7D&leftFrom=1000&leftUntil=4000&rightQuery=process_cpu:cpu:nanoseconds:cpu:nanoseconds%7B%7D&rightFrom=1000&rightUntil=4000";
+
+/// Issue #829: `label-values`'s base request, which reads the last hour.
+const PROFILES_LABEL_VALUES_BASE_QUERY: &str = "label=pod";
+
 /// Issue #827: that window on both sides of a `Diff`.
 const PROFILES_DIFF_BASE_BODY: &str =
     r#"{"left":{"start":"1000","end":"4000"},"right":{"start":"1000","end":"4000"}}"#;
@@ -3195,6 +3208,73 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: PROFILES_HEATMAP_BASE_BODY,
+        cases: &[],
+    },
+    // -- Profiles render routes (issue #829, docs/api.md §5) ------------
+    RouteSpec {
+        path: "/api/profiles/v1/render",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_RENDER_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/render-diff",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_RENDER_DIFF_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/label-values",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_LABEL_VALUES_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/pyroscope/render",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_RENDER_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/pyroscope/render-diff",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_RENDER_DIFF_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/pyroscope/label-values",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_LABEL_VALUES_BASE_QUERY,
         cases: &[],
     },
     // -- OTLP over gRPC (issue #816, docs/api.md §1.1) -------------------

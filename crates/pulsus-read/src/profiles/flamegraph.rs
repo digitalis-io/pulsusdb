@@ -177,6 +177,12 @@ pub fn flame_graph_with_tree(
     Ok((flame_graph_of(&tree, raw), tree_bytes(&tree)))
 }
 
+/// Issue #829: the trimmed tree's bytes alone ([`tree_bytes`]), steps 1
+/// and 2 with `m`, for `PROFILE_FORMAT_TREE`.
+pub fn tree_only(rows: &[TreeRow], m: i64) -> Result<Vec<u8>, ProfilesReadError> {
+    Ok(tree_bytes(&truncated(merged_tree(rows, m)?, m)))
+}
+
 /// The tree's bytes as the reference's `MarshalTruncate` writes them
 /// (`pkg/model/tree.go`): depth first from a virtual root (name `""`, self
 /// 0), last pushed first; per node `uvarint(name length)`, the name,
@@ -546,6 +552,53 @@ mod tests {
         let (graph, bytes) = flame_graph_with_tree(&r, 8192, 0).expect("a graph");
         assert_eq!(graph, flame_graph(&r, 8192, 0).expect("a graph"));
         assert_eq!(bytes, tree_bytes(&tree));
+    }
+
+    /// The tree bytes read back: per node in the order written, its name,
+    /// its self and its child count.
+    fn decode_tree(mut b: &[u8]) -> Vec<(String, i64, u64)> {
+        fn uv(b: &mut &[u8]) -> u64 {
+            let (mut v, mut shift) = (0u64, 0);
+            loop {
+                let byte = b[0];
+                *b = &b[1..];
+                v |= u64::from(byte & 0x7f) << shift;
+                if byte < 0x80 {
+                    return v;
+                }
+                shift += 7;
+            }
+        }
+        let mut out = Vec::new();
+        while !b.is_empty() {
+            let len = uv(&mut b) as usize;
+            let name = String::from_utf8(b[..len].to_vec()).expect("a UTF-8 name");
+            b = &b[len..];
+            let self_value = uv(&mut b) as i64;
+            let children = uv(&mut b);
+            out.push((name, self_value, children));
+        }
+        out
+    }
+
+    /// T1 (issue #829): `PROFILE_FORMAT_TREE`'s bytes are steps 1 and 2's
+    /// tree at `m`: at 4, `d`, `e` and `other` cut into a stub of 8, then
+    /// `c` into `a`'s `other`; children written in reverse name order.
+    #[test]
+    fn t1_tree_only() {
+        let bytes = tree_only(&fixture(), 4).expect("the bytes");
+        let n = |name: &str, s: i64, c: u64| (name.to_string(), s, c);
+        assert_eq!(
+            decode_tree(&bytes),
+            vec![
+                n("", 0, 1),
+                n("main", 0, 2),
+                n("other", 8, 0),
+                n("a", 2, 2),
+                n("other", 5, 0),
+                n("b", 17, 0),
+            ]
+        );
     }
 
     /// F5 (D11): a kept child named `other` takes its cut siblings' sum, so

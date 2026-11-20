@@ -102,8 +102,10 @@ replaces one.
 | [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
 | [47](#47-a-jfr-lock-delay-is-stored-as-its-clock-ticks) | profiles reference | ingest | C | A JFR lock or park delay is stored as its clock-tick count labelled nanoseconds: 2.3 times too large in the library's own test recording. |
 | [48](#48-a-jfr-wall-clock-samples-count-is-carried-into-every-later-event) | profiles reference | ingest | C | In a JFR recording holding wall-clock samples, every later CPU, allocation or lock event counts as the last wall-clock sample's count. |
-| [49](#49-the-pprof-export-writes-a-period-nobody-pushed) | profiles reference | queries | C | A CPU profile pushed with a 10 ms period is exported stating a 1 s period. |
-| [50](#50-the-pprof-exports-cut-keeps-a-frame-below-its-threshold-and-drops-unsymbolised-stacks-addresses) | profiles reference | queries | C, D | An export with a node limit keeps a function the limit cut, and replaces every stack of unsymbolised addresses with `other`. |
+| [49](#49-label-values-drops-the-label-it-is-asked-for) | profiles reference | queries | C | `/pyroscope/label-values?label=service_name` answers `400` instead of the values of `service_name`. |
+| [50](#50-a-render-timeline-from-before-a-tenants-first-profile-leaves-the-windows-grid) | profiles reference | queries | A | A render window that starts before a tenant's first profile puts that profile's sample one step earlier than the same window does once older data exists. |
+| [51](#51-the-pprof-export-writes-a-period-nobody-pushed) | profiles reference | queries | C | A CPU profile pushed with a 10 ms period is exported stating a 1 s period. |
+| [52](#52-the-pprof-exports-cut-keeps-a-frame-below-its-threshold-and-drops-unsymbolised-stacks-addresses) | profiles reference | queries | C, D | An export with a node limit keeps a function the limit cut, and replaces every stack of unsymbolised addresses with `other`. |
 
 ---
 
@@ -2559,7 +2561,64 @@ Pinned by `j6_an_allocation_counts_once_after_a_wall_sample` in
 
 ---
 
-## 49. The pprof export writes a period nobody pushed
+## 49. `label-values` drops the label it is asked for
+
+**The profiles reference · queries · test C**
+
+### What the reference does
+
+`GET /pyroscope/label-values?label=<name>` reads `label`, and for any name but `__name__` sends
+`LabelValues` with an empty request (`pkg/querier/http.go:57`): no name, no matchers and no window.
+The method refuses an empty name, so the route answers `400` for every label.
+
+### Why that is wrong rather than different
+
+The one input the route takes is dropped before it is used (**C**), so the route answers no label's
+values.
+
+### What PulsusDB does
+
+The label's values over the last hour, with no matchers (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `label-values-passes-the-name` (the profiles differential's ledger, issue #822).
+Pinned by case C37 of `crates/pulsus-server/tests/profileql_differential.rs`.
+
+---
+
+## 50. A render timeline from before a tenant's first profile leaves the window's grid
+
+**The profiles reference · queries · test A**
+
+### What the reference does
+
+The time series behind a render timeline is read in steps from the window's start, each point at
+the end of its step. When the window starts before the tenant's oldest profile, the read is split
+there (`pkg/frontend/readpath/router.go:92-113`): the part from the oldest profile on starts its own
+steps at that profile's time, so each point sits at that grid instead of the window's, and a
+profile falls one timeline slot earlier than the window's own grid puts it.
+
+### Why that is wrong rather than different
+
+One request answers on two grids (**A**): the same window over the same profiles puts a sample in
+one slot while the tenant's data begins inside the window, and in the next slot once older data
+exists.
+
+### What PulsusDB does
+
+The series always steps from the window's start, as the timeline's own `durationDelta` says
+(`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `render-timeline-keeps-the-window-grid` (the profiles differential's ledger, issue #822).
+Pinned by case C38 of `crates/pulsus-server/tests/profileql_differential.rs`. Owner decision,
+2026-11-19: "Record the difference".
+
+---
+
+## 51. The pprof export writes a period nobody pushed
 
 **The profiles reference · queries · test C**
 
@@ -2588,7 +2647,7 @@ Ledger row `pprof-period-is-the-pushed-one` (the profiles differential's ledger,
 
 ---
 
-## 50. The pprof export's cut keeps a frame below its threshold and drops unsymbolised stacks' addresses
+## 52. The pprof export's cut keeps a frame below its threshold and drops unsymbolised stacks' addresses
 
 **The profiles reference · queries · tests C, D**
 

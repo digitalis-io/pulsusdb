@@ -985,7 +985,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // the method's response message is empty and nothing is read.
             // Issue #823: the merge paths answer the empty flame graph, as
             // the reference answers an empty window. Issue #827: the diff
-            // paths answer the empty diff.
+            // paths answer the empty diff. Issue #829: the render routes answer
+            // the empty flamebearer, and `label-values` reads the last hour.
             assert_eq!(
                 res.content_type(),
                 Some("application/json"),
@@ -1000,6 +1001,22 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                     .to_string()
             } else if spec.path == "/api/profiles/v1/merge" {
                 EMPTY_FLAME_GRAPH.to_string()
+            } else if spec.path.ends_with("/render") {
+                // Issue #829: the empty flamebearer, and the request's own
+                // window's timeline at 15 s: 990 s to 3,990 s, 200 zeros.
+                let zeros = vec!["0"; 200].join(",");
+                format!(
+                    r#"{{"version":1,"flamebearer":{{"names":["total"],"levels":[[0,0,0,0]],"numTicks":0,"maxSelf":0}},"metadata":{{"format":"single","spyName":"","sampleRate":1000000000,"units":"samples","name":"cpu"}},"timeline":{{"startTime":990,"samples":[{zeros}],"durationDelta":15,"watermarks":null}},"groups":null,"heatmap":null}}"#
+                ) + "\n"
+            } else if spec.path.ends_with("/render-diff") {
+                concat!(
+                    r#"{"version":1,"flamebearer":{"names":["total"],"levels":[[0,0,0,0,0,0,0]],"numTicks":0,"maxSelf":0},"metadata":{"format":"double","spyName":"","sampleRate":1000000000,"units":"samples","name":"cpu"},"timeline":null,"groups":null,"heatmap":null}"#,
+                    "\n"
+                )
+                .to_string()
+            } else if spec.path.ends_with("/label-values") {
+                // Issue #829: the last hour of an empty database.
+                "null\n".to_string()
             } else {
                 "{}".to_string()
             };
