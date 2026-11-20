@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- Issue #888: T9 in crates/pulsus-write/tests/live_cluster_landing.rs reads each
+     failed connection try, logged at Information, from system.text_log. -->
+<clickhouse>
+    <logger><level>trace</level></logger>
+    <text_log>
+        <database>system</database>
+        <table>text_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <level>trace</level>
+    </text_log>
+</clickhouse>
