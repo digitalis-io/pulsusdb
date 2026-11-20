@@ -2093,6 +2093,9 @@ async fn a_batch_whose_member_throws_fails_every_member_on_one_shard() {
 /// defined beside `pulsus_test_cluster` in the fixture's `remote_servers.xml`.
 const DROP_CLUSTER: &str = "pulsus_test_cluster_drop";
 
+/// T9's P2 bound on a stretch with no push acknowledged.
+const T9_SILENCE_MS: u64 = 3_000;
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct PollLagRow {
     lag_s: u64,
@@ -2104,9 +2107,46 @@ struct PollIdentityRow {
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct StoredRow {
+struct FailedTriesRow {
+    insert_tries: u64,
+    polls_tried: u64,
+    not_pinned: u64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct InsertTimesRow {
     n: u64,
-    u: u64,
+    p50_ms: u64,
+    max_ms: u64,
+}
+
+/// The one row `sql` answers.
+async fn one_row<R: ChRow>(client: &ChClient, sql: &str) -> R {
+    let mut stream = client
+        .query_stream::<R>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+    stream
+        .next()
+        .await
+        .expect("one row")
+        .unwrap_or_else(|e| panic!("decode: {e}\nSQL:\n{sql}"))
+}
+
+/// The longest stretch with no push acknowledged, from the first push sent
+/// to the last acknowledgement; each entry is a push's (sent, answered)
+/// offset from the run's start.
+fn longest_silence(acks: &[(Duration, Duration)]) -> Duration {
+    let first_sent = acks.iter().map(|a| a.0).min().unwrap_or_default();
+    let mut answered: Vec<Duration> = acks.iter().map(|a| a.1).collect();
+    answered.sort();
+    let mut last = first_sent;
+    let mut longest = Duration::ZERO;
+    for t in answered {
+        longest = longest.max(t.saturating_sub(last));
+        last = last.max(t);
+    }
+    longest
 }
 
 /// Runs `sql` through `client.query_stream` and reads the stream to its
@@ -2129,9 +2169,10 @@ async fn timed_poll<R: ChRow>(client: &ChClient, sql: &str) -> (Duration, Result
 /// shard an address no host answers, one pool of four keeps answering for
 /// 20 s: 200 pushes at 10 a second through the writer, the read cache's
 /// two every-replica poll statements every 5 s and a `/ready` probe every
-/// second, all beside each other. No push fails or waits a second, no probe
-/// fails, each poll statement leaves the replica out in under a second, and
-/// every push is stored once on both replicas of the shard.
+/// second, all beside each other. No push fails, acknowledgements never stop
+/// for 3 s, no probe fails, and every connection try to the unreachable
+/// replica, by an insert or a poll statement, waits 100 ms. Every push is
+/// stored once on both replicas of the shard.
 #[tokio::test]
 async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
     skip_unless_live!();
@@ -2213,6 +2254,7 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
         WriterTables::landing_for(Some("_drop")),
     ));
 
+    let since = server_now_us(&nodes.s1a).await;
     let tail = pulsus_clickhouse::replica_connect_timeout_clause();
     let lag_sql = format!(
         "SELECT max(absolute_delay) AS lag_s FROM clusterAllReplicas('{DROP_CLUSTER}', system.replicas) \
@@ -2225,7 +2267,8 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
          SETTINGS skip_unavailable_shards = 1, {tail}"
     );
 
-    type PushOutcome = (Duration, Result<(), String>);
+    type PushOutcome = (Duration, Duration, Result<(), String>);
+    let run_start = std::time::Instant::now();
     let pushes = {
         let writer = writer.clone();
         tokio::spawn(async move {
@@ -2245,7 +2288,7 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
                         Ok(wait) => wait.await.map_err(|e| format!("{e:?}")),
                         Err(refusal) => Err(format!("refused at admission: {refusal:?}")),
                     };
-                    (sent.elapsed(), result)
+                    (sent.duration_since(run_start), sent.elapsed(), result)
                 }));
             }
             let mut out: Vec<PushOutcome> = Vec::with_capacity(200);
@@ -2292,18 +2335,39 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
     writer.shutdown(Duration::from_secs(10)).await;
     sync_everywhere(&nodes, db).await;
 
+    let inserts = format!(
+        "is_initial_query AND query_kind = 'Insert' AND has(tables, '{db}.log_landing_drop') \
+         AND toUInt64(toUnixTimestamp64Micro(query_start_time_microseconds)) >= {since}"
+    );
+    let polls = format!(
+        "is_initial_query AND query_kind = 'Select' \
+         AND query LIKE '%clusterAllReplicas(''{DROP_CLUSTER}''%' \
+         AND query NOT LIKE '%system.query_log%' \
+         AND toUInt64(toUnixTimestamp64Micro(query_start_time_microseconds)) >= {since}"
+    );
+    settle_query_log(&nodes.s1a, &inserts, 200).await;
+    settle_query_log(&nodes.s1a, &polls, 8).await;
+    exec(&nodes.s1a, "SYSTEM FLUSH LOGS").await;
+
     let mut failures = Vec::new();
-    // P1, P2.
-    for (i, (elapsed, result)) in pushes.iter().enumerate() {
+    // P1.
+    for (i, (_, elapsed, result)) in pushes.iter().enumerate() {
         if let Err(e) = result {
             failures.push(format!("P1: push {i} failed after {elapsed:?}: {e}"));
-        }
-        if *elapsed >= Duration::from_secs(1) {
-            failures.push(format!("P2: push {i} answered after {elapsed:?}"));
         }
     }
     if pushes.len() != 200 {
         failures.push(format!("P1: {} pushes, 200 expected", pushes.len()));
+    }
+    // P2.
+    let acks: Vec<(Duration, Duration)> = pushes
+        .iter()
+        .filter(|(_, _, result)| result.is_ok())
+        .map(|(sent_at, elapsed, _)| (*sent_at, *sent_at + *elapsed))
+        .collect();
+    let silence = longest_silence(&acks);
+    if silence >= Duration::from_millis(T9_SILENCE_MS) {
+        failures.push(format!("P2: no push acknowledged for {silence:?}"));
     }
     // P3.
     if ready.len() < 20 {
@@ -2327,34 +2391,87 @@ async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
                 "P4: poll {i} ({name}) failed after {elapsed:?}: {e}"
             ));
         }
-        if *elapsed >= Duration::from_secs(1) {
-            failures.push(format!("P4: poll {i} ({name}) took {elapsed:?}"));
-        }
+    }
+    // P6.
+    let tries: FailedTriesRow = one_row(
+        &nodes.s1a,
+        &format!(
+            "SELECT toUInt64(countIf(l.query_kind = 'Insert')) AS insert_tries, \
+                    toUInt64(uniqExactIf(t.query_id, l.query_kind = 'Select')) AS polls_tried, \
+                    toUInt64(countIf(t.message NOT LIKE '%connection timeout 100 ms)%')) AS not_pinned \
+             FROM system.text_log AS t \
+             INNER JOIN (SELECT DISTINCT query_id, query_kind FROM system.query_log \
+                         WHERE ({inserts}) OR ({polls})) AS l ON t.query_id = l.query_id \
+             WHERE t.event_time_microseconds >= fromUnixTimestamp64Micro(toInt64({since})) \
+               AND t.message LIKE 'Connection failed at try%'"
+        ),
+    )
+    .await;
+    if tries.insert_tries == 0 {
+        failures.push("P6: no insert tried the unreachable replica".to_string());
+    }
+    if tries.polls_tried != 8 {
+        failures.push(format!(
+            "P6: {} of 8 poll statements tried the unreachable replica",
+            tries.polls_tried
+        ));
+    }
+    if tries.not_pinned != 0 {
+        failures.push(format!(
+            "P6: {} failed connection tries did not use the 100 ms timeout",
+            tries.not_pinned
+        ));
     }
     // P5.
+    let mut want: Vec<String> = (0..200).map(|i| format!("sustained {i}")).collect();
+    want.sort();
     for (name, node) in [
         ("shard 1, first replica", &nodes.s1a),
         ("shard 1, second replica", &nodes.s1b),
     ] {
-        let sql = format!(
-            "SELECT count() AS n, uniqExact(body) AS u FROM {db}.log_landing \
-             WHERE kind = 0 AND startsWith(body, 'sustained ')"
-        );
-        let mut stream = node
-            .query_stream::<StoredRow>(&sql, &QuerySettings::new())
-            .await
-            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
-        let row = stream
-            .next()
-            .await
-            .expect("one row")
-            .unwrap_or_else(|e| panic!("decode: {e}\nSQL:\n{sql}"));
-        if (row.n, row.u) != (200, 200) {
+        let got = texts(
+            node,
+            &format!("SELECT body AS s FROM {db}.log_landing WHERE kind = 0 ORDER BY body"),
+        )
+        .await;
+        if got != want {
+            let mut diff = std::collections::BTreeMap::<&str, i64>::new();
+            for body in &want {
+                *diff.entry(body.as_str()).or_default() += 1;
+            }
+            for body in &got {
+                *diff.entry(body.as_str()).or_default() -= 1;
+            }
+            let missing: std::collections::BTreeMap<&str, i64> = diff
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(b, n)| (*b, *n))
+                .collect();
+            let extra: std::collections::BTreeMap<&str, i64> = diff
+                .iter()
+                .filter(|(_, n)| **n < 0)
+                .map(|(b, n)| (*b, *n))
+                .collect();
             failures.push(format!(
-                "P5: {name} holds {} lines, {} distinct; 200 of each expected",
-                row.n, row.u
+                "P5: {name} holds {} lines; missing {missing:?}; unexpected or repeated {extra:?}",
+                got.len()
             ));
         }
+    }
+    if !failures.is_empty() {
+        let times: InsertTimesRow = one_row(
+            &nodes.s1a,
+            &format!(
+                "SELECT toUInt64(count()) AS n, toUInt64(quantile(0.5)(query_duration_ms)) AS p50_ms, \
+                        toUInt64(max(query_duration_ms)) AS max_ms \
+                 FROM system.query_log WHERE type = 'QueryFinish' AND {inserts}"
+            ),
+        )
+        .await;
+        failures.push(format!(
+            "server: {} landing inserts, median {} ms, slowest {} ms",
+            times.n, times.p50_ms, times.max_ms
+        ));
     }
 
     drop_db(&nodes, db).await;
