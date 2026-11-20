@@ -257,6 +257,18 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         NameCatalogue::Setting,
     ),
     ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
+    // Issue #889: the replaced-parts lifetime and the two flushes that make
+    // it safe, which every table's `CREATE` carries. This check confirms the
+    // names exist on the server; it does not read a table's value.
+    ("old_parts_lifetime", NameCatalogue::MergeTreeSetting),
+    (
+        "min_compressed_bytes_to_fsync_after_merge",
+        NameCatalogue::MergeTreeSetting,
+    ),
+    (
+        "min_compressed_bytes_to_fsync_after_fetch",
+        NameCatalogue::MergeTreeSetting,
+    ),
     // The three block/seconds deduplication-window names the `CREATE`s carry
     // (issue #603). Which of the first two a statement carries is rendered
     // from the same thing that renders the engine
@@ -772,12 +784,15 @@ mod tests {
     /// **T30.** The three statements, written out, so the list and the
     /// statements cannot drift apart unnoticed.
     ///
-    /// The `MergeTree` catalogue carries §4's **three** deduplication-window
-    /// names and nothing else: which of the two block names a statement
-    /// renders follows the engine, and the seconds name is sent on a clustered
-    /// deployment only, but startup cannot know which shape a later
-    /// reconfiguration renders, so all three are read back. **No query setting
-    /// is added**: the discovery reads send none.
+    /// The `MergeTree` catalogue carries the names the `CREATE`s set:
+    /// `merge_with_ttl_timeout`, issue #889's replaced-parts lifetime and its
+    /// two flush settings, and §4's **three** deduplication-window names.
+    /// Which of the two block names a statement renders follows the engine,
+    /// and the seconds name is sent on a clustered deployment only, but
+    /// startup cannot know which shape a later reconfiguration renders, so all
+    /// three are listed. The check confirms each name exists on the server;
+    /// it does not read a table's value. **No query setting is added**: the
+    /// discovery reads send none.
     #[test]
     fn the_required_names_statements_are_exactly_this_text() {
         assert_eq!(
@@ -807,7 +822,10 @@ mod tests {
                 (
                     NameCatalogue::MergeTreeSetting,
                     "SELECT name FROM system.merge_tree_settings WHERE name IN \
-                     ('merge_with_ttl_timeout', 'non_replicated_deduplication_window', \
+                     ('merge_with_ttl_timeout', 'old_parts_lifetime', \
+                     'min_compressed_bytes_to_fsync_after_merge', \
+                     'min_compressed_bytes_to_fsync_after_fetch', \
+                     'non_replicated_deduplication_window', \
                      'replicated_deduplication_window', \
                      'replicated_deduplication_window_seconds')"
                         .to_string()

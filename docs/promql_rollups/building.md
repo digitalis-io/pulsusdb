@@ -118,8 +118,8 @@ The table's `CREATE TABLE`, its wrapper, its stage and the stage's view, as `sch
 --@level ORDER BY (org_id, fingerprint, t_end)
 --@level TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
 --@level-cold , toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
---@level --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
---@level --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
+--@level --@single  SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
+--@level --@cluster SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
 --@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';
 --@level --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples_{{level}}
 --@level --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples_{{level}}', cityHash64(fingerprint));
@@ -143,7 +143,7 @@ The table's `CREATE TABLE`, its wrapper, its stage and the stage's view, as `sch
 --@level-feeds PARTITION BY toStartOfHour(staged_at)
 --@level-feeds ORDER BY (kind, intDiv(t_end - 1, {{parent_ms}}), org_id, fingerprint, t_end)
 --@level-feeds TTL staged_at + toIntervalHour({{metrics_landing_retention_hours}} + 2 * intDiv({{parent_ms}} + 3599999, 3600000) + 1)
---@level-feeds SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024{{storage_policy_local}};
+--@level-feeds SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024{{storage_policy_local}};
 --@level-feeds CREATE MATERIALIZED VIEW {{db}}.metric_samples_{{level}}_stage_mv{{on_cluster}} TO {{db}}.metric_samples_{{level}}_stage
 --@level-feeds AS SELECT kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags
 --@level-feeds FROM {{db}}.metric_samples_{{level}};
