@@ -435,7 +435,8 @@ async fn a_result_limit_tripped_after_output_has_been_written_carries_its_code()
 async fn query_stream_lease_is_released_on_drop_before_exhaustion() {
     skip_unless_live!();
     // pool_size = 1: if a dropped-mid-stream lease were not released, the
-    // second `query_stream` call below would hang forever on `pool.get()`.
+    // `execute` below would wait on `pool.get()` for the only lease. The
+    // readiness ping has a gate of its own, so it cannot show a leak.
     let mut cfg = test_config();
     cfg.pool_size = 1;
     let client = ChClient::new(cfg).await.expect("connect");
@@ -455,10 +456,13 @@ async fn query_stream_lease_is_released_on_drop_before_exhaustion() {
     }
 
     // If the lease were leaked, this would block until PULSUS_QUERY_TIMEOUT.
-    tokio::time::timeout(Duration::from_secs(5), client.ping())
-        .await
-        .expect("pool.get() did not hang — lease was released on drop")
-        .expect("ping");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.execute("SELECT 1", &QuerySettings::new(), Idempotency::Idempotent),
+    )
+    .await
+    .expect("pool.get() did not hang — lease was released on drop")
+    .expect("SELECT 1");
 }
 
 #[tokio::test]

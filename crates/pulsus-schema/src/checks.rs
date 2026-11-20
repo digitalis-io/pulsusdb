@@ -308,6 +308,13 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     // The deadline's overflow mode; `QuerySettings::landing_insert`'s own
     // doc comment says why it is pinned.
     ("timeout_overflow_mode", NameCatalogue::Setting),
+    // Every landing insert and the three every-replica reads pin these
+    // (issue #888).
+    ("connect_timeout_with_failover_ms", NameCatalogue::Setting),
+    (
+        "connect_timeout_with_failover_secure_ms",
+        NameCatalogue::Setting,
+    ),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
     ("tupleElement", NameCatalogue::Function),
@@ -708,6 +715,8 @@ mod tests {
             "timeout_overflow_mode",
             "max_partitions_per_insert_block",
             "throw_on_max_partitions_per_insert_block",
+            "connect_timeout_with_failover_ms",
+            "connect_timeout_with_failover_secure_ms",
         ]);
 
         // The trace landing insert's own five pins are rows too (issues
@@ -791,7 +800,8 @@ mod tests {
                      'distributed_foreground_insert', 'parallel_view_processing', \
                      'insert_shard_id', \
                      'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
-                     'timeout_overflow_mode')"
+                     'timeout_overflow_mode', 'connect_timeout_with_failover_ms', \
+                     'connect_timeout_with_failover_secure_ms')"
                         .to_string()
                 ),
                 (
