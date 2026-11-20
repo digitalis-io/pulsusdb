@@ -258,13 +258,15 @@ that is not a row here fails the suite.
 
 - **Route:** `SelectSeries`, `SelectHeatmap`.
 - **Request:** exemplars, over a profile whose samples carry differing
-  labels.
+  labels; for example one profile of 3, 2 and 1 in three series:
+  PulsusDB's exemplar 3, the reference's 6, both with the labels the three
+  share.
 - **PulsusDB:** one candidate per series, each with its own total and
   labels.
 - **Reference:** the parts summed into one, with the labels they share.
 - **Why:** #826 plan E6: summing first needs a group per profile, about
   one key per entry.
-- **Case:** `#826 part B`.
+- **Case:** `C43` in `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ### `heatmap-exemplar-mismatch-is-400`
 
@@ -274,7 +276,8 @@ that is not a row here fails the suite.
 - **Reference:** `500` when the window holds data, `{}` when it holds none.
 - **Why:** owner, 2026-11-17, the decision for #825's absent query type,
   applied here (#826 plan E8).
-- **Case:** `#826 part B`.
+- **Case:** `none`: an error answer, and no front-end client sends an
+  exemplar type unlike its query type.
 
 ### `diff-side-failure-keeps-its-code`
 
