@@ -7,6 +7,7 @@
 //! `pkg/og/storage/tree/pprof.go:103-180`). Pure functions, no I/O.
 
 pub mod folded;
+pub mod jfr;
 pub mod speedscope;
 pub mod tree;
 pub mod trie;
@@ -448,6 +449,7 @@ pub(crate) mod test_support {
         LegacyQuery {
             name: parse_name(name).expect("a valid name"),
             from_ns: None,
+            until_ns: None,
             spy_name: "unknown".to_string(),
             format: None,
             sample_rate,

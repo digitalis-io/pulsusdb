@@ -90,7 +90,7 @@ that is not a row here fails the suite.
   `other` 6.
 - **Reference:** the cut children's sum is lost: total 15.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 41.
-- **Case:** #823 part B.
+- **Case:** `C20` in `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ### `series-average-is-the-mean`
 
@@ -99,7 +99,8 @@ that is not a row here fails the suite.
 - **PulsusDB:** each step's value is the mean of the step's profile totals.
 - **Reference:** the sum, whatever the aggregation asked for.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 42.
-- **Case:** #824 part B.
+- **Case:** `none`: no front-end client sends `aggregation` or a call site on
+  `SelectSeries`; pinned by `profiles_series_live.rs` (entry 42).
 
 ### `series-call-site-filters-the-totals`
 
@@ -109,7 +110,8 @@ that is not a row here fails the suite.
   beginning with the call site.
 - **Reference:** the selector is dropped: every stack's total.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 42.
-- **Case:** #824 part B.
+- **Case:** `none`: no front-end client sends `aggregation` or a call site on
+  `SelectSeries`; pinned by `profiles_series_live.rs` (entry 42).
 
 ### `ingest-folded-long-line-is-read`
 
@@ -119,7 +121,7 @@ that is not a row here fails the suite.
 - **Reference:** the lines before the long one are stored, the long line and
   every line after it are dropped, and the push answers `200`.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 43.
-- **Case:** #823 part B.
+- **Case:** `none`: a rare input; pinned by the unit test its defects entry names.
 
 ### `ingest-profile-id-push-is-stored`
 
@@ -128,7 +130,7 @@ that is not a row here fails the suite.
 - **PulsusDB:** the profile is stored, and `profile_id` is a series label.
 - **Reference:** nothing is stored, and the push answers `200`.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 44.
-- **Case:** #823 part B.
+- **Case:** `none`: a rare input; pinned by the unit test its defects entry names.
 
 ### `ingest-speedscope-values-computed-before-truncation`
 
@@ -142,7 +144,7 @@ that is not a row here fails the suite.
 - **Reference:** a weight of `0.5` stores 0, the example stores `a` as
   10,300,000, and a `nanoseconds` file stores nothing and answers `200`.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 45.
-- **Case:** #823 part B.
+- **Case:** `none`: a rare input; pinned by the unit test its defects entry names.
 
 ### `ingest-tree-same-name-siblings-sum`
 
@@ -151,7 +153,7 @@ that is not a row here fails the suite.
 - **PulsusDB:** their values sum.
 - **Reference:** the later sibling's value replaces the earlier one's.
 - **Why:** `docs/reference-defects-we-do-not-copy.md` entry 46.
-- **Case:** #823 part B.
+- **Case:** `none`: a rare input; pinned by the unit test its defects entry names.
 
 ### `ingest-speedscope-error-text`
 
@@ -160,7 +162,43 @@ that is not a row here fails the suite.
 - **PulsusDB:** our JSON reader's text.
 - **Reference:** its JSON reader's text.
 - **Why:** #818 plan §8.
-- **Case:** #823 part B.
+- **Case:** `none`: error answers are not compared (#822 plan §10).
+
+### `ingest-jfr-delay-in-nanoseconds`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording holding `jdk.JavaMonitorEnter` or `jdk.ThreadPark`
+  events on a clock other than one tick per nanosecond.
+- **PulsusDB:** each delay is converted to nanoseconds with its chunk's
+  ticks per second: the library's `example.jfr` stores about 8,005,192,311.
+- **Reference:** the tick count is stored as nanoseconds: 18,443,760,794.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 47.
+- **Case:** `VJ` in `crates/pulsus-server/tests/profileql_differential.rs`
+  (#819), which pins both totals.
+
+### `ingest-jfr-event-count-not-carried`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording holding `profiler.WallClockSample` events with a
+  `samples` count above 1 and later CPU, allocation or lock events.
+- **PulsusDB:** each of those later events counts once.
+- **Reference:** each counts as the last wall-clock sample's count.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 48.
+- **Case:** `none` (#819): the fixture's `example.jfr` holds no wall-clock
+  sample, so the two count each event once there; our side is pinned by J6
+  in `crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
+
+### `ingest-jfr-series-stored-together`
+
+- **Route:** `/ingest`, JFR format.
+- **Request:** a recording of several profiles, one of which the checks
+  refuse.
+- **PulsusDB:** nothing is stored, and the refusal names index 0.
+- **Reference:** each series is pushed on its own, so the others are stored,
+  and the refusal names the refused series' position.
+- **Why:** atomic writes; #819 plan E6 and E7.
+- **Case:** `none` (#819): it needs a series the checks refuse, which the
+  fixture does not push.
 
 ### `otlp-multiple-values-are-summed`
 
@@ -171,7 +209,7 @@ that is not a row here fails the suite.
 - **Reference:** keeps one value (`2`) or refuses the profile, summing only
   for off-CPU profiles.
 - **Why:** R3; high-level design §6, the mapping.
-- **Case:** #823 part B.
+- **Case:** `none`: the fixture's OTLP samples carry one value and no link.
 
 ### `otlp-json-link-ids-are-hex`
 
@@ -182,15 +220,95 @@ that is not a row here fails the suite.
 - **Reference:** read as base64 under the generic JSON mapping, so other
   ids are stored.
 - **Why:** high-level design §6, last paragraph.
-- **Case:** #823 part B (the span selector).
+- **Case:** `none`: the fixture's OTLP samples carry one value and no link.
+
+### `heatmap-absent-query-type-is-400`
+
+- **Route:** `SelectHeatmap`.
+- **Request:** no `queryType`, or an unknown one.
+- **PulsusDB:** `400 invalid_argument` `valid heatmap query type must be
+  specified`, on every window.
+- **Reference:** `500` with that text when the window holds data, and an
+  empty answer when it holds none.
+- **Why:** owner, 2026-11-17 (#825).
+- **Case:** `none`: an error answer.
+
+### `heatmap-series-ordered-by-labels`
+
+- **Route:** `SelectHeatmap`.
+- **Request:** a heatmap of several series, below the limit.
+- **PulsusDB:** the series are ordered by their labels.
+- **Reference:** by the text of internal reference numbers written in hex,
+  which follows no label or value order.
+- **Why:** owner, 2026-11-17 (#825).
+- **Case:** `none`: not met, the cases hold one series.
+
+### `heatmap-span-one-value-per-profile`
+
+- **Route:** `SelectHeatmap`, `HEATMAP_QUERY_TYPE_SPAN`.
+- **Request:** two profiles carrying one span.
+- **PulsusDB:** one value per profile and span, whether or not their
+  timestamps coincide.
+- **Reference:** one value when they share a millisecond, two when they are
+  a millisecond apart.
+- **Why:** #825's code review note 3.
+- **Case:** `none`: two profiles carrying one span in one millisecond.
+
+### `exemplar-split-profile-per-part`
+
+- **Route:** `SelectSeries`, `SelectHeatmap`.
+- **Request:** exemplars, over a profile whose samples carry differing
+  labels.
+- **PulsusDB:** one candidate per series, each with its own total and
+  labels.
+- **Reference:** the parts summed into one, with the labels they share.
+- **Why:** #826 plan E6: summing first needs a group per profile, about
+  one key per entry.
+- **Case:** `#826 part B`.
+
+### `heatmap-exemplar-mismatch-is-400`
+
+- **Route:** `SelectHeatmap`.
+- **Request:** an exemplar type unlike the query type.
+- **PulsusDB:** `400 invalid_argument`, on every window.
+- **Reference:** `500` when the window holds data, `{}` when it holds none.
+- **Why:** owner, 2026-11-17, the decision for #825's absent query type,
+  applied here (#826 plan E8).
+- **Case:** `#826 part B`.
 
 ### `diff-side-failure-keeps-its-code`
+
+**Retired 2026-11-18.** The reference's served `Diff` returns each side's
+own error, as PulsusDB does.
 
 - **Route:** `Diff`.
 - **Request:** one side fails, a ceiling included.
 - **PulsusDB:** the side's own code, as on every profiles route: a ceiling
   reached by either side is `429 resource_exhausted`,
   `query_too_broad: <setting>`.
-- **Reference:** `400 invalid_argument` for any failure of either side.
-- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 47.
-- **Case:** #827 part B.
+- **Reference:** the side's own error, as PulsusDB (its read-path router's
+  `Diff`); the `400 invalid_argument` this row recorded came from a
+  function the reference does not mount.
+- **Why:** was defects entry 47, withdrawn by #827 part B.
+- **Case:** `none`.
+
+### `label-values-passes-the-name`
+
+- **Route:** `/pyroscope/label-values`.
+- **Request:** a label other than `__name__`.
+- **PulsusDB:** `200`, the label's values over the last hour.
+- **Reference:** `400`: it sends `LabelValues` with no name
+  (`pkg/querier/http.go:57`).
+- **Why:** defects entry 49.
+- **Case:** `C37` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `render-timeline-keeps-the-window-grid`
+
+- **Route:** `/pyroscope/render`.
+- **Request:** a window that starts before the tenant's first profile.
+- **PulsusDB:** the timeline's points on the window's own steps.
+- **Reference:** the points on steps starting at the tenant's first
+  profile, so a sample can fall one slot earlier
+  (`pkg/frontend/readpath/router.go:92-113`).
+- **Why:** owner, 2026-11-19, "Record the difference"; defects entry 50.
+- **Case:** `C38` in `crates/pulsus-server/tests/profileql_differential.rs`.

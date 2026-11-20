@@ -3,9 +3,12 @@
 //!
 //! One statement per request (`pulsus_read::profiles::tree`), the merge done
 //! in ClickHouse; the trim to `max_nodes` runs here
-//! (`pulsus_read::profiles::flamegraph`). In the order: the tenant, the
+//! (`pulsus_read::profiles::flamegraph`). The Connect answer carries the
+//! trimmed tree's bytes beside the flame graph; `GET /merge` answers the
+//! flame graph alone and builds no bytes. In the order: the tenant, the
 //! codec and the body, a span selector with a trace selector, the format,
-//! then the planner's own checks.
+//! then the planner's own checks. Issue #829: `PROFILE_FORMAT_TREE`
+//! answers the trimmed tree's bytes alone, from the same statement.
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -17,7 +20,7 @@ use pulsus_profiles_wire::querier_v1::{
 };
 use pulsus_read::profiles::ProfilesReadConfig;
 use pulsus_read::profiles::flamegraph;
-use pulsus_read::profiles::tree::{self, TreeRequest};
+use pulsus_read::profiles::tree::{self, TreeRequest, TreeRow};
 
 use crate::app::AppState;
 use crate::logs_api::params::parse_pairs;
@@ -26,22 +29,27 @@ use super::connect::{Code, Codec, ConnectError};
 use super::engine::with_engine;
 use super::routes::{all, finish, now_ms, prelude, split_query, tenant_of, time_param};
 
-/// The flame graph `msg` asks for, in one statement, or none when its
-/// window ends before the lookback floor.
+/// The answer `msg` asks for, in one statement, or none when its window
+/// ends before the lookback floor: the flame graph and, with `with_tree`,
+/// the trimmed tree's bytes beside it (empty otherwise); for
+/// `PROFILE_FORMAT_TREE`, the bytes alone.
 async fn flame_graph(
     state: &AppState,
     tenant: &Tenant,
     msg: SelectMergeStacktracesRequest,
-) -> Result<FlameGraph, ConnectError> {
+    with_tree: bool,
+) -> Result<SelectMergeStacktracesResponse, ConnectError> {
     tree::refuse_span_with_trace(&msg.span_selector, &msg.trace_id_selector)?;
-    if let Ok(f @ (ProfileFormat::Tree | ProfileFormat::Dot | ProfileFormat::Pprof)) =
-        ProfileFormat::try_from(msg.format)
-    {
-        return Err(ConnectError::new(
-            Code::Unimplemented,
-            format!("profile format {} is not served yet", f.as_str_name()),
-        ));
-    }
+    let tree_only = match ProfileFormat::try_from(msg.format) {
+        Ok(f @ (ProfileFormat::Dot | ProfileFormat::Pprof)) => {
+            return Err(ConnectError::new(
+                Code::Unimplemented,
+                format!("profile format {} is not served yet", f.as_str_name()),
+            ));
+        }
+        Ok(ProfileFormat::Tree) => true,
+        _ => false,
+    };
     let config = ProfilesReadConfig::from_config(&state.config);
     let call_site: Vec<String> = msg
         .stack_trace_selector
@@ -59,15 +67,45 @@ async fn flame_graph(
         profile_id_selector: &msg.profile_id_selector,
     };
     let Some(planned) = tree::plan(tenant, &config, &req, now_ms())? else {
-        return Ok(wire(flamegraph::flame_graph(&[], 0, 0)?));
+        let flamegraph = (!tree_only)
+            .then(|| flamegraph::flame_graph(&[], 0, 0).map(wire))
+            .transpose()?;
+        return Ok(SelectMergeStacktracesResponse {
+            flamegraph,
+            tree: Vec::new(),
+        });
     };
     let sql = planned.sql.as_str();
     let rows = with_engine(state, tenant, |engine| async move {
         Ok(engine.read_tree(sql).await?)
     })
     .await?;
-    let graph = flamegraph::flame_graph(&rows, planned.max_nodes, planned.raw_max_nodes)?;
-    Ok(wire(graph))
+    if tree_only {
+        return Ok(SelectMergeStacktracesResponse {
+            flamegraph: None,
+            tree: flamegraph::tree_only(&rows, planned.max_nodes)?,
+        });
+    }
+    let (graph, tree) = trimmed(&rows, planned.max_nodes, planned.raw_max_nodes, with_tree)?;
+    Ok(SelectMergeStacktracesResponse {
+        flamegraph: Some(wire(graph)),
+        tree,
+    })
+}
+
+/// The flame graph of S5's rows, and the trimmed tree's bytes when
+/// `with_tree` (empty otherwise).
+fn trimmed(
+    rows: &[TreeRow],
+    m: i64,
+    raw: i64,
+    with_tree: bool,
+) -> Result<(flamegraph::FlameGraph, Vec<u8>), ConnectError> {
+    if with_tree {
+        Ok(flamegraph::flame_graph_with_tree(rows, m, raw)?)
+    } else {
+        Ok((flamegraph::flame_graph(rows, m, raw)?, Vec::new()))
+    }
 }
 
 fn wire(g: flamegraph::FlameGraph) -> FlameGraph {
@@ -99,13 +137,12 @@ pub(crate) async fn select_merge_stacktraces(
         Ok(p) => p,
         Err(refused) => return refused.into_response(),
     };
-    let answer = flame_graph(&state, &tenant, msg)
-        .await
-        .map(|g| SelectMergeStacktracesResponse {
-            flamegraph: Some(g),
-        });
-    finish(codec, answer)
+    finish(codec, flame_graph(&state, &tenant, msg, true).await)
 }
+
+/// Whether `GET /merge` builds the tree bytes: it answers the flame graph
+/// alone, so it does not.
+const MERGE_GET_WITH_TREE: bool = false;
 
 /// `GET /api/profiles/v1/merge?query=&from=&until=&maxNodes=`: the
 /// `FlameGraph` message's JSON. `query` is the type, then the selector from
@@ -124,7 +161,12 @@ pub(crate) async fn merge_get(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    finish(Codec::Json, flame_graph(&state, &tenant, msg).await)
+    finish(
+        Codec::Json,
+        flame_graph(&state, &tenant, msg, MERGE_GET_WITH_TREE)
+            .await
+            .map(|r| r.flamegraph.unwrap_or_default()),
+    )
 }
 
 /// The `GET` route's parameters as the Connect request.
@@ -175,6 +217,34 @@ mod tests {
             tree::STACK_DAY_AFTER_MS,
             profile_model::REJECT_OLDER_THAN_MS
         );
+    }
+
+    /// `GET /merge` answers the flame graph alone, so it builds no tree
+    /// bytes; the Connect answer builds them from the same rows.
+    #[test]
+    fn the_get_route_builds_no_tree() {
+        let rows = [
+            TreeRow {
+                node: 1,
+                parent: 0,
+                name: "main".to_string(),
+                total: 5,
+                self_value: 0,
+            },
+            TreeRow {
+                node: 2,
+                parent: 1,
+                name: "a".to_string(),
+                total: 5,
+                self_value: 5,
+            },
+        ];
+        let graph = flamegraph::flame_graph(&rows, 8192, 0).expect("a graph");
+        let (get, tree) = trimmed(&rows, 8192, 0, MERGE_GET_WITH_TREE).expect("a graph");
+        assert_eq!((get, tree), (graph.clone(), Vec::new()), "GET /merge");
+        let (connect, tree) = trimmed(&rows, 8192, 0, true).expect("a graph");
+        assert_eq!(connect, graph, "Connect");
+        assert!(!tree.is_empty(), "the Connect answer builds the tree bytes");
     }
 
     fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {

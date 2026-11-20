@@ -100,7 +100,10 @@ replaces one.
 | [44](#44-a-push-whose-name-carries-profile_id-stores-nothing-and-answers-200) | profiles reference | ingest | C | `name=app{profile_id=p1}` with folded stacks answers `200` and stores nothing. |
 | [45](#45-speedscope-values-are-truncated-before-they-are-scaled) | profiles reference | ingest | A, C | A speedscope weight of `0.5` s stores 0, a parent's self time is 100 times too small, and a `nanoseconds` file stores nothing. |
 | [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
-| [47](#47-a-diff-answers-every-failure-of-either-side-as-an-invalid-argument) | profiles reference | queries | A | A diff that reaches a resource limit is told its request is invalid, where the same selection on its own is told the limit was reached. |
+| [47](#47-a-jfr-lock-delay-is-stored-as-its-clock-ticks) | profiles reference | ingest | C | A JFR lock or park delay is stored as its clock-tick count labelled nanoseconds: 2.3 times too large in the library's own test recording. |
+| [48](#48-a-jfr-wall-clock-samples-count-is-carried-into-every-later-event) | profiles reference | ingest | C | In a JFR recording holding wall-clock samples, every later CPU, allocation or lock event counts as the last wall-clock sample's count. |
+| [49](#49-label-values-drops-the-label-it-is-asked-for) | profiles reference | queries | C | `/pyroscope/label-values?label=service_name` answers `400` instead of the values of `service_name`. |
+| [50](#50-a-render-timeline-from-before-a-tenants-first-profile-leaves-the-windows-grid) | profiles reference | queries | A | A render window that starts before a tenant's first profile puts that profile's sample one step earlier than the same window does once older data exists. |
 
 ---
 
@@ -2495,33 +2498,121 @@ No test of its own: the tree reader adds every node to the stack set that every 
 
 ---
 
-## 47. A diff answers every failure of either side as an invalid argument
+## 47. A JFR lock delay is stored as its clock ticks
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+A JFR `jdk.JavaMonitorEnter` or `jdk.ThreadPark` event's `duration` is a timespan in the recording's
+clock ticks. The JFR library the reference pins adds it to the `delay` sample type, unit
+`nanoseconds`, as it is (`pprof/parser.go:121,131` of that library at `v0.19.0`); the chunk header's
+ticks per second is read and never used (`parser/header.go:25`).
+
+### Why that is wrong rather than different
+
+The value stored is not the value its unit names (**C**). The library's own test recording runs at
+2,303,974,730 ticks per second, so its 13 contentions store 18,443,760,794 "nanoseconds" for
+8,005,192,311; the reference's own agent captures run at 2.8 × 10⁹ ticks per second.
+
+### What PulsusDB does
+
+Each event's duration is converted with its chunk's rate, `ticks × 10⁹ / ticks per second`,
+truncated, before it is added; a chunk naming no rate keeps the tick count (`docs/api.md` §1.3).
+Owner decision, 2026-11-18: "Convert to ns".
+
+### Evidence
+
+Ledger row `ingest-jfr-delay-in-nanoseconds` (the profiles differential's ledger, issue #822).
+Pinned by `j5_lock_and_park_delays_are_nanoseconds` and `j1_example_becomes_the_references_four_profiles`
+in `crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
+
+---
+
+## 48. A JFR wall-clock sample's count is carried into every later event
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+One two-value array serves every event of a recording. A `profiler.WallClockSample` sets its first
+value to the sample's `samples` count, and nothing resets it, so every later CPU sample, allocation,
+lock and live-object event adds that count where it means one event (`pprof/parser.go:57,78,84` of the
+JFR library at `v0.19.0`).
+
+### Why that is wrong rather than different
+
+An allocation counted 5 times, or a CPU sample weighted 5 periods, is a value nobody sent (**C**). It
+meets recordings holding wall-clock and other events together: the library's `wall.jfr` has 195 wall
+samples with a count above 1.
+
+### What PulsusDB does
+
+Every event other than a wall-clock sample counts once; a wall-clock sample counts its `samples`
+(`docs/api.md` §1.3). Owner decision, 2026-11-18: "Count 1".
+
+### Evidence
+
+Ledger row `ingest-jfr-event-count-not-carried` (the profiles differential's ledger, issue #822).
+Pinned by `j6_an_allocation_counts_once_after_a_wall_sample` in
+`crates/pulsus-write/src/protocols/profileql_legacy/jfr/mod.rs`.
+
+---
+
+## 49. `label-values` drops the label it is asked for
+
+**The profiles reference · queries · test C**
+
+### What the reference does
+
+`GET /pyroscope/label-values?label=<name>` reads `label`, and for any name but `__name__` sends
+`LabelValues` with an empty request (`pkg/querier/http.go:57`): no name, no matchers and no window.
+The method refuses an empty name, so the route answers `400` for every label.
+
+### Why that is wrong rather than different
+
+The one input the route takes is dropped before it is used (**C**), so the route answers no label's
+values.
+
+### What PulsusDB does
+
+The label's values over the last hour, with no matchers (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `label-values-passes-the-name` (the profiles differential's ledger, issue #822).
+Pinned by case C37 of `crates/pulsus-server/tests/profileql_differential.rs`.
+
+---
+
+## 50. A render timeline from before a tenant's first profile leaves the window's grid
 
 **The profiles reference · queries · test A**
 
 ### What the reference does
 
-`Diff` reads its two sides with the function `SelectMergeStacktraces` uses for its tree, and answers any
-error either side returns as `invalid_argument`
-(`pkg/frontend/readpath/queryfrontend/query_diff.go:65-67`). `SelectMergeStacktraces` returns the same
-function's error with its own code
-(`pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:39-42`).
+The time series behind a render timeline is read in steps from the window's start, each point at
+the end of its step. When the window starts before the tenant's oldest profile, the read is split
+there (`pkg/frontend/readpath/router.go:92-113`): the part from the oldest profile on starts its own
+steps at that profile's time, so each point sits at that grid instead of the window's, and a
+profile falls one timeline slot earlier than the window's own grid puts it.
 
 ### Why that is wrong rather than different
 
-One selection that fails one way answers two codes on two routes of the same product (**A**). A client
-told `invalid_argument` treats the request as one to fix, not one that was too large or met a failure.
+One request answers on two grids (**A**): the same window over the same profiles puts a sample in
+one slot while the tenant's data begins inside the window, and in the next slot once older data
+exists.
 
 ### What PulsusDB does
 
-A failed statement keeps its own code on `Diff` as on every profiles route: a ceiling reached by either
-side is `resource_exhausted` (`429`), `query_too_broad: <setting>` (`docs/api.md` §5).
+The series always steps from the window's start, as the timeline's own `durationDelta` says
+(`docs/api.md` §5).
 
 ### Evidence
 
-Ledger row `diff-side-failure-keeps-its-code` (the profiles differential's ledger, issue #822). Pinned by
-case V7 of `the_diff_answers_both_sides_in_one_statement` in
-`crates/pulsus-read/tests/profileql_diff_live.rs`.
+Ledger row `render-timeline-keeps-the-window-grid` (the profiles differential's ledger, issue #822).
+Pinned by case C38 of `crates/pulsus-server/tests/profileql_differential.rs`. Owner decision,
+2026-11-19: "Record the difference".
 
 ---
 
@@ -2596,6 +2687,16 @@ they are named so nobody adds them later.
   when they are a millisecond apart. PulsusDB counts one value per profile
   and span either way, so the count does not depend on whether two
   timestamps coincide (`docs/api.md` §5).
+- **Exemplar choices (issue #826).** The reference answers a
+  `SelectHeatmap` whose exemplar type does not match its query type with
+  `500` when the window holds data, and with an empty answer when it holds
+  none (`pkg/querybackend/query_heatmap.go:143-159`); PulsusDB answers
+  `400` with the same texts on every window, as for an absent query type
+  above. The reference sums the parts of a profile whose samples carry
+  differing labels into one exemplar with the labels the parts share
+  (`pkg/model/timeseries/exemplar_builder.go:80-113`); PulsusDB keeps one
+  candidate per series, each with its own total and labels, as it counts
+  the heatmap's values (`docs/api.md` §5).
 - **Everything that follows from our architecture.** Storing spans and
   log lines as ClickHouse rows rather than in the reference's own file
   formats decides a great deal — which parameters are meaningful, what
@@ -2614,6 +2715,12 @@ they are named so nobody adds them later.
   nothing at all — so the widened span has no consumer and there is no
   defect to decline. The row was corrected on 2026-09-02 and keeps the
   superseded sentence beside the correction.
+- **`Diff` answering every side failure as `invalid_argument`, examined
+  and rejected.** The function that does so
+  (`pkg/frontend/readpath/queryfrontend/query_diff.go:65-67`) is not the
+  mounted handler; the read-path router's `Diff`
+  (`pkg/frontend/readpath/query_service_handler.go:212-251`) returns a
+  side's error as it is.
 
 ## A claim recorded elsewhere that this file deliberately does not make
 

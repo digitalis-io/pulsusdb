@@ -78,6 +78,7 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/api/metrics/query",
     "/api/metrics/query_range",
     "/api/profiles/v1/ingest",
+    "/api/profiles/v1/label-values",
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/labels",
     "/api/profiles/v1/merge",
@@ -89,6 +90,8 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
+    "/api/profiles/v1/render",
+    "/api/profiles/v1/render-diff",
     "/api/profiles/v1/select_series",
     "/api/profiles/v1/series",
     "/api/profiles/v1/types",
@@ -145,6 +148,9 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
     "/push.v1.PusherService/Push",
     "/pyroscope/ingest",
+    "/pyroscope/label-values",
+    "/pyroscope/render",
+    "/pyroscope/render-diff",
     "/querier.v1.QuerierService/Diff",
     "/querier.v1.QuerierService/LabelNames",
     "/querier.v1.QuerierService/LabelValues",
@@ -630,7 +636,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 111);
+        assert_eq!(ROUTE_TEMPLATES.len(), 117);
         assert!(
             ROUTE_TEMPLATES
                 .iter()

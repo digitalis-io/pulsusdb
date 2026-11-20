@@ -24,6 +24,7 @@ use pulsus_read::profiles::heatmap::{
     self, HeatmapRequest, QUERY_TYPE_INDIVIDUAL, QUERY_TYPE_SPAN,
 };
 use pulsus_read::profiles::selector::WindowLimits;
+use pulsus_read::profiles::series::Exemplar;
 use pulsus_read::profiles::{ProfilesEngine, ProfilesReadConfig, ProfilesReadError};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -38,6 +39,9 @@ const T2: &str = "00000000000000000000000000000002";
 const PROFILE: &str = "00000000-0000-0000-0000-0000000000a0";
 const P1: &str = "00000000-0000-0000-0000-0000000000a1";
 const P2: &str = "00000000-0000-0000-0000-0000000000a2";
+const D1: &str = "00000000-0000-0000-0000-0000000000d1";
+const D2: &str = "00000000-0000-0000-0000-0000000000d2";
+const D3: &str = "00000000-0000-0000-0000-0000000000d3";
 const SPAN_A: u64 = 10;
 const SPAN_B: u64 = 11;
 
@@ -98,9 +102,22 @@ fn series_row(org: &str, s: i64, service: &str, fp: u128, pod: Option<&str>) -> 
 
 /// A kind-3 row: one profile's total at `ts_ns`.
 fn entry_row(org: &str, s: i64, service: &str, fp: u128, ts_ns: i64, total: i64) -> String {
+    profile_entry_row(org, s, service, fp, ts_ns, total, PROFILE)
+}
+
+/// A kind-3 row: `profile`'s total at `ts_ns`.
+fn profile_entry_row(
+    org: &str,
+    s: i64,
+    service: &str,
+    fp: u128,
+    ts_ns: i64,
+    total: i64,
+    profile: &str,
+) -> String {
     format!(
         "('{org}', {s}, 3, '{CPU}', '{service}', {fp}, {ts_ns}, 0, {total}, 0, \
-         unhex('{NO_TRACE}'), [], [], '', '{PROFILE}')"
+         unhex('{NO_TRACE}'), [], [], '', '{profile}')"
     )
 }
 
@@ -203,6 +220,13 @@ type Slot = (i64, BTreeMap<usize, i32>);
 /// carries.
 type Got = (Vec<(String, String)>, Vec<Slot>, Vec<f64>);
 
+/// Issue #826: a series as its labels and its slots, each slot its
+/// timestamp, its non-zero counts and its exemplars.
+type WithExemplars = (
+    Vec<(String, String)>,
+    Vec<(i64, BTreeMap<usize, i32>, Vec<Exemplar>)>,
+);
+
 struct Fixture {
     bootstrap: ChClient,
     db: String,
@@ -211,7 +235,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let db = pulsus_testkit::test_db("pulsus_read_it_profileql_heatmap");
+        Self::in_database(pulsus_testkit::test_db("pulsus_read_it_profileql_heatmap")).await
+    }
+
+    /// The fixture in the database `db`.
+    async fn in_database(db: String) -> Self {
         let bootstrap = ChClient::new(test_config("default"))
             .await
             .expect("connect (bootstrap)");
@@ -290,6 +318,46 @@ impl Fixture {
                 (series.labels, slots, y_min)
             })
             .collect())
+    }
+
+    /// Issue #826: plans `req` with exemplars for `org`, reads its rows
+    /// and orders them, each slot as its timestamp, its non-zero counts
+    /// and its exemplars.
+    async fn exemplars(&self, org: &str, req: &HeatmapRequest<'_>) -> Vec<WithExemplars> {
+        let req = HeatmapRequest {
+            exemplars: true,
+            ..*req
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let sql = match heatmap::plan(&tenant(org), &config(), &req, now) {
+            Ok(Some(sql)) => sql,
+            other => panic!("expected a plan for {req:?}, got {other:?}"),
+        };
+        let client = ChClient::new(test_config(&self.db)).await.expect("connect");
+        let rows = ProfilesEngine::new(client, config(), tenant(org))
+            .read_heatmap_exemplars(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{req:?}: {e:?}\n{sql}"));
+        heatmap::heatmap_exemplars(rows, req.group_by, req.limit)
+            .into_iter()
+            .map(|series| {
+                let slots = series
+                    .slots
+                    .into_iter()
+                    .map(|slot| {
+                        let counts = slot
+                            .counts
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| **c != 0)
+                            .map(|(i, c)| (i, *c))
+                            .collect();
+                        (slot.timestamp, counts, slot.exemplars)
+                    })
+                    .collect();
+                (series.labels, slots)
+            })
+            .collect()
     }
 
     async fn got(&self, org: &str, req: &HeatmapRequest<'_>) -> Vec<Got> {
@@ -480,6 +548,157 @@ async fn the_heatmap_answers_its_tenants_bucket_counts() {
         )),
         "L6"
     );
+
+    fx.finish().await;
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+/// An `INDIVIDUAL` exemplar.
+fn individual(timestamp: i64, profile: &str, value: i64, labels: &[(String, String)]) -> Exemplar {
+    Exemplar {
+        timestamp,
+        profile_id: profile.to_string(),
+        span_id: String::new(),
+        trace_id: String::new(),
+        value,
+        labels: labels.to_vec(),
+    }
+}
+
+/// Issue #826, H1–H3: one exemplar per non-empty cell, its largest value,
+/// in bucket order.
+#[tokio::test]
+async fn heatmap_exemplars_name_each_cells_largest_value() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let fx = Fixture::in_database(pulsus_testkit::test_db(
+        "pulsus_read_it_profileql_heatmap_exemplars",
+    ))
+    .await;
+    let s = fx.s;
+    let ns = |ms: i64| ms * 1_000_000;
+    let client = ChClient::new(test_config(&fx.db)).await.expect("connect");
+    exec(
+        &client,
+        &insert(&[
+            series_row("t1", s, "u", 11, Some("g")),
+            profile_entry_row("t1", s, "u", 11, ns(s + 5 * SECOND_MS), 0, D1),
+            profile_entry_row("t1", s, "u", 11, ns(s + 6 * SECOND_MS), 100, D2),
+            profile_entry_row("t1", s, "u", 11, ns(s + 7 * SECOND_MS), 101, D3),
+        ]),
+    )
+    .await;
+
+    // H1: two cells, two exemplars; `D2` is not a cell's largest.
+    let u = r#"{service_name="u"}"#;
+    let all = pairs(&[
+        ("__profile_type__", CPU),
+        ("pod", "g"),
+        ("service_name", "u"),
+    ]);
+    let h1 = |labels: &[(String, String)]| {
+        vec![
+            individual(s + 5 * SECOND_MS, D1, 0, labels),
+            individual(s + 7 * SECOND_MS, D3, 101, labels),
+        ]
+    };
+    assert_eq!(
+        fx.exemplars("t1", &fx.request(u)).await,
+        vec![(
+            vec![],
+            vec![(s + STEP_MS, counts(&[(0, 1), (19, 2)]), h1(&all))]
+        )],
+        "H1"
+    );
+    let by_pod = vec!["pod".to_string()];
+    let rest = pairs(&[("__profile_type__", CPU), ("service_name", "u")]);
+    assert_eq!(
+        fx.exemplars(
+            "t1",
+            &HeatmapRequest {
+                group_by: &by_pod,
+                ..fx.request(u)
+            }
+        )
+        .await,
+        vec![(
+            pod("g"),
+            vec![(s + STEP_MS, counts(&[(0, 1), (19, 2)]), h1(&rest))]
+        )],
+        "H1 by pod"
+    );
+
+    // H2: `SPAN` exemplars carry the span and the trace, and no profile.
+    let z_labels = pairs(&[
+        ("__profile_type__", CPU),
+        ("pod", "d"),
+        ("service_name", "z"),
+    ]);
+    let span = |value: i64, span: &str, trace: &str| Exemplar {
+        timestamp: s + 5 * SECOND_MS,
+        profile_id: String::new(),
+        span_id: span.to_string(),
+        trace_id: trace.to_string(),
+        value,
+        labels: z_labels.clone(),
+    };
+    assert_eq!(
+        fx.exemplars(
+            "t1",
+            &HeatmapRequest {
+                query_type: QUERY_TYPE_SPAN,
+                ..fx.request(r#"{service_name="z"}"#)
+            }
+        )
+        .await,
+        vec![(
+            vec![],
+            vec![(
+                s + STEP_MS,
+                counts(&[(2, 1), (11, 1), (17, 1), (19, 1)]),
+                vec![
+                    span(2, "0a00000000000000", T1),
+                    span(5, "0b00000000000000", T1),
+                    span(7, "0a00000000000000", T1),
+                    span(9, "0a00000000000000", T2),
+                ]
+            )]
+        )],
+        "H2"
+    );
+
+    // H3: each tenant's own values.
+    let a = r#"{pod="a"}"#;
+    let a_labels = pairs(&[
+        ("__profile_type__", CPU),
+        ("pod", "a"),
+        ("service_name", "x"),
+    ]);
+    for (org, scale) in [("t1", 1), ("t2", 100)] {
+        assert_eq!(
+            fx.exemplars(org, &fx.request(a)).await,
+            vec![(
+                vec![],
+                vec![(
+                    s + STEP_MS,
+                    counts(&[(0, 1), (10, 1), (19, 1)]),
+                    vec![
+                        individual(s + 5 * SECOND_MS, PROFILE, 0, &a_labels),
+                        individual(s + 10 * SECOND_MS, PROFILE, 10 * scale, &a_labels),
+                        individual(s + STEP_MS, PROFILE, 20 * scale, &a_labels),
+                    ]
+                )]
+            )],
+            "H3 as {org}"
+        );
+    }
 
     fx.finish().await;
 }

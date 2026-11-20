@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::future::try_join_all;
 use tokio::sync::oneshot;
 
-pub use config::WriterRuntime;
+pub use config::{CLAIM_INSERT_BOUND, WriterRuntime};
 pub use error::WriteError;
 pub use landing::{landing_block_overhead_bytes, landing_charge};
 pub use log::{LogWriter, WriterTables};

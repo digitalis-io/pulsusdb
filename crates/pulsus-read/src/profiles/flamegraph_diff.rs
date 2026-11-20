@@ -2,10 +2,11 @@
 //! `NewFlamegraphDiff` (`pkg/model/flamegraph_diff.go`), run on the rows S7
 //! returns (`super::diff`). Pure: no I/O.
 //!
-//! Each side is trimmed as the flame graph's tree is (steps 1 and 2 of
-//! `super::flamegraph`, #823's D11 included). The two trees are then
-//! aligned under virtual roots, cut once on the larger of each pair's
-//! totals, and walked into one graph. The reference's check for a negative
+//! Each side is trimmed with its own `max_nodes` as the flame graph's tree
+//! is (steps 1 and 2 of `super::flamegraph`, #823's D11 included). The two
+//! trees are then aligned under virtual roots and walked into one graph,
+//! not cut again: the reference's mounted `Diff` runs its diff with no
+//! limit. The reference's check for a negative
 //! self is not ported: ingest stores no value of 0 or below.
 
 use std::collections::HashMap;
@@ -28,9 +29,13 @@ pub struct FlameGraphDiff {
     pub right_ticks: i64,
 }
 
-/// The diff of S7's rows with the resolved `max_nodes` `m`: steps 1 and 2
-/// on each side, then [`diff_of`].
-pub fn flame_graph_diff(rows: &[DiffRow], m: i64) -> Result<FlameGraphDiff, ProfilesReadError> {
+/// The diff of S7's rows: steps 1 and 2 on each side with its own resolved
+/// `max_nodes`, then [`diff_of`] with no cut.
+pub fn flame_graph_diff(
+    rows: &[DiffRow],
+    left_m: i64,
+    right_m: i64,
+) -> Result<FlameGraphDiff, ProfilesReadError> {
     let side = |total: fn(&DiffRow) -> (i64, i64)| -> Vec<TreeRow> {
         rows.iter()
             .filter(|r| total(r).0 > 0)
@@ -43,9 +48,15 @@ pub fn flame_graph_diff(rows: &[DiffRow], m: i64) -> Result<FlameGraphDiff, Prof
             })
             .collect()
     };
-    let left = truncated(merged_tree(&side(|r| (r.left_total, r.left_self)), m)?, m);
-    let right = truncated(merged_tree(&side(|r| (r.right_total, r.right_self)), m)?, m);
-    Ok(diff_of(&left, &right, m))
+    let left = truncated(
+        merged_tree(&side(|r| (r.left_total, r.left_self)), left_m)?,
+        left_m,
+    );
+    let right = truncated(
+        merged_tree(&side(|r| (r.right_total, r.right_self)), right_m)?,
+        right_m,
+    );
+    Ok(diff_of(&left, &right, 0))
 }
 
 /// One node of the two aligned trees: each side's total and self, 0 on a
@@ -267,7 +278,7 @@ mod tests {
     #[test]
     fn g1() {
         assert_eq!(
-            flame_graph_diff(&rows(&[("main,a", 3)], &[("main,b", 5)]), 8192),
+            flame_graph_diff(&rows(&[("main,a", 3)], &[("main,b", 5)]), 8192, 8192),
             Ok(graph(
                 &["total", "main", "b", "a"],
                 &[
@@ -284,7 +295,7 @@ mod tests {
     #[test]
     fn g2() {
         assert_eq!(
-            flame_graph_diff(&rows(&[("main,a", 3)], &[]), 8192),
+            flame_graph_diff(&rows(&[("main,a", 3)], &[]), 8192, 8192),
             Ok(graph(
                 &["total", "main", "a"],
                 &[
@@ -301,13 +312,14 @@ mod tests {
     #[test]
     fn g3() {
         assert_eq!(
-            flame_graph_diff(&[], 8192),
+            flame_graph_diff(&[], 8192, 8192),
             Ok(graph(&["total"], &[&[0, 0, 0, 0, 0, 0, 0]], (0, 0, 0, 0)))
         );
     }
 
-    /// G4: the combined cut sends `a`, `b` and the named `other` to a
-    /// generated `other` of (9, 4).
+    /// G4: each side trimmed with its own limit, the combined graph not
+    /// cut: the left's `c` and the right's `a` go to each side's `other`
+    /// (C27 of #827 part B).
     #[test]
     fn g4() {
         assert_eq!(
@@ -317,15 +329,19 @@ mod tests {
                     &[("main,a", 1), ("main,b", 3), ("main,c", 6)],
                 ),
                 3,
+                3,
             ),
             Ok(graph(
-                &["total", "main", "other", "c"],
+                &["total", "main", "other", "c", "b", "a"],
                 &[
                     &[0, 9, 0, 0, 10, 0, 0],
                     &[0, 9, 0, 0, 10, 0, 1],
-                    &[0, 0, 0, 0, 6, 6, 3, 0, 9, 9, 0, 4, 4, 2],
+                    &[
+                        0, 4, 4, 0, 0, 0, 5, 0, 3, 3, 0, 3, 3, 4, 0, 0, 0, 0, 6, 6, 3, 0, 2, 2, 0,
+                        1, 1, 2,
+                    ],
                 ],
-                (19, 9, 9, 10),
+                (19, 6, 9, 10),
             ))
         );
     }
@@ -339,6 +355,7 @@ mod tests {
                     &[("main,other,x", 4), ("main,a", 2)],
                     &[("main,other,x", 1)],
                 ),
+                8192,
                 8192,
             ),
             Ok(graph(
@@ -365,6 +382,7 @@ mod tests {
                     &[("main,a", 2)],
                 ),
                 3,
+                3,
             ),
             Ok(graph(
                 &["total", "main", "other", "a"],
@@ -379,20 +397,21 @@ mod tests {
     }
 
     /// G7: `main → a` 10 and `main → other → x` 1 on both sides at
-    /// `max_nodes` 2: both children fall below the cut of 11.
+    /// `max_nodes` 2: each side keeps `a` and folds `other → x` into its
+    /// `other`, and the combined graph is not cut (C28 of #827 part B).
     #[test]
     fn g7() {
         let stacks = [("main,a", 10), ("main,other,x", 1)];
         assert_eq!(
-            flame_graph_diff(&rows(&stacks, &stacks), 2),
+            flame_graph_diff(&rows(&stacks, &stacks), 2, 2),
             Ok(graph(
-                &["total", "main", "other"],
+                &["total", "main", "other", "a"],
                 &[
                     &[0, 11, 0, 0, 11, 0, 0],
                     &[0, 11, 0, 0, 11, 0, 1],
-                    &[0, 11, 11, 0, 11, 11, 2],
+                    &[0, 10, 10, 0, 10, 10, 3, 0, 1, 1, 0, 1, 1, 2],
                 ],
-                (22, 11, 11, 11),
+                (22, 10, 11, 11),
             ))
         );
     }

@@ -4,7 +4,8 @@
 //!
 //! Step 1 is the reference's `TreeFromStacktraceTree`, step 2 its
 //! `MarshalTruncate` followed by `UnmarshalTree`, step 3 its
-//! `NewFlameGraph`. Children are kept sorted by name, in byte order, at
+//! `NewFlameGraph`. The Connect answer also carries step 2's tree as
+//! `MarshalTruncate` writes it ([`tree_bytes`]). Children are kept sorted by name, in byte order, at
 //! every step, as the reference's `insert` keeps them.
 //!
 //! One deliberate difference from the reference
@@ -163,6 +164,62 @@ pub fn truncated(mut tree: Tree, m: i64) -> Tree {
 pub fn flame_graph(rows: &[TreeRow], m: i64, raw: i64) -> Result<FlameGraph, ProfilesReadError> {
     let tree = truncated(merged_tree(rows, m)?, m);
     Ok(flame_graph_of(&tree, raw))
+}
+
+/// The flame graph of S5's rows, as [`flame_graph`], and the trimmed tree's
+/// bytes ([`tree_bytes`]) beside it.
+pub fn flame_graph_with_tree(
+    rows: &[TreeRow],
+    m: i64,
+    raw: i64,
+) -> Result<(FlameGraph, Vec<u8>), ProfilesReadError> {
+    let tree = truncated(merged_tree(rows, m)?, m);
+    Ok((flame_graph_of(&tree, raw), tree_bytes(&tree)))
+}
+
+/// Issue #829: the trimmed tree's bytes alone ([`tree_bytes`]), steps 1
+/// and 2 with `m`, for `PROFILE_FORMAT_TREE`.
+pub fn tree_only(rows: &[TreeRow], m: i64) -> Result<Vec<u8>, ProfilesReadError> {
+    Ok(tree_bytes(&truncated(merged_tree(rows, m)?, m)))
+}
+
+/// The tree's bytes as the reference's `MarshalTruncate` writes them
+/// (`pkg/model/tree.go`): depth first from a virtual root (name `""`, self
+/// 0), last pushed first; per node `uvarint(name length)`, the name,
+/// `uvarint(self)`, then `uvarint(child count)`. Children are pushed in
+/// name order, so written in reverse name order. An empty tree is no bytes.
+///
+/// Cost: one walk over the trimmed tree and one buffer the size of the
+/// answer; no read and no statement. The trimmed tree is not bounded by
+/// `max_nodes`: every node whose total equals the cut is kept, so is every
+/// node named `other`, and each generated `other` adds one more.
+pub fn tree_bytes(tree: &Tree) -> Vec<u8> {
+    if tree.roots.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<Option<usize>> = vec![None];
+    while let Some(at) = stack.pop() {
+        let (name, self_value) = match at {
+            Some(i) => (tree.nodes[i].name.as_str(), tree.nodes[i].self_value),
+            None => ("", 0),
+        };
+        let children = tree.children(at);
+        uvarint(&mut out, name.len() as u64);
+        out.extend_from_slice(name.as_bytes());
+        uvarint(&mut out, self_value as u64);
+        uvarint(&mut out, children.len() as u64);
+        stack.extend(children.iter().map(|&c| Some(c)));
+    }
+    out
+}
+
+fn uvarint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
 }
 
 /// Step 3: the reference's `NewFlameGraph` (`pkg/model/flamegraph.go`). A
@@ -469,6 +526,78 @@ mod tests {
             Err(ProfilesReadError::Internal(
                 "malformed merged tree".to_string()
             ))
+        );
+    }
+
+    /// F6: the trimmed tree's bytes are the reference's — depth first from
+    /// a virtual root, children written in reverse name order; captured
+    /// from the pinned reference's answer to C21's request. No rows is no
+    /// bytes.
+    #[test]
+    fn f6_tree_bytes_are_the_references() {
+        let r = rows(&[
+            ("main", 50_000_000, 0),
+            ("main/a", 50_000_000, 0),
+            ("main/a/b", 30_000_000, 30_000_000),
+            ("main/a/c", 20_000_000, 20_000_000),
+        ]);
+        let tree = truncated(merged_tree(&r, 8192).expect("a tree"), 8192);
+        use base64::Engine;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(tree_bytes(&tree)),
+            "AAABBG1haW4AAQFhAAIBY4DaxAkAAWKAh6cOAA=="
+        );
+        let empty = truncated(merged_tree(&[], 8192).expect("a tree"), 8192);
+        assert_eq!(tree_bytes(&empty), Vec::<u8>::new());
+        let (graph, bytes) = flame_graph_with_tree(&r, 8192, 0).expect("a graph");
+        assert_eq!(graph, flame_graph(&r, 8192, 0).expect("a graph"));
+        assert_eq!(bytes, tree_bytes(&tree));
+    }
+
+    /// The tree bytes read back: per node in the order written, its name,
+    /// its self and its child count.
+    fn decode_tree(mut b: &[u8]) -> Vec<(String, i64, u64)> {
+        fn uv(b: &mut &[u8]) -> u64 {
+            let (mut v, mut shift) = (0u64, 0);
+            loop {
+                let byte = b[0];
+                *b = &b[1..];
+                v |= u64::from(byte & 0x7f) << shift;
+                if byte < 0x80 {
+                    return v;
+                }
+                shift += 7;
+            }
+        }
+        let mut out = Vec::new();
+        while !b.is_empty() {
+            let len = uv(&mut b) as usize;
+            let name = String::from_utf8(b[..len].to_vec()).expect("a UTF-8 name");
+            b = &b[len..];
+            let self_value = uv(&mut b) as i64;
+            let children = uv(&mut b);
+            out.push((name, self_value, children));
+        }
+        out
+    }
+
+    /// T1 (issue #829): `PROFILE_FORMAT_TREE`'s bytes are steps 1 and 2's
+    /// tree at `m`: at 4, `d`, `e` and `other` cut into a stub of 8, then
+    /// `c` into `a`'s `other`; children written in reverse name order.
+    #[test]
+    fn t1_tree_only() {
+        let bytes = tree_only(&fixture(), 4).expect("the bytes");
+        let n = |name: &str, s: i64, c: u64| (name.to_string(), s, c);
+        assert_eq!(
+            decode_tree(&bytes),
+            vec![
+                n("", 0, 1),
+                n("main", 0, 2),
+                n("other", 8, 0),
+                n("a", 2, 2),
+                n("other", 5, 0),
+                n("b", 17, 0),
+            ]
         );
     }
 

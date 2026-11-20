@@ -41,10 +41,11 @@ pub struct CacheMetrics {
     /// ScanBudgetExceeded`], never a [`FallbackReason`] (a warm cache that
     /// reaches this bound is not degraded).
     pub miss_scan_budget_total: AtomicU64,
-    /// Successful sweeps (each one swaps in a new snapshot).
+    /// Committed passes, one per tenant (each one moves that tenant's
+    /// recency anchor).
     pub refreshes_total: AtomicU64,
-    /// Sweeps that failed (transient `ChError`) — the last good snapshot
-    /// keeps serving, rising in age until `StaleCache` takes over.
+    /// Passes that failed (transient `ChError`) — the cache keeps answering
+    /// from what it holds, rising in age until `StaleCache` takes over.
     pub refresh_failures_total: AtomicU64,
     /// Gauge: resident fingerprint count as of the most recent successful
     /// sweep.

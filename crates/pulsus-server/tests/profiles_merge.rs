@@ -413,6 +413,19 @@ fn answer(res: &Res, ctx: &str) -> (Value, String) {
     (res.json(ctx), res.query_id(ctx))
 }
 
+/// A Connect answer's `flamegraph`, its `tree` checked present and not
+/// empty: the trimmed tree's bytes, base64.
+fn with_tree(got: &Value, ctx: &str) -> Value {
+    let tree = got["tree"].as_str().unwrap_or("");
+    assert!(!tree.is_empty(), "{ctx}: no tree bytes in {got}");
+    let keys: Vec<&String> = got
+        .as_object()
+        .map(|o| o.keys().collect())
+        .unwrap_or_default();
+    assert_eq!(keys, ["flamegraph", "tree"], "{ctx}: {got}");
+    got["flamegraph"].clone()
+}
+
 /// One refused request: its status, code and message, and its id.
 fn refused(res: &Res, status: u16, code: &str, message: &str, ctx: &str) -> String {
     assert_eq!(res.status, status, "{ctx}: {}", res.text());
@@ -470,7 +483,7 @@ async fn the_merged_flame_graph_answers_in_one_statement() {
 
     // M1: the native Connect path, JSON, no `maxNodes`.
     let (got, id) = answer(&connect(a, native_path(), "t1", &body(json!({}))), "M1");
-    assert_eq!(got, json!({"flamegraph": row1(1)}), "M1");
+    assert_eq!(with_tree(&got, "M1"), row1(1), "M1");
     counted.push(("M1".to_string(), id, 1));
 
     // M2: the compat Connect path, protobuf, `maxNodes` 4.
@@ -526,7 +539,7 @@ async fn the_merged_flame_graph_answers_in_one_statement() {
         ),
         "M4 delta",
     );
-    assert_eq!(got, json!({"flamegraph": row1(1)}), "M4 delta");
+    assert_eq!(with_tree(&got, "M4 delta"), row1(1), "M4 delta");
     counted.push(("M4 delta".to_string(), id, 1));
     let id = refused(
         &connect(
@@ -595,18 +608,18 @@ async fn the_merged_flame_graph_answers_in_one_statement() {
             a,
             native_path(),
             "t1",
-            &body(json!({"format": "PROFILE_FORMAT_TREE"})),
+            &body(json!({"format": "PROFILE_FORMAT_DOT"})),
         ),
         501,
         "unimplemented",
-        "profile format PROFILE_FORMAT_TREE is not served yet",
+        "profile format PROFILE_FORMAT_DOT is not served yet",
         "M8",
     );
     counted.push(("M8".to_string(), id, 0));
 
     // M9: the tenant's own samples.
     let (got, id) = answer(&connect(a, native_path(), "t2", &body(json!({}))), "M9");
-    assert_eq!(got, json!({"flamegraph": row1(100)}), "M9");
+    assert_eq!(with_tree(&got, "M9"), row1(100), "M9");
     counted.push(("M9".to_string(), id, 1));
 
     // M3: spawn B, the compat flag unset: the native `GET` route answers

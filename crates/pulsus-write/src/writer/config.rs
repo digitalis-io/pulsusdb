@@ -44,7 +44,7 @@ const SPOOL_DIR: &str = "./spool";
 /// [`WriterConfig`] and that knob is not in it. Same documented-constant
 /// precedent as [`LRU_CAPACITY`]; promote both together if a deployment
 /// needs to tune it.
-const CLAIM_INSERT_BOUND: Duration = Duration::from_secs(120);
+pub const CLAIM_INSERT_BOUND: Duration = Duration::from_secs(120);
 
 /// The resolved set of tunables the three writers and their landing workers
 /// read from — computed once at construction, never re-read from the

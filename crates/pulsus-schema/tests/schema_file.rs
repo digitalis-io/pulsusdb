@@ -1203,7 +1203,7 @@ const METRICS_PUSH_PARAGRAPHS: &str = r##"**How a metrics push is written.** A m
 
 A synchronous push is answered as the last column says; one sent with `X-Pulsus-Async: 1` is answered `202` once admitted. On a cluster ClickHouse divides the samples insert into one block per shard its series select, and the descriptors insert is one block on one shard.
 
-**A metrics push has a second guard, in ClickHouse.** Its samples insert's `insert_deduplication_token` is derived from its tenant and the sample, histogram sample and exemplar rows it inserts, every column of them with the receive time set to zero, and never from `Idempotency-Key`. So the same content sent again, to any writer process, after `PULSUS_INGEST_DEDUP_WINDOW` or with `PULSUS_INGEST_DEDUP=false`, stores no sample, histogram sample, exemplar or series a second time while ClickHouse still remembers the token ([configuration.md](configuration.md), `PULSUS_METRICS_DEDUP_WINDOW`), and two pushes of identical parsed content store their samples, histogram samples, exemplars and series once; their descriptors may be stored twice, and `/api/v1/metadata` shows one. The staging table `metric_landing`, whose rows no query returns (its one reader, the first rollup level's build, removes the copies), may hold a resend received in a later hour a second time until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. If a shard refuses its block of the samples insert, a synchronous push is answered `500` and one sent with `X-Pulsus-Async: 1` has already been answered `202` at admission, and either way the other shards may keep theirs; sending the same push again stores the refused part without storing the kept part twice, within the same limit. The descriptors insert carries a token minted for it. The writer sends a descriptor about once an hour and after it restarts; a metrics insert of that writer that ends without a commit empties the descriptors it holds, so a later push carrying one sends it again unless an insert that committed in between recorded it; so the stored table may hold a descriptor more than once until ClickHouse merges the copies; `/api/v1/metadata` reports each descriptor once, and a descriptor a client keeps sending never expires."##;
+**A metrics push has a second guard, in ClickHouse.** Its samples insert's `insert_deduplication_token` is derived from its tenant and the sample, histogram sample and exemplar rows it inserts, every column of them with the receive time set to zero, and never from `Idempotency-Key`. So the same content sent again, to any writer process, after `PULSUS_INGEST_DEDUP_WINDOW` or with `PULSUS_INGEST_DEDUP=false`, stores no sample, histogram sample, exemplar or series a second time while ClickHouse still remembers the token ([configuration.md](configuration.md), `PULSUS_METRICS_DEDUP_WINDOW`), and two pushes of identical parsed content store their samples, histogram samples, exemplars and series once; their descriptors may be stored twice, and `/api/v1/metadata` shows one. The staging table `metric_landing`, whose rows no query returns (its readers are the first rollup level's build, which removes the copies, and the label cache's registration feed, which keeps one entry per series), may hold a resend received in a later hour a second time until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. If a shard refuses its block of the samples insert, a synchronous push is answered `500` and one sent with `X-Pulsus-Async: 1` has already been answered `202` at admission, and either way the other shards may keep theirs; sending the same push again stores the refused part without storing the kept part twice, within the same limit. The descriptors insert carries a token minted for it. The writer sends a descriptor about once an hour and after it restarts; a metrics insert of that writer that ends without a commit empties the descriptors it holds, so a later push carrying one sends it again unless an insert that committed in between recorded it; so the stored table may hold a descriptor more than once until ClickHouse merges the copies; `/api/v1/metadata` reports each descriptor once, and a descriptor a client keeps sending never expires."##;
 
 /// `docs/api.md`'s `Idempotency-Key` row, its third cell (issue #494 part 1b).
 const IDEMPOTENCY_KEY_CELL: &str = r##"issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included"##;
@@ -1232,7 +1232,7 @@ const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
     (
         "configuration.md",
         None,
-        r##" A metrics push's token is derived from its tenant and parsed content, so the window also covers a client's resend of the same push, to any PulsusDB process: no sample, series or exemplar is stored twice, and only `metric_landing` itself, whose rows no query returns (its one reader, the first rollup level's build, removes the copies), may hold a resend received in a later hour until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. A push's descriptors carry a token of their own, so `metric_metadata` may hold a descriptor more than once; `/api/v1/metadata` reports it once ([api.md §1.0](api.md))."##,
+        r##" A metrics push's token is derived from its tenant and parsed content, so the window also covers a client's resend of the same push, to any PulsusDB process: no sample, series or exemplar is stored twice, and only `metric_landing` itself, whose rows no query returns (its readers are the first rollup level's build, which removes the copies, and the label cache's registration feed, which keeps one entry per series), may hold a resend received in a later hour until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. A push's descriptors carry a token of their own, so `metric_metadata` may hold a descriptor more than once; `/api/v1/metadata` reports it once ([api.md §1.0](api.md))."##,
     ),
     (
         "configuration.md",
@@ -2437,7 +2437,7 @@ ENGINE = ReplacingMergeTree(ver)
 PARTITION BY toDate(minute)
 ORDER BY (org_id, conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400), 4294967295))
-SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 
 /// `service_edges_mv` as the design writes it (part A §3.2, part C §3),
 /// rendered the same way, with the production row ceiling. Its first line
@@ -3267,7 +3267,7 @@ fn the_rollup_levels_render_from_one_template() {
                         format!(
                             "TTL staged_at + toIntervalHour(6 + 2 * intDiv({next}000 + 3599999, 3600000) + 1)"
                         ),
-                        "SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
+                        "SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
                     ] {
                         assert!(
                             stage_lines.contains(&line.as_str()),
@@ -3802,21 +3802,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     };
     // The digests moved with issue #813, which adds the six profile tables,
     // their four wrappers and five views, and with issue #814, which gives
-    // `profile_landing`'s ten upload columns a `DEFAULT`.
+    // `profile_landing`'s ten upload columns a `DEFAULT`, and with issue #889,
+    // which puts the replaced-parts settings first in every table's `SETTINGS`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "0fa35c6e8deccbf9702a3b067d90f6539049d89bb6fe75df3174103aa71c2157",
+            "eba95984512773d67dd1e25b76757817f0667f01d7ec9ca30e4f8e989fb8e28d",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "7617e94d52ff561b63d6efb5d75e5d986f7de7c70598c1d9b34560daa1731ef2",
+            "931b801f2be66f5c8b5c4a2cbb33231bea273a504b47364b2e105db9c948e9bd",
         ),
         (
             "clustered with a storage policy",
@@ -3826,7 +3827,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "d166858d3524a2f3861c8222590b5fa3ebe54e1d0f375283c7407e2f26c377c6",
+            "f6e7f09f3f8e3e05e9e82e3fa6f507b7a86e3c9275dc7042a069e87975301a09",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -6833,5 +6834,54 @@ fn the_profile_landing_upload_columns_carry_defaults() {
             defaulted, want,
             "{what}: the columns of profile_landing that carry a DEFAULT"
         );
+    }
+}
+
+/// Issue #889: every table keeps its replaced parts 60 s, and a merge and a
+/// fetch flush the files of the part they write before it replaces anything.
+/// The tuple comes first in each table's `SETTINGS`, once, in both renders.
+/// No wrapper or view carries any of it, no statement flushes a part's
+/// directory, and only the `Distributed` wrappers flush their inserts.
+#[test]
+fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and_fetches() {
+    const TUPLE: &str = "SETTINGS old_parts_lifetime = 60, \
+                         min_compressed_bytes_to_fsync_after_merge = 1, \
+                         min_compressed_bytes_to_fsync_after_fetch = 1, ";
+    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
+        let mut tables = 0;
+        for s in rendered_statements(&ctx) {
+            let is_wrapper = s.contains("ENGINE = Distributed(");
+            let is_table = s.trim_start().starts_with("CREATE TABLE") && !is_wrapper;
+            if is_table {
+                assert_eq!(
+                    s.matches(TUPLE).count(),
+                    1,
+                    "{what}: a table without the replaced-parts settings once: {s}"
+                );
+                tables += 1;
+            } else {
+                for name in [
+                    "old_parts_lifetime",
+                    "fsync_after_merge",
+                    "fsync_after_fetch",
+                ] {
+                    assert!(
+                        !s.contains(name),
+                        "{what}: {name} reached a wrapper or a view: {s}"
+                    );
+                }
+            }
+            assert!(
+                !s.contains("fsync_part_directory"),
+                "{what}: a statement flushes a part's directory: {s}"
+            );
+            if s.contains("fsync_after_insert") {
+                assert!(
+                    is_wrapper,
+                    "{what}: fsync_after_insert outside a wrapper: {s}"
+                );
+            }
+        }
+        assert_eq!(tables, 37, "{what}: table count");
     }
 }

@@ -9,7 +9,7 @@
 //! the query API uses, against `proto/types/v1/types.proto` and
 //! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages,
 //! issue #824 the time series', issue #827 the diff's, issue #825 the
-//! heatmap's.
+//! heatmap's, issue #826 the exemplar's.
 //!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
@@ -28,7 +28,7 @@ use pulsus_profiles_wire::querier_v1::{
     SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
+    Exemplar, GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
     LabelValuesRequest, LabelValuesResponse, Labels, Location as CallSite, Point,
     ProfileAnnotation, ProfileType, Series, StackTraceSelector,
 };
@@ -468,9 +468,11 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
 
     let m = SelectMergeStacktracesResponse {
         flamegraph: Some(flame_graph()),
+        tree: vec![0, 0, 1],
     };
     let mut b = Vec::new();
     nested(1, &flame_graph_bytes(&flame_graph()), &mut b);
+    encoding::bytes::encode(2, &m.tree, &mut b);
     assert_eq!(m.encode_to_vec(), b, "SelectMergeStacktracesResponse");
 
     let m = SelectMergeStacktracesRequest {
@@ -670,6 +672,7 @@ fn point() -> Point {
         value: 2.5,
         timestamp: 1_794_819_600_000,
         annotations: vec![annotation()],
+        exemplars: Vec::new(),
     }
 }
 
@@ -755,6 +758,7 @@ fn heatmap_slot() -> HeatmapSlot {
         timestamp: 1_794_819_600_000,
         y_min: vec![0.0, 2.5, 5.0],
         counts: vec![1, 0, 3],
+        exemplars: Vec::new(),
     }
 }
 
@@ -829,4 +833,48 @@ fn every_heatmap_message_field_encodes_under_the_proto_tag() {
     encoding::int64::encode(9, &0, &mut b);
     check("limit 0", &zero, b);
     check("default", &SelectHeatmapRequest::default(), Vec::new());
+}
+
+fn exemplar() -> Exemplar {
+    Exemplar {
+        timestamp: 1_794_819_625_000,
+        profile_id: "00000000-0000-0000-0000-0000000000c2".to_string(),
+        span_id: "0a00000000000000".to_string(),
+        value: 5,
+        labels: vec![label_pair()],
+        trace_id: "00000000000000000000000000000002".to_string(),
+    }
+}
+
+fn exemplar_bytes(e: &Exemplar) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::int64::encode(1, &e.timestamp, &mut b);
+    encoding::string::encode(2, &e.profile_id, &mut b);
+    encoding::string::encode(3, &e.span_id, &mut b);
+    encoding::int64::encode(4, &e.value, &mut b);
+    nested(5, &label_pair_bytes(&e.labels[0]), &mut b);
+    encoding::string::encode(6, &e.trace_id, &mut b);
+    b
+}
+
+/// W1 (issue #826): `Exemplar`, every field set, and `Point` and
+/// `HeatmapSlot` each carrying one under tag 4.
+#[test]
+fn every_exemplar_field_encodes_under_the_proto_tag() {
+    let e = exemplar();
+    check("Exemplar", &e, exemplar_bytes(&e));
+    let p = Point {
+        exemplars: vec![exemplar()],
+        ..point()
+    };
+    let mut b = point_bytes(&point());
+    nested(4, &exemplar_bytes(&exemplar()), &mut b);
+    check("Point with an exemplar", &p, b);
+    let slot = HeatmapSlot {
+        exemplars: vec![exemplar()],
+        ..heatmap_slot()
+    };
+    let mut b = heatmap_slot_bytes(&heatmap_slot());
+    nested(4, &exemplar_bytes(&exemplar()), &mut b);
+    check("HeatmapSlot with an exemplar", &slot, b);
 }

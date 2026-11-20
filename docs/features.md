@@ -24,7 +24,7 @@ M1 and M2 are deliberately **narrow proof milestones**: the project exists becau
 | OTLP traces | `POST /v1/traces` | protobuf | M4 |
 | OTLP profiles | `POST /v1development/profiles` | protobuf (experimental OTLP signal) | M5 |
 | Prometheus remote write | `POST /api/v1/write` | snappy protobuf (`prompb.WriteRequest`) — supports the collector's `prometheusremotewrite` exporter | M2 |
-| Profile ingest (native) | `POST /api/profiles/v1/ingest` | pprof; folded stacks, lines, trie, tree and speedscope | M5 |
+| Profile ingest (native) | `POST /api/profiles/v1/ingest` | pprof; folded stacks, lines, trie, tree, speedscope and JFR | M5 |
 | OTLP/JSON encoding | all OTLP endpoints | JSON per OTLP/HTTP spec | M6 |
 
 ### 1.2 Compatibility receivers (flag-gated, M6)
@@ -160,6 +160,7 @@ and for the one performance cliff it introduces.
 | Stats | `GET /api/profiles/v1/stats` | M5 |
 | Render (flamebearer) | `GET /api/profiles/v1/render` | M5 |
 | Diff render | `GET /api/profiles/v1/render-diff` | M5 |
+| Label values, the reference's form | `GET /api/profiles/v1/label-values` | M5 |
 | DOT export | `render?format=dot` — `maxNodes`, unit-aware labels, scaled fonts | M5 |
 | Compat query aliases (Connect-protocol querier surface + render paths) | flag-gated | M5 |
 

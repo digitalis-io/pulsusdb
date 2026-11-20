@@ -117,6 +117,9 @@ profileql_heatmap_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_POR
 # Issue #825: SelectHeatmap over the Connect protocol, against the spawned
 # binary. Reuses this job's ClickHouse container.
 profileql_heatmap	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_heatmap
+# Issue #829: the render routes and the tree format, against the spawned
+# binary. Reuses this job's ClickHouse container.
+profileql_render	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_render
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406
@@ -146,8 +149,9 @@ otlp_profiles_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19
 # Issue #822: the profiles differential. Pushes one fixture through
 # every receiver to the spawned binary and to the pinned profiles
 # reference started above, under two tenants, and compares the
-# catalogue answers and the stored values. Reuses this job's ClickHouse
-# container.
+# catalogue answers and the stored values; part B of #823, #824, #825
+# and #827 adds the flame graph, series, heatmap and diff over a second
+# pair of tenants. Reuses this job's ClickHouse container.
 profileql_differential	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_PROFILEQL_DIFF_URL=http://localhost:14040	cargo test -p pulsus-server --test profileql_differential
 # Issue #816: each signal's OTLP export over gRPC (h2c and TLS h2, gzip and
 # identity) stores the rows its HTTP route stores. Reuses this job's
