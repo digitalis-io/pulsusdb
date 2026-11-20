@@ -34,5 +34,27 @@
                 </replica>
             </shard>
         </pulsus_test_cluster>
+        <!--
+          Used by one test alone, `pushes_keep_being_answered_while_a_replica_is_unreachable`
+          in crates/pulsus-write/tests/live_cluster_landing.rs (issue #888): one shard
+          whose first replica is host 99 of the fixture's subnet, which no service is
+          given, so a connect to it times out inside the network. Its second replica
+          is shard 1's first, as in pulsus_test_cluster.
+        -->
+        <pulsus_test_cluster_drop>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.99</host>
+                    <port>9000</port>
+                    <priority>1</priority>
+                </replica>
+                <replica>
+                    <host>172.28.0.11</host>
+                    <port>9000</port>
+                    <priority>2</priority>
+                </replica>
+            </shard>
+        </pulsus_test_cluster_drop>
     </remote_servers>
 </clickhouse>
