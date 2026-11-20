@@ -80,6 +80,7 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
+      - ./config.d/text_log.xml:/etc/clickhouse-server/config.d/text_log.xml:ro
       - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
       - ./config.d/storage_partial.xml:/etc/clickhouse-server/config.d/storage_partial.xml:ro
     ports:
@@ -109,6 +110,7 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard1b/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
+      - ./config.d/text_log.xml:/etc/clickhouse-server/config.d/text_log.xml:ro
       - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
       - ./config.d/storage_partial.xml:/etc/clickhouse-server/config.d/storage_partial.xml:ro
     # Below 32768, where Linux starts handing out the ports of outgoing
@@ -142,6 +144,7 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard2/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
+      - ./config.d/text_log.xml:/etc/clickhouse-server/config.d/text_log.xml:ro
       - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
     ports:
       - "28123:8123" # HTTP
