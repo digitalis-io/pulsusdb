@@ -412,6 +412,55 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
     );
 }
 
+/// Issue #889: every table keeps its replaced parts 60 s, and a merge and a
+/// fetch flush the files of the part they write before it replaces anything.
+/// The tuple comes first in each table's `SETTINGS`, once, in both renders.
+/// No wrapper or view carries any of it, no statement flushes a part's
+/// directory, and only the `Distributed` wrappers flush their inserts.
+#[test]
+fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and_fetches() {
+    const TUPLE: &str = "SETTINGS old_parts_lifetime = 60, \
+                         min_compressed_bytes_to_fsync_after_merge = 1, \
+                         min_compressed_bytes_to_fsync_after_fetch = 1, ";
+    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
+        let mut tables = 0;
+        for s in rendered_statements(&ctx) {
+            let is_wrapper = s.contains("ENGINE = Distributed(");
+            let is_table = s.trim_start().starts_with("CREATE TABLE") && !is_wrapper;
+            if is_table {
+                assert_eq!(
+                    s.matches(TUPLE).count(),
+                    1,
+                    "{what}: a table without the replaced-parts settings once: {s}"
+                );
+                tables += 1;
+            } else {
+                for name in [
+                    "old_parts_lifetime",
+                    "fsync_after_merge",
+                    "fsync_after_fetch",
+                ] {
+                    assert!(
+                        !s.contains(name),
+                        "{what}: {name} reached a wrapper or a view: {s}"
+                    );
+                }
+            }
+            assert!(
+                !s.contains("fsync_part_directory"),
+                "{what}: a statement flushes a part's directory: {s}"
+            );
+            if s.contains("fsync_after_insert") {
+                assert!(
+                    is_wrapper,
+                    "{what}: fsync_after_insert outside a wrapper: {s}"
+                );
+            }
+        }
+        assert_eq!(tables, 37, "{what}: table count");
+    }
+}
+
 /// The configured values reach the statements: a hard-coded literal in the
 /// file passes at the default and fails here.
 #[test]
@@ -2437,7 +2486,7 @@ ENGINE = ReplacingMergeTree(ver)
 PARTITION BY toDate(minute)
 ORDER BY (org_id, conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400), 4294967295))
-SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 
 /// `service_edges_mv` as the design writes it (part A §3.2, part C §3),
 /// rendered the same way, with the production row ceiling. Its first line
@@ -3267,7 +3316,7 @@ fn the_rollup_levels_render_from_one_template() {
                         format!(
                             "TTL staged_at + toIntervalHour(6 + 2 * intDiv({next}000 + 3599999, 3600000) + 1)"
                         ),
-                        "SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
+                        "SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
                     ] {
                         assert!(
                             stage_lines.contains(&line.as_str()),
