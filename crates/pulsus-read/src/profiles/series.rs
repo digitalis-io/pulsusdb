@@ -390,14 +390,27 @@ pub(super) type LabelsByFingerprint = HashMap<u128, Vec<(String, String)>>;
 
 /// Issue #826: an exemplar statement's rows split into the series rows,
 /// those `is_series` holds for, and the map each other row's
-/// `(fingerprint, labels)` makes.
+/// `(fingerprint, labels)` makes. Each label list takes the reference's
+/// order: `__profile_type__` first, `__service_name__` second, the rest by
+/// name.
 pub(super) fn split_labels<R>(
     rows: Vec<R>,
     is_series: impl Fn(&R) -> bool,
     labels: impl Fn(R) -> (u128, Vec<(String, String)>),
 ) -> (Vec<R>, LabelsByFingerprint) {
     let (series, other): (Vec<R>, Vec<R>) = rows.into_iter().partition(|r| is_series(r));
-    (series, other.into_iter().map(labels).collect())
+    let by_fingerprint = other
+        .into_iter()
+        .map(|r| {
+            let (fingerprint, mut pairs) = labels(r);
+            pairs.sort_by(|(a, _), (b, _)| {
+                let key = |n: &str| (n != "__profile_type__", n != "__service_name__");
+                key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+            });
+            (fingerprint, pairs)
+        })
+        .collect();
+    (series, by_fingerprint)
 }
 
 /// A series' labels: the `group_by` names it holds a value for, in request
@@ -1112,6 +1125,58 @@ GROUP BY fingerprint";
         assert_eq!(
             labels(&series_exemplars(tied, &group_by, None)),
             vec![pod("a"), pod("b")]
+        );
+    }
+
+    /// S20 (issue #826 part B): an exemplar's labels take the reference's
+    /// order, `__profile_type__` first, `__service_name__` second, the rest
+    /// by name.
+    #[test]
+    fn s20_exemplar_labels_take_the_reference_order() {
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
+        };
+        let rows = vec![
+            TimeSeriesExemplarRow {
+                kind: 0,
+                g: vec!["a".to_string()],
+                series_total: 3.0,
+                points: vec![(1, 3.0, 3, "p".to_string(), 7, 9)],
+                fingerprint: 0,
+                labels: Vec::new(),
+            },
+            TimeSeriesExemplarRow {
+                kind: 1,
+                g: Vec::new(),
+                series_total: 0.0,
+                points: Vec::new(),
+                fingerprint: 9,
+                labels: pairs(&[
+                    ("__name__", "process_cpu"),
+                    ("__period_type__", "cpu"),
+                    ("__profile_type__", "T"),
+                    ("__service_name__", "v"),
+                    ("pod", "e"),
+                ]),
+            },
+        ];
+        let out = series_exemplars(rows, &strings(&["pod"]), None);
+        let got = out[0].points[0]
+            .exemplar
+            .as_ref()
+            .map(|e| e.labels.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            got,
+            pairs(&[
+                ("__profile_type__", "T"),
+                ("__service_name__", "v"),
+                ("__name__", "process_cpu"),
+                ("__period_type__", "cpu"),
+                ("pod", "e"),
+            ])
         );
     }
 }

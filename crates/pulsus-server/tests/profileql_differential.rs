@@ -5,7 +5,9 @@
 //! the answer must be. Part B of issues #823, #824, #825 and #827 adds
 //! the flame graph, the series, the heatmap and the diff (C15–C30) over a
 //! second pair of tenants holding the query fixture. Issue #829 part A adds
-//! the tree format, the render routes and `label-values` (C31–C38).
+//! the tree format, the render routes and `label-values` (C31–C38), and
+//! issue #826 part B the exemplars of the series and the heatmap (C39–C43)
+//! over that pair.
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -54,7 +56,7 @@ use pulsus_profiles_wire::querier_v1::{
     SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
+    Exemplar, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
     LabelValuesRequest, LabelValuesResponse, Point, Series,
 };
 use serde_json::{Value, json};
@@ -118,15 +120,21 @@ const SERVICES: [&str; 15] = [
 ];
 
 /// The query fixture's `rx` values (§3.2), sorted.
-const Q_RX: [&str; 15] = [
+const Q_RX: [&str; 21] = [
     "q-allother",
     "q-d4l",
     "q-d4r",
     "q-d5l",
     "q-d5r",
     "q-d7",
+    "q-ex-1",
+    "q-ex-2",
+    "q-ex-3",
+    "q-ex-4",
+    "q-exspan",
     "q-other",
     "q-span",
+    "q-split",
     "q-trim",
     "q-ts-1",
     "q-ts-2",
@@ -139,6 +147,17 @@ const Q_RX: [&str; 15] = [
 /// `q-span`'s two span ids (§3.2).
 const SPAN_1: &str = "0102030405060708";
 const SPAN_2: &str = "1112131415161718";
+/// `q-exspan`'s third span id and its one trace id (#826 part B §3).
+const SPAN_3: &str = "2122232425262728";
+const TRACE_1: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// The exemplar fixture's profile ids (#826 part B §3), each pushed in
+/// `RawSample.id` so that both servers store it.
+const ID_E1: &str = "00000000-0000-4000-8000-0000000000e1";
+const ID_E2: &str = "00000000-0000-4000-8000-0000000000e2";
+const ID_E3: &str = "00000000-0000-4000-8000-0000000000e3";
+const ID_E4: &str = "00000000-0000-4000-8000-0000000000e4";
+const ID_E5: &str = "00000000-0000-4000-8000-0000000000e5";
 
 /// The `cpu` value of one count under `q1`; `q2` holds 100 times it.
 const Q1_UNIT: i64 = 10_000_000;
@@ -171,6 +190,14 @@ enum Window {
     Fixed(i64, i64),
 }
 
+/// Which query window a series or heatmap request reads: `Q` (§3.2) or the
+/// exemplar fixture's `X` (#826 part B §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Over {
+    Q,
+    X,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Method {
     ProfileTypes(Window),
@@ -186,17 +213,21 @@ enum Method {
         max_nodes: Option<i64>,
         span: &'static [&'static str],
     },
-    /// `SelectSeries` of `TYPE_A` over `Q`, step 15 s.
+    /// `SelectSeries` of `TYPE_A` over `over`, step 15 s.
     SelectSeries {
         selector: &'static str,
         group_by: &'static [&'static str],
+        exemplar_type: i32,
+        over: Over,
     },
-    /// `SelectHeatmap` of `TYPE_A` over `Q`, `group_by` `[]`; `step` in
+    /// `SelectHeatmap` of `TYPE_A` over `over`, `group_by` `[]`; `step` in
     /// seconds.
     Heatmap {
         selector: &'static str,
         step: i64,
         query_type: i32,
+        exemplar_type: i32,
+        over: Over,
     },
     /// `Diff` of two `TYPE_A` selections over `W`.
     Diff {
@@ -289,22 +320,47 @@ struct DiffGraph {
     right_ticks: i64,
 }
 
-/// One series: its labels, and its points as `(seconds after S0, value in
-/// the tenant's unit)`.
+/// One series: its labels, and its points as `(seconds after the case
+/// window's start, value in the tenant's unit)`.
 type SeriesPoints = (
     &'static [(&'static str, &'static str)],
     &'static [(i64, i64)],
 );
 
-/// A heatmap of one series: its labels, its slots as `(seconds after S0,
-/// [(bucket, count)])`, and its 20 bucket starts as `first + i × step`, both
-/// in tenths of the tenant's unit.
+/// A heatmap of one series: its labels, its slots as `(seconds after the
+/// case window's start, [(bucket, count)])`, its 20 bucket starts as
+/// `first + i × step`, both in tenths of the tenant's unit, and each slot's
+/// exemplars, in any order (R4), or `&[]` for none on every slot.
 #[derive(Debug)]
 struct Slots {
     labels: &'static [(&'static str, &'static str)],
     slots: &'static [(i64, &'static [(usize, i32)])],
     y_min: (i64, i64),
+    exemplars: &'static [&'static [Ex]],
 }
+
+/// One exemplar as #826 part B §4 writes it: its time in milliseconds after
+/// the case window's start, its full profile id or `""`, its span and trace
+/// ids or `""`, its value in the tenant's unit, and its labels
+/// `X(service; rest)`: [`x_labels`].
+#[derive(Debug, Clone, Copy)]
+struct Ex {
+    at_ms: i64,
+    id: &'static str,
+    span: &'static str,
+    trace: &'static str,
+    value: i64,
+    service: &'static str,
+    rest: &'static [(&'static str, &'static str)],
+}
+
+/// One series of exemplar points: its labels, and its points as `(seconds
+/// after the case window's start, value in the tenant's unit, its one
+/// exemplar)`.
+type ExemplarPoints = (
+    &'static [(&'static str, &'static str)],
+    &'static [(i64, i64, Ex)],
+);
 
 #[derive(Debug, Clone, Copy)]
 struct Request {
@@ -348,6 +404,8 @@ enum Fixture {
     Points(&'static [SeriesPoints]),
     /// Exactly this heatmap series.
     Slots(&'static Slots),
+    /// Exactly these series in this order, one exemplar per point.
+    Exemplars(&'static [ExemplarPoints]),
     /// Issue #829: the tree bytes decoded, per node in the order written:
     /// its name, its self in the tenant's unit, and its child count.
     Tree(&'static [(&'static str, i64, u64)]),
@@ -376,12 +434,13 @@ enum Expect {
         ours: Pin,
         theirs: Pin,
     },
-    /// A ledger case on a flame graph (R3): each server's decoded graph is
-    /// its own, and the bodies differ.
-    LedgerGraph {
+    /// A ledger case on a decoded answer (R5): each server's answer is
+    /// `200` and holds its own fixture, the `Content-Type`s are equal, and
+    /// the bodies differ.
+    LedgerFixture {
         row: &'static str,
-        ours: &'static Graph,
-        theirs: &'static Graph,
+        ours: Fixture,
+        theirs: Fixture,
     },
     /// Issue #829: a ledger case on a render answer: both answers are
     /// `Render(graph)`, and each timeline's one non-zero sample is at its
@@ -632,13 +691,125 @@ static C24_SLOTS: Slots = Slots {
         (30, &[(10, 1), (15, 1)]),
     ],
     y_min: (60, 12),
+    exemplars: &[],
 };
 
 static C25_SLOTS: Slots = Slots {
     labels: &[],
     slots: &[(5, &[(0, 1), (19, 1)])],
     y_min: (10, 2),
+    exemplars: &[&[
+        span_ex(
+            5_000,
+            SPAN_2,
+            "",
+            1,
+            "q-span",
+            &[("rx", "q-span"), ("service_name", "q-span")],
+        ),
+        span_ex(
+            5_000,
+            SPAN_1,
+            "",
+            5,
+            "q-span",
+            &[("rx", "q-span"), ("service_name", "q-span")],
+        ),
+    ]],
 };
+
+/// An `INDIVIDUAL` exemplar of profile `id`.
+const fn ex(
+    at_ms: i64,
+    id: &'static str,
+    value: i64,
+    service: &'static str,
+    rest: &'static [(&'static str, &'static str)],
+) -> Ex {
+    Ex {
+        at_ms,
+        id,
+        span: "",
+        trace: "",
+        value,
+        service,
+        rest,
+    }
+}
+
+/// A `SPAN` exemplar: no profile id.
+const fn span_ex(
+    at_ms: i64,
+    span: &'static str,
+    trace: &'static str,
+    value: i64,
+    service: &'static str,
+    rest: &'static [(&'static str, &'static str)],
+) -> Ex {
+    Ex {
+        at_ms,
+        id: "",
+        span,
+        trace,
+        value,
+        service,
+        rest,
+    }
+}
+
+/// C39's exemplars, and C41's at 10 s and 20 s.
+const EX_E3: Ex = ex(
+    10_000,
+    ID_E3,
+    240,
+    "q-ex",
+    &[("pod", "a"), ("rx", "q-ex-3"), ("service_name", "q-ex")],
+);
+const EX_E4: Ex = ex(
+    20_000,
+    ID_E4,
+    18,
+    "q-ex",
+    &[("pod", "b"), ("rx", "q-ex-4"), ("service_name", "q-ex")],
+);
+
+/// C41: the datasource's heatmap over `q-ex`.
+static C41_SLOTS: Slots = Slots {
+    labels: &[],
+    slots: &[(15, &[(0, 2), (19, 1)]), (30, &[(1, 1)])],
+    y_min: (60, 117),
+    exemplars: &[
+        &[
+            ex(
+                3_250,
+                ID_E1,
+                12,
+                "q-ex",
+                &[("pod", "a"), ("rx", "q-ex-1"), ("service_name", "q-ex")],
+            ),
+            EX_E3,
+        ],
+        &[EX_E4],
+    ],
+};
+
+/// `q-exspan`'s labels below the seven.
+const EXSPAN_REST: &[(&str, &str)] = &[("rx", "q-exspan"), ("service_name", "q-exspan")];
+
+/// C42: the span heatmap over `q-exspan`.
+static C42_SLOTS: Slots = Slots {
+    labels: &[],
+    slots: &[(15, &[(0, 1), (10, 1), (19, 1)])],
+    y_min: (10, 1),
+    exemplars: &[&[
+        span_ex(5_000, SPAN_2, "", 1, "q-exspan", EXSPAN_REST),
+        span_ex(5_000, SPAN_3, TRACE_1, 2, "q-exspan", EXSPAN_REST),
+        span_ex(5_000, SPAN_1, TRACE_1, 3, "q-exspan", EXSPAN_REST),
+    ]],
+};
+
+/// `q-split`'s labels below the seven.
+const SPLIT_REST: &[(&str, &str)] = &[("rx", "q-split"), ("service_name", "q-split")];
 
 static CASES: &[Case] = &[
     Case {
@@ -836,10 +1007,10 @@ static CASES: &[Case] = &[
         id: "C20",
         client: "datasource, max nodes set",
         request: query(merge(r#"{service_name="q-other"}"#, Some(3))),
-        expect: Expect::LedgerGraph {
+        expect: Expect::LedgerFixture {
             row: "flamegraph-named-other-keeps-cut-values",
-            ours: &Q_OTHER_OURS,
-            theirs: &Q_OTHER_THEIRS,
+            ours: Fixture::Graph(&Q_OTHER_OURS),
+            theirs: Fixture::Graph(&Q_OTHER_THEIRS),
         },
     },
     Case {
@@ -858,6 +1029,8 @@ static CASES: &[Case] = &[
         request: query(Method::SelectSeries {
             selector: r#"{service_name="q-ts"}"#,
             group_by: &[],
+            exemplar_type: 1,
+            over: Over::Q,
         }),
         expect: Expect::Parity(Fixture::Points(&[(&[], Q_TS_POINTS)])),
     },
@@ -867,6 +1040,8 @@ static CASES: &[Case] = &[
         request: query(Method::SelectSeries {
             selector: "{}",
             group_by: &["service_name"],
+            exemplar_type: 1,
+            over: Over::Q,
         }),
         expect: Expect::Parity(Fixture::Points(&[
             (&[("service_name", "q-ts")], Q_TS_POINTS),
@@ -881,6 +1056,8 @@ static CASES: &[Case] = &[
             selector: "{}",
             step: 15,
             query_type: 1,
+            exemplar_type: 1,
+            over: Over::Q,
         }),
         expect: Expect::Parity(Fixture::Slots(&C24_SLOTS)),
     },
@@ -892,6 +1069,8 @@ static CASES: &[Case] = &[
                 selector: r#"{service_name="q-span"}"#,
                 step: 1,
                 query_type: 2,
+                exemplar_type: 3,
+                over: Over::Q,
             },
             encoding: Encoding::Json,
             utf8: true,
@@ -1039,6 +1218,118 @@ static CASES: &[Case] = &[
             theirs: 0,
         },
     },
+    Case {
+        id: "C39",
+        client: "datasource, exemplars on, one service",
+        request: query(Method::SelectSeries {
+            selector: r#"{service_name="q-ex"}"#,
+            group_by: &[],
+            exemplar_type: 2,
+            over: Over::X,
+        }),
+        expect: Expect::Parity(Fixture::Exemplars(&[(
+            &[],
+            &[(15, 258, EX_E3), (30, 18, EX_E4)],
+        )])),
+    },
+    Case {
+        id: "C40",
+        client: "datasource, exemplars on, by a label",
+        request: query(Method::SelectSeries {
+            selector: r#"{service_name="q-ex"}"#,
+            group_by: &["pod"],
+            exemplar_type: 2,
+            over: Over::X,
+        }),
+        expect: Expect::Parity(Fixture::Exemplars(&[
+            (
+                &[("pod", "a")],
+                &[(
+                    15,
+                    252,
+                    ex(
+                        10_000,
+                        ID_E3,
+                        240,
+                        "q-ex",
+                        &[("rx", "q-ex-3"), ("service_name", "q-ex")],
+                    ),
+                )],
+            ),
+            (
+                &[("pod", "b")],
+                &[
+                    (
+                        15,
+                        6,
+                        ex(
+                            7_500,
+                            ID_E2,
+                            6,
+                            "q-ex",
+                            &[("rx", "q-ex-2"), ("service_name", "q-ex")],
+                        ),
+                    ),
+                    (
+                        30,
+                        18,
+                        ex(
+                            20_000,
+                            ID_E4,
+                            18,
+                            "q-ex",
+                            &[("rx", "q-ex-4"), ("service_name", "q-ex")],
+                        ),
+                    ),
+                ],
+            ),
+        ])),
+    },
+    Case {
+        id: "C41",
+        client: "datasource heatmap, exemplars on",
+        request: query(Method::Heatmap {
+            selector: r#"{service_name="q-ex"}"#,
+            step: 15,
+            query_type: 1,
+            exemplar_type: 2,
+            over: Over::X,
+        }),
+        expect: Expect::Parity(Fixture::Slots(&C41_SLOTS)),
+    },
+    Case {
+        id: "C42",
+        client: "datasource span heatmap, exemplars on",
+        request: query(Method::Heatmap {
+            selector: r#"{service_name="q-exspan"}"#,
+            step: 15,
+            query_type: 2,
+            exemplar_type: 3,
+            over: Over::X,
+        }),
+        expect: Expect::Parity(Fixture::Slots(&C42_SLOTS)),
+    },
+    Case {
+        id: "C43",
+        client: "datasource, exemplars on, a profile with sample labels",
+        request: query(Method::SelectSeries {
+            selector: r#"{service_name="q-split"}"#,
+            group_by: &[],
+            exemplar_type: 2,
+            over: Over::X,
+        }),
+        expect: Expect::LedgerFixture {
+            row: "exemplar-split-profile-per-part",
+            ours: Fixture::Exemplars(&[(
+                &[],
+                &[(15, 6, ex(12_000, ID_E5, 3, "q-split", SPLIT_REST))],
+            )]),
+            theirs: Fixture::Exemplars(&[(
+                &[],
+                &[(15, 6, ex(12_000, ID_E5, 6, "q-split", SPLIT_REST))],
+            )]),
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------
@@ -1114,7 +1405,7 @@ fn the_ledger_and_the_cases_name_each_other() {
 
     for case in CASES {
         if let Expect::Ledger { row, .. }
-        | Expect::LedgerGraph { row, .. }
+        | Expect::LedgerFixture { row, .. }
         | Expect::LedgerTimeline { row, .. } = case.expect
             && !headings.contains(row)
         {
@@ -1136,7 +1427,7 @@ fn the_ledger_and_the_cases_name_each_other() {
             Some(Case {
                 expect:
                     Expect::Ledger { row, .. }
-                    | Expect::LedgerGraph { row, .. }
+                    | Expect::LedgerFixture { row, .. }
                     | Expect::LedgerTimeline { row, .. },
                 ..
             }) if row == id => {}
@@ -1423,18 +1714,9 @@ fn intern(table: &mut Vec<String>, v: &str) -> i64 {
     (table.len() - 1) as i64
 }
 
-/// The three stacks, root first, each with its sample label.
-/// A stack, root first, and its sample label.
-type Stack = (
-    &'static [&'static str],
-    Option<(&'static str, &'static str)>,
-);
-
-const STACKS: [Stack; 3] = [
-    (&["main", "a", "b"], None),
-    (&["main", "a", "c"], Some(("thread", "t-a"))),
-    (&["main"], Some(("pod", "p1"))),
-];
+/// The three stacks, root first; their sample labels are
+/// [`Form::sample_labels`].
+const STACKS: [&[&str]; 3] = [&["main", "a", "b"], &["main", "a", "c"], &["main"]];
 
 /// The `count` of each stack.
 const COUNTS: [i64; 3] = [3, 2, 1];
@@ -1451,6 +1733,31 @@ enum Form {
     /// `q-span`'s (§3.2): P with a sample label `span_id` in place of P's
     /// labels.
     Span,
+    /// P with no sample labels (#826 part B §3).
+    Plain,
+    /// `q-exspan`'s (#826 part B §3): `main;a;b` in `SPAN_1` of `TRACE_1`,
+    /// `main;a;c` in `SPAN_3` of `TRACE_1`, `main` in `SPAN_2` of no trace.
+    SpanTrace,
+}
+
+impl Form {
+    /// The sample labels of P's three stacks, in [`STACKS`]' order.
+    fn sample_labels(self) -> [&'static [(&'static str, &'static str)]; 3] {
+        match self {
+            Form::Cpu | Form::Memory => [&[], &[("thread", "t-a")], &[("pod", "p1")]],
+            Form::Span => [
+                &[("span_id", SPAN_1)],
+                &[("span_id", SPAN_1)],
+                &[("span_id", SPAN_2)],
+            ],
+            Form::Plain => [&[], &[], &[]],
+            Form::SpanTrace => [
+                &[("span_id", SPAN_1), ("trace_id", TRACE_1)],
+                &[("span_id", SPAN_3), ("trace_id", TRACE_1)],
+                &[("span_id", SPAN_2)],
+            ],
+        }
+    }
 }
 
 /// Profile P in `form`, timed `time_ns`, every value times `scale`.
@@ -1499,29 +1806,23 @@ fn pprof(time_ns: i64, scale: i64, form: Form) -> google_v1::Profile {
         })
         .collect();
     let id_of = |n: &str| names.iter().position(|x| *x == n).expect("a function") as u64 + 1;
-    let spans = [
-        Some(("span_id", SPAN_1)),
-        Some(("span_id", SPAN_1)),
-        Some(("span_id", SPAN_2)),
-    ];
     let sample = STACKS
         .iter()
         .zip(COUNTS)
-        .zip(spans)
-        .map(|(((stack, label), count), span)| {
-            let label = if form == Form::Span { span } else { *label };
+        .zip(form.sample_labels())
+        .map(|((stack, count), labels)| {
             let value = if memory {
                 vec![count * 1000 * scale]
             } else {
                 vec![count * scale, count * CPU_PERIOD * scale]
             };
-            let label = label
+            let label = labels
+                .iter()
                 .map(|(k, v)| google_v1::Label {
                     key: intern(&mut t, k),
                     str: intern(&mut t, v),
                     ..google_v1::Label::default()
                 })
-                .into_iter()
                 .collect();
             google_v1::Sample {
                 location_id: stack.iter().rev().map(|n| id_of(n)).collect(),
@@ -1699,7 +2000,8 @@ fn otlp_json(request: &ExportProfilesServiceRequest) -> Vec<u8> {
     v.to_string().into_bytes()
 }
 
-fn push_request(labels: &[(&str, &str)], raw_profile: Vec<u8>) -> PushRequest {
+/// A push of one profile; `id` is its `RawSample.id`, `""` for none.
+fn push_request(labels: &[(&str, &str)], raw_profile: Vec<u8>, id: &str) -> PushRequest {
     PushRequest {
         series: vec![RawProfileSeries {
             labels: labels
@@ -1711,7 +2013,7 @@ fn push_request(labels: &[(&str, &str)], raw_profile: Vec<u8>) -> PushRequest {
                 .collect(),
             samples: vec![RawSample {
                 raw_profile,
-                id: String::new(),
+                id: id.to_string(),
             }],
             annotations: Vec::new(),
         }],
@@ -1950,6 +2252,7 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
                         ("k8s.pod.name", "p0"),
                     ],
                     p(5),
+                    "",
                 )
                 .encode_to_vec(),
                 answer: PushAnswer::Connect,
@@ -1985,6 +2288,7 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
                         ("env", "prod"),
                     ],
                     p(7),
+                    "",
                 )
                 .encode_to_vec(),
                 answer: PushAnswer::Connect,
@@ -2049,7 +2353,7 @@ fn pushes(t0_s: i64, run: &str, t1: bool) -> Vec<Push> {
         transport: Transport::Http {
             path: "/push.v1.PusherService/Push".to_string(),
             headers: vec![("Content-Type", "application/proto".to_string())],
-            body: push_request(&only_labels, only_profile).encode_to_vec(),
+            body: push_request(&only_labels, only_profile, "").encode_to_vec(),
             answer: PushAnswer::Connect,
         },
     });
@@ -2158,9 +2462,10 @@ fn jfr_pushes(t0_s: i64, run: &str) -> Vec<Push> {
     }]
 }
 
-/// The query fixture (§3.2): every count times 1 under `q1`, 100 under
-/// `q2`. Every push has its own `rx`.
-fn query_pushes(t0_s: i64, s0_s: i64, q1: bool) -> Vec<Push> {
+/// The query fixture (§3.2) and the exemplar fixture at `e0_s` (#826 part B
+/// §3): every count times 1 under `q1`, 100 under `q2`. Every push has its
+/// own `rx`.
+fn query_pushes(t0_s: i64, s0_s: i64, e0_s: i64, q1: bool) -> Vec<Push> {
     let scale = if q1 { 1 } else { 100 };
     let folded = |rx: &'static str, service: &str, at: i64, rows: &[(&str, i64)]| -> Push {
         let body: String = rows
@@ -2250,11 +2555,46 @@ fn query_pushes(t0_s: i64, s0_s: i64, q1: bool) -> Vec<Push> {
                     ("rx", "q-span"),
                 ],
                 gzip(&pprof((s0_s + 5) * 1_000_000_000, scale, Form::Span).encode_to_vec()),
+                "",
             )
             .encode_to_vec(),
             answer: PushAnswer::Connect,
         },
     });
+    // The exemplar fixture: `(rx, service, pod, ms after E0, k, form, id)`.
+    let exemplar_rows = [
+        ("q-ex-1", "q-ex", Some("a"), 3_250, 2, Form::Plain, ID_E1),
+        ("q-ex-2", "q-ex", Some("b"), 7_500, 1, Form::Plain, ID_E2),
+        ("q-ex-3", "q-ex", Some("a"), 10_000, 40, Form::Plain, ID_E3),
+        ("q-ex-4", "q-ex", Some("b"), 20_000, 3, Form::Plain, ID_E4),
+        ("q-exspan", "q-exspan", None, 5_000, 1, Form::SpanTrace, ""),
+        ("q-split", "q-split", None, 12_000, 1, Form::Cpu, ID_E5),
+    ];
+    for (rx, service, pod, after_ms, k, form, id) in exemplar_rows {
+        let mut labels = vec![
+            ("__name__", "process_cpu"),
+            ("service_name", service),
+            ("rx", rx),
+        ];
+        if let Some(pod) = pod {
+            labels.push(("pod", pod));
+        }
+        let at_ns = (e0_s * 1000 + after_ms) * 1_000_000;
+        out.push(Push {
+            rx,
+            transport: Transport::Http {
+                path: "/push.v1.PusherService/Push".to_string(),
+                headers: vec![("Content-Type", "application/proto".to_string())],
+                body: push_request(
+                    &labels,
+                    gzip(&pprof(at_ns, k * scale, form).encode_to_vec()),
+                    id,
+                )
+                .encode_to_vec(),
+                answer: PushAnswer::Connect,
+            },
+        });
+    }
     out
 }
 
@@ -2583,20 +2923,63 @@ fn landing_sets(t1: bool) -> BTreeSet<LabelSet> {
     out
 }
 
+/// An exemplar's expected labels, `X(service; rest)` (#826 part B §4): the
+/// seven pairs of `TYPE_A` with `__service_name__` second, then `rest`.
+fn x_labels(service: &str, rest: &[(&str, &str)]) -> Vec<LabelPair> {
+    let mut out = label_pairs(&[
+        ("__profile_type__", TYPE_A),
+        ("__service_name__", service),
+        ("__name__", "process_cpu"),
+        ("__period_type__", "cpu"),
+        ("__period_unit__", "nanoseconds"),
+        ("__type__", "cpu"),
+        ("__unit__", "nanoseconds"),
+    ]);
+    out.extend(label_pairs(rest));
+    out
+}
+
+/// `ex` as the wire message, in the unit `b`, timed from `start_ms`.
+fn exemplar_of(ex: &Ex, b: i64, start_ms: i64) -> Exemplar {
+    Exemplar {
+        timestamp: start_ms + ex.at_ms,
+        profile_id: ex.id.to_string(),
+        span_id: ex.span.to_string(),
+        value: ex.value * b,
+        labels: x_labels(ex.service, ex.rest),
+        trace_id: ex.trace.to_string(),
+    }
+}
+
+/// R4's order of a slot's exemplars: by value, time, profile id, span id,
+/// trace id.
+fn sort_exemplars(exemplars: &mut [Exemplar]) {
+    exemplars.sort_by(|a, b| {
+        (a.value, a.timestamp, &a.profile_id, &a.span_id, &a.trace_id).cmp(&(
+            b.value,
+            b.timestamp,
+            &b.profile_id,
+            &b.span_id,
+            &b.trace_id,
+        ))
+    });
+}
+
 /// Checks one server's answer to a fixture case, `None` when it holds.
 /// Every fixture case is a success: an error status fails here, whatever
-/// its body decodes as. `t1` is the pair's first tenant; `s0_ms` is S0.
+/// its body decodes as. `t1` is the pair's first tenant; `start_ms` is the
+/// case window's start.
 fn fixture_failure(
     fixture: Fixture,
     case: &Case,
     t1: bool,
-    s0_ms: i64,
+    start_ms: i64,
     res: &Res,
 ) -> Option<String> {
     if res.status != 200 {
         return Some(format!("status {}, want 200", res.status));
     }
-    check_fixture(fixture, case, t1, s0_ms, &res.body)
+    check_fixture(fixture, case, t1, start_ms, &res.body)
 }
 
 /// Checks a decoded answer against `fixture`, `None` when it holds.
@@ -2604,7 +2987,7 @@ fn check_fixture(
     fixture: Fixture,
     case: &Case,
     t1: bool,
-    s0_ms: i64,
+    start_ms: i64,
     body: &[u8],
 ) -> Option<String> {
     let method = &case.request.method;
@@ -2685,9 +3068,31 @@ fn check_fixture(
                         .iter()
                         .map(|(after_s, v)| Point {
                             value: (v * b) as f64,
-                            timestamp: s0_ms + after_s * 1000,
+                            timestamp: start_ms + after_s * 1000,
                             annotations: Vec::new(),
                             exemplars: Vec::new(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            return match decode_as::<SelectSeriesResponse>(encoding, body) {
+                Ok(r) if r.series == want => None,
+                Ok(r) => Some(format!("series {:?}, want {want:?}", r.series)),
+                Err(e) => Some(format!("undecodable: {e}")),
+            };
+        }
+        Fixture::Exemplars(series) => {
+            let want: Vec<Series> = series
+                .iter()
+                .map(|(labels, points)| Series {
+                    labels: label_pairs(labels),
+                    points: points
+                        .iter()
+                        .map(|(after_s, v, ex)| Point {
+                            value: (v * b) as f64,
+                            timestamp: start_ms + after_s * 1000,
+                            annotations: Vec::new(),
+                            exemplars: vec![exemplar_of(ex, b, start_ms)],
                         })
                         .collect(),
                 })
@@ -2708,23 +3113,36 @@ fn check_fixture(
                 slots: slots
                     .slots
                     .iter()
-                    .map(|(after_s, counts)| {
+                    .enumerate()
+                    .map(|(i, (after_s, counts))| {
                         let mut all = vec![0; 20];
                         for (bucket, count) in counts.iter() {
                             all[*bucket] = *count;
                         }
+                        let mut exemplars: Vec<Exemplar> = slots
+                            .exemplars
+                            .get(i)
+                            .into_iter()
+                            .flat_map(|xs| xs.iter())
+                            .map(|ex| exemplar_of(ex, b, start_ms))
+                            .collect();
+                        sort_exemplars(&mut exemplars);
                         HeatmapSlot {
-                            timestamp: s0_ms + after_s * 1000,
+                            timestamp: start_ms + after_s * 1000,
                             y_min: y_min.clone(),
                             counts: all,
-                            exemplars: Vec::new(),
+                            exemplars,
                         }
                     })
                     .collect(),
             }];
             return match decode_as::<SelectHeatmapResponse>(encoding, body) {
-                Ok(r) if r.series == want => None,
-                Ok(r) => Some(format!("heatmap {:?}, want {want:?}", r.series)),
+                Ok(mut r) => {
+                    for slot in r.series.iter_mut().flat_map(|s| s.slots.iter_mut()) {
+                        sort_exemplars(&mut slot.exemplars);
+                    }
+                    (r.series != want).then(|| format!("heatmap {:?}, want {want:?}", r.series))
+                }
                 Err(e) => Some(format!("undecodable: {e}")),
             };
         }
@@ -2783,6 +3201,7 @@ fn check_fixture(
         | Fixture::DiffGraph(_)
         | Fixture::Points(_)
         | Fixture::Slots(_)
+        | Fixture::Exemplars(_)
         | Fixture::Tree(_)
         | Fixture::Render(_)
         | Fixture::RenderDiff(_) => None,
@@ -2898,12 +3317,33 @@ fn value_checks(t1: bool) -> Vec<(&'static str, &'static str, i64)> {
 /// the 15 s boundary before `q-trim`, the query tenants' first profile, so
 /// each step ends 1 ms after a boundary and our point falls in the slot
 /// after the profile's own (the fixture keeps that profile off a boundary).
+/// And `X`, the exemplar fixture's window (#826 part B D2).
 #[derive(Debug, Clone, Copy)]
 struct Windows {
     w: (i64, i64),
     q: (i64, i64),
     r: (i64, i64),
     e: (i64, i64),
+    x: (i64, i64),
+}
+
+impl Windows {
+    /// The window `over` names.
+    fn of(&self, over: Over) -> (i64, i64) {
+        match over {
+            Over::Q => self.q,
+            Over::X => self.x,
+        }
+    }
+
+    /// The start of the window `method` reads its series or heatmap over:
+    /// `X` or `Q`, and `Q` for every other method.
+    fn case_start(&self, method: &Method) -> i64 {
+        match method {
+            Method::SelectSeries { over, .. } | Method::Heatmap { over, .. } => self.of(*over).0,
+            _ => self.q.0,
+        }
+    }
 }
 
 /// `msg` in `encoding`.
@@ -2918,7 +3358,6 @@ fn encoded<T: Message + serde::Serialize>(msg: &T, encoding: Encoding) -> Vec<u8
 fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
     let strings = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let w = win.w;
-    let (q0, q1) = win.q;
     let side = |selector: &str, max_nodes: Option<i64>| SelectMergeStacktracesRequest {
         profile_type_id: TYPE_A.to_string(),
         label_selector: selector.to_string(),
@@ -2960,14 +3399,24 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
         (Method::Render { .. } | Method::RenderDiff { .. } | Method::LabelValuesGet(_), _) => {
             Vec::new()
         }
-        (Method::SelectSeries { selector, group_by }, _) => {
+        (
+            Method::SelectSeries {
+                selector,
+                group_by,
+                exemplar_type,
+                over,
+            },
+            _,
+        ) => {
+            let (start, end) = win.of(*over);
             let msg = SelectSeriesRequest {
                 profile_type_id: TYPE_A.to_string(),
                 label_selector: selector.to_string(),
-                start: q0,
-                end: q1,
+                start,
+                end,
                 group_by: strings(group_by),
                 step: 15.0,
+                exemplar_type: *exemplar_type,
                 ..SelectSeriesRequest::default()
             };
             encoded(&msg, encoding)
@@ -2977,34 +3426,44 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
                 selector,
                 step,
                 query_type,
+                exemplar_type,
+                over,
             },
             Encoding::Proto,
-        ) => SelectHeatmapRequest {
-            profile_type_id: TYPE_A.to_string(),
-            label_selector: selector.to_string(),
-            start: q0,
-            end: q1,
-            step: *step as f64,
-            query_type: *query_type,
-            // `EXEMPLAR_TYPE_NONE`.
-            exemplar_type: 1,
-            ..SelectHeatmapRequest::default()
+        ) => {
+            let (start, end) = win.of(*over);
+            SelectHeatmapRequest {
+                profile_type_id: TYPE_A.to_string(),
+                label_selector: selector.to_string(),
+                start,
+                end,
+                step: *step as f64,
+                query_type: *query_type,
+                exemplar_type: *exemplar_type,
+                ..SelectHeatmapRequest::default()
+            }
+            .encode_to_vec()
         }
-        .encode_to_vec(),
         // The exploration app's body, numbers as it writes them (C25).
         (
             Method::Heatmap {
                 selector,
                 step,
                 query_type,
+                exemplar_type,
+                over,
             },
             Encoding::Json,
-        ) => json!({
-            "profileTypeID": TYPE_A, "labelSelector": selector, "start": q0, "end": q1,
-            "step": step, "groupBy": [], "queryType": query_type, "exemplarType": 0
-        })
-        .to_string()
-        .into_bytes(),
+        ) => {
+            let (start, end) = win.of(*over);
+            json!({
+                "profileTypeID": TYPE_A, "labelSelector": selector, "start": start, "end": end,
+                "step": step, "groupBy": [], "queryType": query_type,
+                "exemplarType": exemplar_type
+            })
+            .to_string()
+            .into_bytes()
+        }
         (
             Method::Diff {
                 left,
@@ -3188,6 +3647,7 @@ fn rx_values(server: &Server, tenant: &str, w: (i64, i64)) -> Option<Vec<String>
             q: w,
             r: w,
             e: w,
+            x: w,
         },
     );
     if res.status != 200 {
@@ -3272,6 +3732,60 @@ fn json_value(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(body).ok()
 }
 
+/// R4 (#826 part B §5): two `SelectHeatmap` answers of one status and
+/// `Content-Type`, `None` when equal with each slot's exemplars taken as a
+/// set. A success in proto: each body is the encoding of its own decoded
+/// answer, and the two re-encode equal with each slot's exemplars sorted
+/// ([`sort_exemplars`]). In JSON: the parsed values are equal with each
+/// `series[].slots[].exemplars` array sorted by its elements' text.
+/// Anything else compares as bytes.
+fn heatmap_parity(encoding: Encoding, ours: &Res, theirs: &Res) -> Option<&'static str> {
+    if ours.content_type != theirs.content_type {
+        return Some("Content-Type differs");
+    }
+    if ours.status != 200 {
+        return (ours.body != theirs.body).then_some("bodies differ");
+    }
+    match encoding {
+        Encoding::Proto => {
+            let decoded = |res: &Res| {
+                SelectHeatmapResponse::decode(&res.body[..])
+                    .ok()
+                    .filter(|r| r.encode_to_vec() == res.body)
+            };
+            let (Some(mut a), Some(mut b)) = (decoded(ours), decoded(theirs)) else {
+                return Some("a body is not the encoding of its decoded answer");
+            };
+            for r in [&mut a, &mut b] {
+                for slot in r.series.iter_mut().flat_map(|s| s.slots.iter_mut()) {
+                    sort_exemplars(&mut slot.exemplars);
+                }
+            }
+            (a.encode_to_vec() != b.encode_to_vec())
+                .then_some("bodies differ, each slot's exemplars as a set")
+        }
+        Encoding::Json => {
+            let sorted = |res: &Res| {
+                let mut v = json_value(&res.body)?;
+                for series in v["series"].as_array_mut().into_iter().flatten() {
+                    for slot in series["slots"].as_array_mut().into_iter().flatten() {
+                        if let Some(xs) = slot["exemplars"].as_array_mut() {
+                            xs.sort_by_key(|x| x.to_string());
+                        }
+                    }
+                }
+                Some(v)
+            };
+            match (sorted(ours), sorted(theirs)) {
+                (Some(a), Some(b)) if a == b => None,
+                (Some(_), Some(_)) => Some("JSON bodies differ, each slot's exemplars as a set"),
+                _ if ours.body == theirs.body => None,
+                _ => Some("bodies differ"),
+            }
+        }
+    }
+}
+
 /// `None` when two answers are equal under the case's rule (§5).
 fn parity(request: &Request, ours: &Res, theirs: &Res) -> Option<&'static str> {
     if ours.status != theirs.status {
@@ -3288,6 +3802,7 @@ fn parity(request: &Request, ours: &Res, theirs: &Res) -> Option<&'static str> {
         };
     }
     match (&request.method, request.encoding) {
+        (Method::Heatmap { .. }, encoding) => heatmap_parity(encoding, ours, theirs),
         (Method::Series { .. }, Encoding::Json) => {
             let (a, b) = (
                 label_sets(Encoding::Json, &ours.body),
@@ -3603,11 +4118,14 @@ async fn profileql_matches_the_reference() {
     let w = (now_ms - HOUR_MS, now_ms + HOUR_MS);
     let s0_s = t0_s + 180;
     let s0_ms = s0_s * 1000;
+    let e0_s = t0_s + 60;
+    let e0_ms = e0_s * 1000;
     let win = Windows {
         w,
         q: (s0_ms, s0_ms + 60_500),
         r: (w.0.div_euclid(15_000) * 15_000 + 14_999, w.1),
         e: (((t0_s + 1) * 1000).div_euclid(15_000) * 15_000 + 1, w.1),
+        x: (e0_ms, e0_ms + 30_500),
     };
     let mut mismatches = Mismatches::default();
 
@@ -3615,8 +4133,8 @@ async fn profileql_matches_the_reference() {
     let all_pushes = [
         (&t1, pushes(t0_s, &run, true)),
         (&t2, pushes(t0_s, &run, false)),
-        (&q1, query_pushes(t0_s, s0_s, true)),
-        (&q2, query_pushes(t0_s, s0_s, false)),
+        (&q1, query_pushes(t0_s, s0_s, e0_s, true)),
+        (&q2, query_pushes(t0_s, s0_s, e0_s, false)),
         (&j1, jfr_pushes(t0_s, &run)),
         (&j2, jfr_pushes(t0_s, &run)),
     ];
@@ -3718,7 +4236,7 @@ async fn profileql_matches_the_reference() {
     eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
-    // §4: C0–C38.
+    // §4: C0–C43.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {
@@ -3728,6 +4246,7 @@ async fn profileql_matches_the_reference() {
         };
         let method = case.request.method.name();
         let enc = case.request.encoding;
+        let start_ms = win.case_start(&case.request.method);
         for (tenant, is_t1) in tenants {
             let what = format!(
                 "{} ({}, {method}) under {}",
@@ -3774,21 +4293,16 @@ async fn profileql_matches_the_reference() {
                         );
                     }
                 }
-                Expect::LedgerGraph {
+                Expect::LedgerFixture {
                     row,
-                    ours: go,
-                    theirs: gt,
+                    ours: fo,
+                    theirs: ft,
                 } => {
-                    let unit = unit(is_t1);
-                    let failures: Vec<String> = [(&a, go, &ours), (&b, gt, &reference)]
+                    let failures: Vec<String> = [(&a, fo, &ours), (&b, ft, &reference)]
                         .into_iter()
-                        .filter_map(|(res, graph, server)| {
-                            let why = if res.status != 200 {
-                                Some(format!("status {}, want 200", res.status))
-                            } else {
-                                graph_failure(graph, unit, enc, &res.body)
-                            };
-                            why.map(|w| format!("{}: {w}", server.name))
+                        .filter_map(|(res, fixture, server)| {
+                            fixture_failure(fixture, case, is_t1, start_ms, res)
+                                .map(|w| format!("{}: {w}", server.name))
                         })
                         .collect();
                     if !failures.is_empty() {
@@ -3798,6 +4312,15 @@ async fn profileql_matches_the_reference() {
                                 "ledger row `{row}`: an answer is not its pin: {}",
                                 failures.join("; ")
                             ),
+                            &a,
+                            &b,
+                            method,
+                            enc,
+                        );
+                    } else if a.content_type != b.content_type {
+                        mismatches.both(
+                            &what,
+                            &format!("ledger row `{row}`: Content-Type differs"),
                             &a,
                             &b,
                             method,
@@ -3850,7 +4373,7 @@ async fn profileql_matches_the_reference() {
                         mismatches.both(&what, why, &a, &b, method, enc);
                     }
                     for (res, server) in [(&a, &ours), (&b, &reference)] {
-                        if let Some(why) = fixture_failure(fixture, case, is_t1, s0_ms, res) {
+                        if let Some(why) = fixture_failure(fixture, case, is_t1, start_ms, res) {
                             mismatches.one(
                                 &what,
                                 &format!("{}: not what the fixture says: {why}", server.name),
@@ -4141,5 +4664,78 @@ fn one_gate_without_the_other_fails_the_run() {
     assert!(
         ok,
         "with both gates unset outside CI, L1 must skip\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// #826 part B: heatmap exemplars compare as a set
+// ---------------------------------------------------------------------
+
+/// **H3.** Two heatmap answers whose one slot holds the same exemplars in
+/// another order are equal under R4, in proto and in JSON; a changed value,
+/// or a field the answer's decoder does not know, is a difference.
+#[test]
+fn h3_heatmap_exemplars_compare_as_a_set() {
+    let c41 = CASES.iter().find(|c| c.id == "C41").expect("C41");
+    let exemplar = |profile_id: &str, value: i64| Exemplar {
+        timestamp: 1_000,
+        profile_id: profile_id.to_string(),
+        value,
+        labels: label_pairs(&[("service_name", "s")]),
+        ..Exemplar::default()
+    };
+    let (a, b) = (exemplar("a", 2), exemplar("b", 3));
+    let answer = |exemplars: Vec<Exemplar>| SelectHeatmapResponse {
+        series: vec![HeatmapSeries {
+            labels: Vec::new(),
+            slots: vec![HeatmapSlot {
+                timestamp: 15_000,
+                y_min: vec![2.0; 20],
+                counts: vec![1; 20],
+                exemplars,
+            }],
+        }],
+    };
+    let proto = |r: &SelectHeatmapResponse| Res {
+        status: 200,
+        content_type: Some("application/proto".to_string()),
+        body: r.encode_to_vec(),
+    };
+    let json_res = |r: &SelectHeatmapResponse| Res {
+        status: 200,
+        content_type: Some("application/json".to_string()),
+        body: serde_json::to_vec(r).expect("JSON"),
+    };
+    let ab = answer(vec![a.clone(), b.clone()]);
+    let ba = answer(vec![b.clone(), a.clone()]);
+    assert_eq!(
+        parity(&c41.request, &proto(&ab), &proto(&ba)),
+        None,
+        "one slot's exemplars in another order differ in proto"
+    );
+    let json_request = Request {
+        encoding: Encoding::Json,
+        ..c41.request
+    };
+    assert_eq!(
+        parity(&json_request, &json_res(&ab), &json_res(&ba)),
+        None,
+        "one slot's exemplars in another order differ in JSON"
+    );
+    let changed = answer(vec![exemplar("b", 4), a.clone()]);
+    assert!(
+        parity(&c41.request, &proto(&ab), &proto(&changed)).is_some(),
+        "a changed exemplar value compared equal in proto"
+    );
+    assert!(
+        parity(&json_request, &json_res(&ab), &json_res(&changed)).is_some(),
+        "a changed exemplar value compared equal in JSON"
+    );
+    let mut unknown = proto(&ba);
+    // Field 15, varint 1: a field `SelectHeatmapResponse` does not have.
+    unknown.body.extend_from_slice(&[15 << 3, 1]);
+    assert!(
+        parity(&c41.request, &proto(&ab), &unknown).is_some(),
+        "an answer with a field its decoder drops compared equal"
     );
 }
