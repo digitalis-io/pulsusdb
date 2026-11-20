@@ -793,8 +793,25 @@ async fn l10_a_recreated_database_is_cleared() {
         &[],
     )
     .await;
-    let l2 = r.times.l1("rate(rc_total[5m])").shifted(MINUTE);
-    assert_eq!(same(&r.a, &r.b, l2, "L2").cache(), "miss");
+    // `g`, not a rate: the rebuild adds 10 to every value, so a kept answer
+    // served after it differs from B's.
+    let l2 = r.times.l1("g").shifted(MINUTE);
+    let before = same(&r.a, &r.b, l2, "L2");
+    assert_eq!(before.cache(), "miss");
+    // L2 put tenant `a` in use on both servers. Each must hold the tenant's
+    // 40 series before the drop: the writer registers none of them again,
+    // so a tenant first built after the rebuild has no series to answer.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while [&r.a, &r.b]
+        .iter()
+        .any(|s| s.metric("pulsus_label_cache_series_count") < 40)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "a label cache did not build tenant a within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let clears = r.a.metric("pulsus_read_cache_clears_total");
     live_db::drop_db(&r.db).await;
     live_db::build_schema(&r.db).await;
@@ -822,7 +839,16 @@ async fn l10_a_recreated_database_is_cleared() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    same(&r.a, &r.b, l2, "L2 after the rebuild");
+    let after = same(&r.a, &r.b, l2, "L2 after the rebuild");
+    assert_ne!(after.cache(), "hit", "the clear left L2's entry");
+    assert!(
+        after.body.contains(r#""i":"0""#),
+        "L2 after the rebuild is empty"
+    );
+    assert_ne!(
+        after.body, before.body,
+        "L2 after the rebuild reads the new values"
+    );
 }
 
 /// L12 (#835): an answer with an info is not kept: its repeat is read in
