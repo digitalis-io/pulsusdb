@@ -11,9 +11,11 @@
 //! Issue #824: `double` is a `double` field's JSON form, and
 //! `aggregation_type` and `exemplar_type` are the time series request's
 //! two enums, in the shape of `profile_format`. Issue #825:
-//! `heatmap_query_type`, and `double`'s repeated form.
+//! `heatmap_query_type`, and `double`'s repeated form. Issue #829:
+//! `flamebearer`, the render routes' JSON answer.
 
 pub mod connect;
+pub mod flamebearer;
 pub mod google_v1;
 pub mod int64;
 mod json;

@@ -83,7 +83,7 @@ The connection pool (`crates/pulsus-clickhouse/src/pool.rs`) holds **one
 That semaphore bounds *total* concurrent requests to `PULSUS_CH_POOL_SIZE` —
 it is not multiplied by the endpoint count, and the RAII lease discipline is
 unchanged (a streaming cursor owns exactly one permit and one endpoint for its
-whole lifetime, released on drop).
+whole lifetime, released on drop). The readiness probe (`ping`) is the one statement outside that semaphore: it takes the single permit of a gate of its own, so `/ready` never queues behind inserts and queries. It chooses its endpoint as a write does.
 
 A **write** lease (every insert, `execute`, `ping`) chooses an endpoint with a pure, lock-free policy (`candidate_order`): endpoints in this node's zone lead (round-robin among them), then the other healthy endpoints (round-robin), then demoted endpoints whose cooldown has expired, then the rest. A **read request** is bound to one endpoint when its client is built: the first of that same order, with no zone leading under `read_spread: all` and this node's zone under `zone`, from a rotation of its own. Every read of that client is leased on that endpoint, whatever happens to its health meanwhile, so a request never moves between endpoints while it runs. If a read reports a server failure, the endpoint is demoted and the request is marked. When it ends, it runs once more with a new client and so a new endpoint, and only the run whose answer is used may update a cache. On the healthy path this is a few atomic loads, a modulo, and a zone compare — **no ping and no extra round-trip.**
 

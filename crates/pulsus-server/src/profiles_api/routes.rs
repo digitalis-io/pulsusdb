@@ -200,7 +200,7 @@ fn profile_type(id: String) -> Option<ProfileType> {
     })
 }
 
-async fn profile_types_answer(
+pub(super) async fn profile_types_answer(
     state: &AppState,
     tenant: &Tenant,
     msg: ProfileTypesRequest,
@@ -247,7 +247,7 @@ async fn label_names_answer(
     })
 }
 
-async fn label_values_answer(
+pub(super) async fn label_values_answer(
     state: &AppState,
     tenant: &Tenant,
     msg: LabelValuesRequest,

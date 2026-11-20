@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use pulsus_clickhouse::{ChClient, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, QuerySettings, Row, replica_connect_timeout_clause};
 use pulsus_model::{Fingerprint, STALE_NAN_BITS, Tenant};
 use pulsus_promql::{PlanParams, QueryPlan, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
@@ -108,9 +108,10 @@ pub struct ReplicaDelay {
 /// `cluster`, a replica it cannot reach left out.
 pub fn replica_delay_sql(cluster: &str, db: &str) -> String {
     format!(
-        "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas({}, system.replicas) WHERE database = {} ORDER BY host, table SETTINGS skip_unavailable_shards = 1",
+        "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas({}, system.replicas) WHERE database = {} ORDER BY host, table SETTINGS skip_unavailable_shards = 1, {}",
         ch_string(cluster),
-        ch_string(db)
+        ch_string(db),
+        replica_connect_timeout_clause()
     )
 }
 
@@ -2134,7 +2135,7 @@ mod tests {
     fn the_replica_delay_statement_skips_an_unreachable_replica() {
         assert_eq!(
             replica_delay_sql("pulsus_test_cluster", "pulsus"),
-            "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1"
+            "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1, connect_timeout_with_failover_ms = 100, connect_timeout_with_failover_secure_ms = 100"
         );
     }
 
