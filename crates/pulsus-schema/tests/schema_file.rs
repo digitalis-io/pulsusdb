@@ -412,55 +412,6 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
     );
 }
 
-/// Issue #889: every table keeps its replaced parts 60 s, and a merge and a
-/// fetch flush the files of the part they write before it replaces anything.
-/// The tuple comes first in each table's `SETTINGS`, once, in both renders.
-/// No wrapper or view carries any of it, no statement flushes a part's
-/// directory, and only the `Distributed` wrappers flush their inserts.
-#[test]
-fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and_fetches() {
-    const TUPLE: &str = "SETTINGS old_parts_lifetime = 60, \
-                         min_compressed_bytes_to_fsync_after_merge = 1, \
-                         min_compressed_bytes_to_fsync_after_fetch = 1, ";
-    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
-        let mut tables = 0;
-        for s in rendered_statements(&ctx) {
-            let is_wrapper = s.contains("ENGINE = Distributed(");
-            let is_table = s.trim_start().starts_with("CREATE TABLE") && !is_wrapper;
-            if is_table {
-                assert_eq!(
-                    s.matches(TUPLE).count(),
-                    1,
-                    "{what}: a table without the replaced-parts settings once: {s}"
-                );
-                tables += 1;
-            } else {
-                for name in [
-                    "old_parts_lifetime",
-                    "fsync_after_merge",
-                    "fsync_after_fetch",
-                ] {
-                    assert!(
-                        !s.contains(name),
-                        "{what}: {name} reached a wrapper or a view: {s}"
-                    );
-                }
-            }
-            assert!(
-                !s.contains("fsync_part_directory"),
-                "{what}: a statement flushes a part's directory: {s}"
-            );
-            if s.contains("fsync_after_insert") {
-                assert!(
-                    is_wrapper,
-                    "{what}: fsync_after_insert outside a wrapper: {s}"
-                );
-            }
-        }
-        assert_eq!(tables, 37, "{what}: table count");
-    }
-}
-
 /// The configured values reach the statements: a hard-coded literal in the
 /// file passes at the default and fails here.
 #[test]
@@ -3851,21 +3802,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     };
     // The digests moved with issue #813, which adds the six profile tables,
     // their four wrappers and five views, and with issue #814, which gives
-    // `profile_landing`'s ten upload columns a `DEFAULT`.
+    // `profile_landing`'s ten upload columns a `DEFAULT`, and with issue #889,
+    // which puts the replaced-parts settings first in every table's `SETTINGS`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "0fa35c6e8deccbf9702a3b067d90f6539049d89bb6fe75df3174103aa71c2157",
+            "eba95984512773d67dd1e25b76757817f0667f01d7ec9ca30e4f8e989fb8e28d",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "7617e94d52ff561b63d6efb5d75e5d986f7de7c70598c1d9b34560daa1731ef2",
+            "931b801f2be66f5c8b5c4a2cbb33231bea273a504b47364b2e105db9c948e9bd",
         ),
         (
             "clustered with a storage policy",
@@ -3875,7 +3827,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "d166858d3524a2f3861c8222590b5fa3ebe54e1d0f375283c7407e2f26c377c6",
+            "f6e7f09f3f8e3e05e9e82e3fa6f507b7a86e3c9275dc7042a069e87975301a09",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -6882,5 +6834,54 @@ fn the_profile_landing_upload_columns_carry_defaults() {
             defaulted, want,
             "{what}: the columns of profile_landing that carry a DEFAULT"
         );
+    }
+}
+
+/// Issue #889: every table keeps its replaced parts 60 s, and a merge and a
+/// fetch flush the files of the part they write before it replaces anything.
+/// The tuple comes first in each table's `SETTINGS`, once, in both renders.
+/// No wrapper or view carries any of it, no statement flushes a part's
+/// directory, and only the `Distributed` wrappers flush their inserts.
+#[test]
+fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and_fetches() {
+    const TUPLE: &str = "SETTINGS old_parts_lifetime = 60, \
+                         min_compressed_bytes_to_fsync_after_merge = 1, \
+                         min_compressed_bytes_to_fsync_after_fetch = 1, ";
+    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
+        let mut tables = 0;
+        for s in rendered_statements(&ctx) {
+            let is_wrapper = s.contains("ENGINE = Distributed(");
+            let is_table = s.trim_start().starts_with("CREATE TABLE") && !is_wrapper;
+            if is_table {
+                assert_eq!(
+                    s.matches(TUPLE).count(),
+                    1,
+                    "{what}: a table without the replaced-parts settings once: {s}"
+                );
+                tables += 1;
+            } else {
+                for name in [
+                    "old_parts_lifetime",
+                    "fsync_after_merge",
+                    "fsync_after_fetch",
+                ] {
+                    assert!(
+                        !s.contains(name),
+                        "{what}: {name} reached a wrapper or a view: {s}"
+                    );
+                }
+            }
+            assert!(
+                !s.contains("fsync_part_directory"),
+                "{what}: a statement flushes a part's directory: {s}"
+            );
+            if s.contains("fsync_after_insert") {
+                assert!(
+                    is_wrapper,
+                    "{what}: fsync_after_insert outside a wrapper: {s}"
+                );
+            }
+        }
+        assert_eq!(tables, 37, "{what}: table count");
     }
 }

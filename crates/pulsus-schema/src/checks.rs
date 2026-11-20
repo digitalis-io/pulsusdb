@@ -257,6 +257,18 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         NameCatalogue::Setting,
     ),
     ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
+    // Issue #889: the replaced-parts lifetime and the two flushes that make
+    // it safe, which every table's `CREATE` carries. This check confirms the
+    // names exist on the server; it does not read a table's value.
+    ("old_parts_lifetime", NameCatalogue::MergeTreeSetting),
+    (
+        "min_compressed_bytes_to_fsync_after_merge",
+        NameCatalogue::MergeTreeSetting,
+    ),
+    (
+        "min_compressed_bytes_to_fsync_after_fetch",
+        NameCatalogue::MergeTreeSetting,
+    ),
     // The three block/seconds deduplication-window names the `CREATE`s carry
     // (issue #603). Which of the first two a statement carries is rendered
     // from the same thing that renders the engine

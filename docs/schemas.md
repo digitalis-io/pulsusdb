@@ -986,7 +986,7 @@ ENGINE = MergeTree
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (org_id, kind, type_id, service, fingerprint, timestamp_ns)
 TTL toDateTime(least(intDiv(received_ms, 1000) + ({{profile_landing_retention_hours}} * 3600), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.profile_samples{{on_cluster}}
 (
@@ -1006,7 +1006,7 @@ PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
 ORDER BY (org_id, type_id, service, fingerprint, timestamp_ns, profile_id)
 TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@cold-profiles , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{profiles_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.profile_entries{{on_cluster}}
 (
@@ -1026,7 +1026,7 @@ PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
 ORDER BY (org_id, type_id, service, fingerprint, timestamp_ns, profile_id)
 TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@cold-profiles , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{profiles_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.profile_series{{on_cluster}}
 (
@@ -1044,7 +1044,7 @@ ORDER BY (org_id, type_id, service, fingerprint)
 TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
 -- `labels` is outside the key and not an aggregate. It is a function of
 -- `fingerprint`, so a merge never chooses between two different values.
-SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.profile_stacks{{on_cluster}}
 (
@@ -1059,7 +1059,7 @@ ENGINE = ReplacingMergeTree
 PARTITION BY day
 ORDER BY (org_id, stack_id)
 TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.profile_locations{{on_cluster}}
 (
@@ -1082,7 +1082,7 @@ ENGINE = ReplacingMergeTree
 PARTITION BY day
 ORDER BY (org_id, location_id)
 TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 ```
 
 ---
@@ -1184,6 +1184,7 @@ Reader-issued settings: every logs, metrics and trace read sends the answer pins
 | `PREWHERE` | planner always places the most selective low-cardinality predicate (`metric_name`, `service`, `type_id`) in `PREWHERE`; time predicates in `WHERE` (partitions already prune them) |
 | Partitioning | **daily** for raw sample/span tables (short TTL, whole-part drops); **monthly** for series/index tables; the rollup levels by UTC day of `t_end − 1 ms` |
 | TTL | each table's, in [configuration.md §7](configuration.md); `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` move old parts to a cold volume ([configuration.md §7](configuration.md)) |
+| Replaced parts | every table: `old_parts_lifetime = 60`, with `min_compressed_bytes_to_fsync_after_merge = 1` and `min_compressed_bytes_to_fsync_after_fetch = 1`. The files of a part a merge or a fetch writes are flushed to disk before it replaces the parts it covers, so those parts are not kept as a fallback, and each replica's Keeper part list holds about 60 s of replaced parts instead of 480 s. The part's directory is not flushed (`fsync_part_directory` is off, to keep push latency). Until the file system writes the part's directory entry to disk, a power cut after the replaced parts are removed can lose the merged part on that server. On a cluster, that replica fetches it again from another replica; a single-node deployment has no other replica to fetch it from, so its rows are lost. An inserted part is not flushed. At startup the binary confirms only that the server knows the three setting names; it does not read their values back from the tables |
 | Dedup strategy | metadata: `ReplacingMergeTree` + duplicate-tolerant reads (`LIMIT 1 BY`, `GROUP BY`); samples: append-only `MergeTree`, with a retried push suppressed at ingest by the writer that accepted the original, inside `PULSUS_INGEST_DEDUP_WINDOW` (issue #494), and writer batch atomicity below that; spans and error spans: `ReplacingMergeTree`, whose copies of one span are read as [api.md §1.0](api.md) states |
 | Codecs | timestamps `DoubleDelta`, gauge-like floats `Gorilla`, counters/ids `Delta`/`T64`, payloads/labels `ZSTD(3..5)`, everything wrapped in `ZSTD(1)` minimum |
 | Minimum ClickHouse | 26.8 LTS (the supported LTS line; servers before 26.3 do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412. All MVs are classic incremental — no refreshable-MV or scheduler dependency) |
