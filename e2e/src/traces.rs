@@ -3187,10 +3187,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn permanently_absent_trace_fails_bounded_with_attempts_and_elapsed() {
         let started = tokio::time::Instant::now();
-        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
-            std::future::ready(Ok(None))
-        })
+        // The outer bound is the test's own, so a loop that ignores its
+        // deadline fails here instead of retrying for ever.
+        let err = tokio::time::timeout(
+            TEST_CEILING * 3,
+            retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+                std::future::ready(Ok(None))
+            }),
+        )
         .await
+        .expect("the retry loop must stop at its deadline")
         .expect_err("a permanently absent trace must fail");
         let waited = started.elapsed();
         let msg = format!("{err:#}");
