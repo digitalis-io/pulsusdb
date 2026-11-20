@@ -20,6 +20,8 @@
 mod live_db;
 #[path = "../../pulsus-read/tests/profileql_pprof_nf/mod.rs"]
 mod nf;
+#[path = "../../pulsus-read/tests/query_log_wait/mod.rs"]
+mod query_log_wait;
 
 use live_db::ScopedDb;
 
@@ -36,7 +38,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::profiles::v1development as otlp;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
-use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings};
+use pulsus_clickhouse::{ChClient, QuerySettings};
 use pulsus_profiles_wire::google_v1::Profile;
 use pulsus_profiles_wire::querier_v1::{
     ProfileFormat, SelectMergeProfileRequest, SelectMergeStacktracesRequest,
@@ -230,21 +232,18 @@ fn spawn_ready(port: u16, db: &str, clickhouse_http: u16, env: &[(&str, &str)]) 
 // Statement counting
 // ---------------------------------------------------------------------
 
-async fn exec(client: &ChClient, sql: &str) {
-    client
-        .execute(
-            sql,
-            &QuerySettings::new().set("insert_deduplicate", 0u64),
-            Idempotency::NonIdempotent,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
-}
-
 /// The finished statements `system.query_log` holds for each request id.
 async fn statements(client: &ChClient, ids: &[String]) -> BTreeMap<String, u64> {
-    exec(client, "SYSTEM FLUSH LOGS").await;
     let list: Vec<String> = ids.iter().map(|id| sql_string(id)).collect();
+    // A statement's ending row can be queued after its answer reached the
+    // server, so one flush can miss the last request's; wait for every
+    // started statement to end before counting.
+    query_log_wait::settle_query_log(
+        &[client],
+        &format!("log_comment IN ({})", list.join(", ")),
+        0,
+    )
+    .await;
     let sql = format!(
         "SELECT concat(log_comment, ' ', toString(count())) AS s FROM system.query_log \
          WHERE type != 'QueryStart' AND is_initial_query AND log_comment IN ({}) \

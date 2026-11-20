@@ -1188,9 +1188,18 @@ GROUP BY kind, k";
         assert!(!sql.contains("profile_entries"), "{sql}");
     }
 
-    /// A window ending before the lookback floor plans nothing.
+    /// A window ending before the lookback floor plans nothing; seen from a
+    /// day inside the floor, the same window plans its statement.
     #[test]
     fn a_window_before_the_floor_plans_nothing() {
+        let inside = END + 6 * 86_400_000;
+        assert!(
+            matches!(
+                plan(&tenant("t1"), &single(), &example(), inside),
+                Ok(Some(_))
+            ),
+            "a window inside the floor must plan a statement"
+        );
         let now = END + 8 * 86_400_000;
         assert_eq!(plan(&tenant("t1"), &single(), &example(), now), Ok(None));
     }
