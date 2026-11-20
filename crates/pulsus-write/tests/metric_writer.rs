@@ -1332,6 +1332,8 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
     // has begun; the cap is only there so nothing runs forever.
     const PUSHERS: u128 = 8;
     const CAP: u128 = 400;
+    // Far above the time a loaded machine takes to schedule eight pushers.
+    const PUSHERS_START_DEADLINE: Duration = Duration::from_secs(30);
 
     let cfg = WriterConfig {
         // One worker per pusher, so a block's send does not wait behind
@@ -1400,10 +1402,21 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
     let drain = {
         let writer = writer.clone();
         tokio::spawn(async move {
-            pushing_rx
-                .wait_for(|n| *n == PUSHERS)
-                .await
-                .expect("the test holds a sender");
+            // Bounded, so a pusher that fails before it signals fails the
+            // test instead of leaving the drain waiting for ever: the test
+            // itself holds a sender, so the channel never closes.
+            tokio::time::timeout(
+                PUSHERS_START_DEADLINE,
+                pushing_rx.wait_for(|n| *n == PUSHERS),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "not every pusher made its first admission within \
+                     {PUSHERS_START_DEADLINE:?}: one failed or is stuck"
+                )
+            })
+            .expect("the test holds a sender");
             writer.shutdown(Duration::from_secs(5)).await;
             writer.metrics().queue_bytes
         })
