@@ -608,11 +608,11 @@ async fn the_merged_flame_graph_answers_in_one_statement() {
             a,
             native_path(),
             "t1",
-            &body(json!({"format": "PROFILE_FORMAT_TREE"})),
+            &body(json!({"format": "PROFILE_FORMAT_DOT"})),
         ),
         501,
         "unimplemented",
-        "profile format PROFILE_FORMAT_TREE is not served yet",
+        "profile format PROFILE_FORMAT_DOT is not served yet",
         "M8",
     );
     counted.push(("M8".to_string(), id, 0));

@@ -291,3 +291,24 @@ own error, as PulsusDB does.
   function the reference does not mount.
 - **Why:** was defects entry 47, withdrawn by #827 part B.
 - **Case:** `none`.
+
+### `label-values-passes-the-name`
+
+- **Route:** `/pyroscope/label-values`.
+- **Request:** a label other than `__name__`.
+- **PulsusDB:** `200`, the label's values over the last hour.
+- **Reference:** `400`: it sends `LabelValues` with no name
+  (`pkg/querier/http.go:57`).
+- **Why:** defects entry 49.
+- **Case:** `C37` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `render-timeline-keeps-the-window-grid`
+
+- **Route:** `/pyroscope/render`.
+- **Request:** a window that starts before the tenant's first profile.
+- **PulsusDB:** the timeline's points on the window's own steps.
+- **Reference:** the points on steps starting at the tenant's first
+  profile, so a sample can fall one slot earlier
+  (`pkg/frontend/readpath/router.go:92-113`).
+- **Why:** owner, 2026-11-19, "Record the difference"; defects entry 50.
+- **Case:** `C38` in `crates/pulsus-server/tests/profileql_differential.rs`.

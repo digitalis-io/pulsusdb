@@ -5,7 +5,8 @@
 //! series rows; the stacks are landed once, on shard 1, and the cluster
 //! copies them to every node. The statement reads the samples through their
 //! wrapper, merges the per-shard sums, and joins them to the stacks read on
-//! the node that receives it — one statement.
+//! the node that receives it — one statement. Issue #829 (K3): the render
+//! statement reads both shards' tree and series in one statement.
 //!
 //! ```text
 //! docker compose -f ci/clickhouse-cluster/compose.yaml up -d
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_model::Tenant;
+use pulsus_read::profiles::render::{self, RenderRequest};
 use pulsus_read::profiles::selector::WindowLimits;
 use pulsus_read::profiles::tree::{self, TreeRequest, TreeRow};
 use pulsus_read::profiles::{ProfilesEngine, ProfilesReadConfig};
@@ -260,7 +262,7 @@ async fn the_merged_tree_merges_both_shards_in_one_statement() {
     let comment = format!("{db}-k1-{now}");
     let rows = ProfilesEngine::new(
         ChClient::new(shard1_config(&db)).await.expect("shard1"),
-        config,
+        config.clone(),
         tenant("t1"),
     )
     .with_query_log_comment(comment.clone())
@@ -299,6 +301,61 @@ async fn the_merged_tree_merges_both_shards_in_one_statement() {
         .await
         .expect("query_log");
     assert_eq!(n, ["1"], "K2");
+
+    // K3 (issue #829): one entry per shard at the samples' time, each its
+    // shard's samples' sum; the render statement reads both shards' tree
+    // and series in one statement.
+    for (shard, client, total) in [(1u8, &shard1, 25), (2u8, &shard2, 7)] {
+        let fp = 200 + u128::from(shard);
+        exec(
+            client,
+            &insert(&[format!(
+                "('t1', {t}, 3, '{CPU}', 'svc', {fp}, {at}, 0, {total}, 0, \
+                 unhex('{NO_TRACE}'), [], [], '', '{PROFILE}')"
+            )]),
+        )
+        .await;
+    }
+    for client in [&shard1, &replica1b, &shard2] {
+        exec(client, "SYSTEM SYNC REPLICA profile_entries LIGHTWEIGHT").await;
+    }
+    let render_req = RenderRequest {
+        tree: req,
+        group_by: &[],
+        average: false,
+    };
+    let planned = match render::plan(&tenant("t1"), &config, &render_req, now) {
+        Ok(Some(p)) => p,
+        other => panic!("K3: expected a plan, got {other:?}"),
+    };
+    let comment = format!("{db}-k3-{now}");
+    let rows = ProfilesEngine::new(
+        ChClient::new(shard1_config(&db)).await.expect("shard1"),
+        config,
+        tenant("t1"),
+    )
+    .with_query_log_comment(comment.clone())
+    .read_render(&planned.sql)
+    .await
+    .unwrap_or_else(|e| panic!("K3: {e:?}\n{}", planned.sql));
+    let (tree_rows, series_rows) = render::split(rows);
+    assert_eq!(paths(&tree_rows), expected, "K3 tree");
+    assert_eq!(series_rows.len(), 1, "K3 series: {series_rows:?}");
+    let sum: f64 = series_rows[0].points.iter().map(|(_, v)| v).sum();
+    assert_eq!(sum, 32.0, "K3 series: {series_rows:?}");
+    let filter = format!("is_initial_query AND log_comment = '{comment}'");
+    settle_query_log(&[&shard1], &filter, 1).await;
+    let n = shard1
+        .query_strings(
+            &format!(
+                "SELECT toString(count()) AS s FROM system.query_log \
+                 WHERE {filter} AND type = 'QueryFinish'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    assert_eq!(n, ["1"], "K3 statements");
 
     exec(
         &bootstrap,
