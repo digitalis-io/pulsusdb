@@ -519,6 +519,8 @@ docs/benchmarks/metrics-differential-ledger.md	tsdb/head_append_v2.go:115-127	no
 docs/benchmarks/metrics-differential-ledger.md	write_handler.go:502-504	not_in_this_repository
 docs/benchmarks/metrics-differential-ledger.md	write_otlp_handler.go:132-138	not_in_this_repository
 docs/benchmarks/metrics-differential-ledger.md	write_otlp_handler.go:177-189	not_in_this_repository
+docs/benchmarks/profileql-differential-ledger.md	pkg/frontend/readpath/router.go:92-113	not_in_this_repository
+docs/benchmarks/profileql-differential-ledger.md	pkg/querier/http.go:57	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	.github/workflows/ci.yml:483	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	.github/workflows/ci.yml:651	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	ast.go:1100-1103	not_in_this_repository
@@ -1066,6 +1068,7 @@ docs/reference-defects-we-do-not-copy.md	parser/header.go:25	not_in_this_reposit
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/query_service_handler.go:212-251	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_diff.go:65-67	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_time_series.go:78-83	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/router.go:92-113	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/loghttp/params.go:38-46	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:452-469	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:489	not_in_this_repository
@@ -1107,6 +1110,7 @@ docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/batch.go:9-38	not_in_t
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:50-78	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/stream.go:133	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/querier/http.go:57	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/intervals.go:32-40	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1101	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1142	not_in_this_repository

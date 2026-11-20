@@ -10,7 +10,10 @@
 //! that transport: its primary job is bounding **concurrent request count**
 //! to `pool_size` (a single semaphore, unchanged by endpoint count), plus a
 //! uniform lease API so callers do not need to know which crate ships
-//! underneath.
+//! underneath. The readiness probe ([`ChPool::ping`]) is the one statement
+//! outside it: it goes through a one-permit gate of its own, so it never
+//! queues behind inserts and queries, and at most `pool_size + 1` requests
+//! are in flight (issue #888).
 //!
 //! **Connection spreading (issues #43 and #803).** The pool holds one
 //! `clickhouse::Client` per distinct endpoint. A **write** lease (`get`)
@@ -469,6 +472,9 @@ impl ReadBinding {
 pub struct ChPool {
     endpoints: Vec<Endpoint>,
     semaphore: Arc<Semaphore>,
+    /// The readiness probe's own lease, one permit, beside `semaphore`
+    /// (issue #888).
+    ping_gate: Semaphore,
     /// Free-running round-robin counter for read bindings; one `fetch_add`
     /// per [`ChPool::bind_read`] (issue #803).
     next_rr_read: AtomicU64,
@@ -519,6 +525,7 @@ impl ChPool {
 
         let pool = Self {
             semaphore: Arc::new(Semaphore::new(cfg.pool_size)),
+            ping_gate: Semaphore::new(1),
             endpoints,
             next_rr_read: AtomicU64::new(0),
             next_rr_write: AtomicU64::new(0),
@@ -570,8 +577,17 @@ impl ChPool {
     /// is tried; the last transport error is returned only if every
     /// candidate is unreachable.
     pub(crate) async fn get(&self, class: StatementClass) -> Result<PooledConn<'_>, ChError> {
-        let permit = self.acquire_permit().await?;
+        let permit = self.acquire_from(&self.semaphore).await?;
+        self.hand_out(class, permit).await
+    }
 
+    /// Selects an endpoint for `class` and hands out a lease holding
+    /// `permit`, as [`Self::get`] describes.
+    async fn hand_out<'a>(
+        &'a self,
+        class: StatementClass,
+        permit: SemaphorePermit<'a>,
+    ) -> Result<PooledConn<'a>, ChError> {
         let rr = self.next_rr_write.fetch_add(1, Ordering::Relaxed);
         let now = self.now_ms();
         let states = self.endpoint_states(now);
@@ -626,16 +642,15 @@ impl ChPool {
             .unwrap_or_else(|| ChError::Connect("no ClickHouse endpoint available".to_string())))
     }
 
-    /// One of the pool's permits, waiting at most `query_timeout`.
-    async fn acquire_permit(&self) -> Result<SemaphorePermit<'_>, ChError> {
-        Ok(
-            tokio::time::timeout(self.query_timeout, self.semaphore.acquire())
-                .await
-                .map_err(|_| {
-                    ChError::Timeout("pool exhausted: no connection available".to_string())
-                })?
-                .expect("semaphore is never closed for the pool's lifetime"),
-        )
+    /// One permit of `sem`, waiting at most `query_timeout`.
+    async fn acquire_from<'a>(
+        &'a self,
+        sem: &'a Semaphore,
+    ) -> Result<SemaphorePermit<'a>, ChError> {
+        Ok(tokio::time::timeout(self.query_timeout, sem.acquire())
+            .await
+            .map_err(|_| ChError::Timeout("pool exhausted: no connection available".to_string()))?
+            .expect("semaphore is never closed for the pool's lifetime"))
     }
 
     /// Every endpoint's zone and health at `now`, for [`candidate_order`].
@@ -686,7 +701,7 @@ impl ChPool {
         &'a self,
         b: &'a ReadBinding,
     ) -> Result<PooledConn<'a>, ChError> {
-        let permit = self.acquire_permit().await?;
+        let permit = self.acquire_from(&self.semaphore).await?;
         let idx = b.endpoint();
         let ep = &self.endpoints[idx];
         ep.health.record_selection(self.now_ms());
@@ -710,8 +725,14 @@ impl ChPool {
 
     /// Health probe (`SELECT 1`) against one selected endpoint. A transport
     /// failure here demotes that endpoint so the next `get()` fails over.
+    ///
+    /// Its lease comes from a one-permit gate of its own, not from the
+    /// `pool_size` semaphore every insert and query shares, so it never waits
+    /// for one of those (issue #888). It chooses its endpoint as a write does.
+    /// Concurrent probes wait for each other on the gate.
     pub async fn ping(&self) -> Result<(), ChError> {
-        let conn = self.get(StatementClass::Write).await?;
+        let permit = self.acquire_from(&self.ping_gate).await?;
+        let conn = self.hand_out(StatementClass::Write, permit).await?;
         let result = ping_client(conn.client()).await;
         if let Err(ref e) = result {
             conn.report_transport_failure(e);
@@ -990,6 +1011,7 @@ pub(crate) fn test_pool(
         .collect();
     ChPool {
         semaphore: Arc::new(Semaphore::new(permits)),
+        ping_gate: Semaphore::new(1),
         endpoints: eps,
         next_rr_read: AtomicU64::new(0),
         next_rr_write: AtomicU64::new(0),
@@ -1884,5 +1906,43 @@ mod tests {
         assert_eq!(pool.bind_read_avoiding(Some(0)), 1, "even demoted");
         let one = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
         assert_eq!(one.bind_read_avoiding(Some(0)), 0, "the only endpoint");
+    }
+
+    /// **T1 (issue #888): the readiness ping answers while every workload
+    /// lease is held.** The ping takes its lease from a gate of its own; the
+    /// workload semaphore stays as full as it was, so a write still waits.
+    #[tokio::test]
+    async fn ping_answers_while_every_workload_lease_is_held() {
+        use crate::stub_server::{Mode, StubServer};
+        let stub = StubServer::start(Mode::Silent);
+        let pool = ChPool::connect(ChConnConfig {
+            server: "127.0.0.1".to_string(),
+            http_port: stub.addr.port(),
+            database: "default".to_string(),
+            proto: ChProto::Http,
+            pool_size: 8,
+            query_timeout: Duration::from_secs(10),
+            ..ChConnConfig::default()
+        })
+        .await
+        .expect("connect to the stub");
+        let _held = pool
+            .semaphore
+            .try_acquire_many(8)
+            .expect("all eight workload leases");
+        assert_eq!(pool.semaphore.available_permits(), 0);
+
+        let ping = tokio::time::timeout(Duration::from_millis(500), pool.ping()).await;
+        assert!(
+            matches!(ping, Ok(Ok(()))),
+            "the ping must not wait for a workload lease: {ping:?}"
+        );
+        let write =
+            tokio::time::timeout(Duration::from_millis(100), pool.get(StatementClass::Write)).await;
+        assert!(
+            write.is_err(),
+            "a write must still wait for a workload lease; the ping's capacity \
+             is its own, not one more permit for everyone"
+        );
     }
 }

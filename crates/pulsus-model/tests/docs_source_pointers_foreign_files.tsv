@@ -84,6 +84,7 @@ pkg/engine/handler.go
 pkg/frontend/readpath/query_service_handler.go
 pkg/frontend/readpath/queryfrontend/query_diff.go
 pkg/frontend/readpath/queryfrontend/query_select_time_series.go
+pkg/frontend/readpath/router.go
 pkg/iter/entry_iterator.go
 pkg/loghttp/params.go
 pkg/loghttp/patterns.go
@@ -132,6 +133,7 @@ pkg/pattern/iter/batch.go
 pkg/pattern/iter/merge.go
 pkg/pattern/stream.go
 pkg/push/push.pb.go
+pkg/querier/http.go
 pkg/querier/intervals.go
 pkg/querier/limits/validation.go
 pkg/querier/pattern/querier.go

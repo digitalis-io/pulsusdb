@@ -1130,9 +1130,12 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
                 spec.gate == Gate::CompatAndReader
             }
             Surface::Admin => spec.gate == Gate::AdminPair,
-            // Issue #821: the profiles `GET` routes are native only; the
-            // Connect paths are native and compat.
-            Surface::ProfilesQuery => spec.gate == Gate::ReaderMode,
+            // Issue #821: the profiles `GET` routes are native; issue #829's
+            // render routes are native and compat. The Connect paths are
+            // native and compat.
+            Surface::ProfilesQuery => {
+                matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
+            }
             Surface::ProfilesConnect => {
                 matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
             }

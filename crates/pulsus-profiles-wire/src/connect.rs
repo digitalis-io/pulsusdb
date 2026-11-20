@@ -1,6 +1,7 @@
 //! The Connect protocol's error rule, shared by every profiles route: a
 //! code, its HTTP status (`protocol_connect.go:1269-1308` of the Connect
-//! library), and the JSON error body.
+//! library), and the JSON error body. Issue #829: the string escaping it
+//! uses ([`go_string`]), shared with the render routes' answers.
 
 /// A Connect error code: the ones the profiles routes answer, ingest and
 /// query alike.
@@ -62,7 +63,17 @@ pub fn error_json(code: Code, message: &str) -> String {
     out.push_str(r#"{"code":""#);
     out.push_str(code.as_str());
     out.push_str(r#"","message":""#);
-    for c in message.chars() {
+    go_string(&mut out, message);
+    out.push_str("\"}");
+    out
+}
+
+/// Issue #829: `s`'s characters as Go's `json.Marshal` escapes a string's,
+/// without the quotes: `"` and `\\`, the five short control escapes, any
+/// other control character as `\u00xx`, and `<`, `>`, `&`, U+2028 and
+/// U+2029 as `\u` escapes.
+pub fn go_string(out: &mut String, s: &str) {
+    for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -78,7 +89,25 @@ pub fn error_json(code: Code, message: &str) -> String {
             c => out.push(c),
         }
     }
-    out.push_str("\"}");
+}
+
+/// Issue #829: `v` as Go's `json.Encoder` writes a `[]string`: `null` when
+/// empty, else the strings in order, each by [`go_string`]; then `\n`.
+pub fn go_string_array(v: &[String]) -> String {
+    if v.is_empty() {
+        return "null\n".to_string();
+    }
+    let mut out = String::with_capacity(v.iter().map(|s| s.len() + 3).sum::<usize>() + 3);
+    out.push('[');
+    for (i, s) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        go_string(&mut out, s);
+        out.push('"');
+    }
+    out.push_str("]\n");
     out
 }
 
@@ -91,6 +120,16 @@ mod tests {
         assert_eq!(
             error_json(Code::InvalidArgument, "a \"b\" <c> & \\ \n\u{1}\u{8}\u{c}"),
             r#"{"code":"invalid_argument","message":"a \"b\" \u003cc\u003e \u0026 \\ \n\u0001\b\f"}"#
+        );
+    }
+
+    /// Issue #829: a `[]string` as Go's `json.Encoder` writes it.
+    #[test]
+    fn go_string_array_writes_null_or_the_escaped_strings() {
+        assert_eq!(go_string_array(&[]), "null\n");
+        assert_eq!(
+            go_string_array(&["a<b".to_string(), "c".to_string()]),
+            "[\"a\\u003cb\",\"c\"]\n"
         );
     }
 }

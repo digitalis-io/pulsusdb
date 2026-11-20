@@ -1469,7 +1469,7 @@ async fn the_two_4b_tables_have_the_planned_shape() {
         );
         assert!(
             tbv.engine_full.ends_with(&format!(
-                "SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, {dedup}"
+                "SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, {dedup}"
             )),
             "tag_bucket_values' settings: {}",
             tbv.engine_full
@@ -1491,7 +1491,7 @@ async fn the_two_4b_tables_have_the_planned_shape() {
         );
         assert!(
             es.engine_full.ends_with(&format!(
-                "SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, \
+                "SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 2048, \
                  min_columns_to_activate_adaptive_write_buffer = 1, {dedup}"
             )),
             "error_spans' settings: {}",
@@ -1619,7 +1619,7 @@ async fn the_4c_table_has_the_planned_shape() {
         );
         assert!(
             sbr.engine_full.ends_with(&format!(
-                "SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, {dedup}"
+                "SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, {dedup}"
             )),
             "service_bucket_resources' settings: {}",
             sbr.engine_full
