@@ -774,7 +774,7 @@ const EX_E4: Ex = ex(
 );
 
 /// C41: the datasource's heatmap over `q-ex`.
-static C33_SLOTS: Slots = Slots {
+static C41_SLOTS: Slots = Slots {
     labels: &[],
     slots: &[(15, &[(0, 2), (19, 1)]), (30, &[(1, 1)])],
     y_min: (60, 117),
@@ -797,7 +797,7 @@ static C33_SLOTS: Slots = Slots {
 const EXSPAN_REST: &[(&str, &str)] = &[("rx", "q-exspan"), ("service_name", "q-exspan")];
 
 /// C42: the span heatmap over `q-exspan`.
-static C34_SLOTS: Slots = Slots {
+static C42_SLOTS: Slots = Slots {
     labels: &[],
     slots: &[(15, &[(0, 1), (10, 1), (19, 1)])],
     y_min: (10, 1),
@@ -1295,7 +1295,7 @@ static CASES: &[Case] = &[
             exemplar_type: 2,
             over: Over::X,
         }),
-        expect: Expect::Parity(Fixture::Slots(&C33_SLOTS)),
+        expect: Expect::Parity(Fixture::Slots(&C41_SLOTS)),
     },
     Case {
         id: "C42",
@@ -1307,7 +1307,7 @@ static CASES: &[Case] = &[
             exemplar_type: 3,
             over: Over::X,
         }),
-        expect: Expect::Parity(Fixture::Slots(&C34_SLOTS)),
+        expect: Expect::Parity(Fixture::Slots(&C42_SLOTS)),
     },
     Case {
         id: "C43",
