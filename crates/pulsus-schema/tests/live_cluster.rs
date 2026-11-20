@@ -66,6 +66,12 @@ static TEST_DB_LEVELS: pulsus_testkit::TestDb =
 // the cluster, the samples one per shard.
 static TEST_DB_PROFILE_STACKS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_profile_stacks");
+// Issue #889: the replaced-parts lifetime every table carries, and the flushes
+// a merge and a fetch make.
+static TEST_DB_REPLACED_PARTS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_replaced_parts");
+static TEST_DB_PART_FLUSH: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_part_flush");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -2747,4 +2753,180 @@ async fn one_and_eight_levels_are_discovered_on_the_cluster() {
         );
         drop_cluster_db(&shard1, db).await;
     }
+}
+
+/// The settings tuple issue #889 puts first in every table's `SETTINGS`.
+const REPLACED_PARTS_TUPLE: &str = "SETTINGS old_parts_lifetime = 60, \
+                                    min_compressed_bytes_to_fsync_after_merge = 1, \
+                                    min_compressed_bytes_to_fsync_after_fetch = 1, ";
+
+/// **T3 (issue #889).** After a clustered build, every MergeTree-family table
+/// on each of the three servers carries the replaced-parts lifetime and the
+/// two flush settings, read back from the server's own stored definition.
+/// The startup check (`REQUIRED_SERVER_NAMES`) confirms only that the names
+/// exist; this case is what reads the values back.
+#[tokio::test]
+async fn every_table_on_every_server_keeps_replaced_parts_sixty_seconds() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db: &str = &TEST_DB_REPLACED_PARTS;
+    fresh_cluster_db(&shard1, db).await;
+    for (what, client) in [
+        ("shard1", &shard1),
+        ("shard1b", &shard1b),
+        ("shard2", &shard2),
+    ] {
+        let lacking = strings_on(
+            client,
+            &format!(
+                "SELECT name AS s FROM system.tables WHERE database = '{db}' \
+                 AND engine LIKE '%MergeTree' \
+                 AND position(create_table_query, '{REPLACED_PARTS_TUPLE}') = 0 ORDER BY name"
+            ),
+        )
+        .await;
+        assert_eq!(
+            lacking,
+            Vec::<String>::new(),
+            "{what}: tables without the replaced-parts settings"
+        );
+        let tables = strings_on(
+            client,
+            &format!(
+                "SELECT name AS s FROM system.tables WHERE database = '{db}' \
+                 AND engine LIKE '%MergeTree' ORDER BY name"
+            ),
+        )
+        .await;
+        for name in [
+            "metric_landing",
+            "metric_samples",
+            "log_metrics_5s",
+            "log_patterns",
+            "log_samples",
+            "log_landing",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == name),
+                "{what}: {name} is not among the MergeTree tables: {tables:?}"
+            );
+        }
+    }
+    drop_cluster_db(&shard1, db).await;
+}
+
+/// **T4 (issue #889).** A merge and a fetch flush the files of the part they
+/// write, and an insert does not. Read from `system.part_log`'s `FileSync`
+/// count on the replica that took the inserts and merged them, and on the
+/// replica that copied them.
+#[tokio::test]
+async fn a_merge_and_a_fetch_flush_their_part_and_an_insert_does_not() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db: &str = &TEST_DB_PART_FLUSH;
+    fresh_cluster_db(&shard1, db).await;
+    let ms = cluster_now_ns() / 1_000_000;
+    exec_on(
+        &shard1,
+        &format!("INSERT INTO {db}.metric_samples VALUES ('', 1, {ms}, 1.0)"),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!("INSERT INTO {db}.metric_samples VALUES ('', 2, {ms}, 2.0)"),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!("OPTIMIZE TABLE {db}.metric_samples FINAL"),
+    )
+    .await;
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM SYNC REPLICA {db}.metric_samples"),
+    )
+    .await;
+    exec_on(&shard1, "SYSTEM FLUSH LOGS").await;
+    exec_on(&shard1b, "SYSTEM FLUSH LOGS").await;
+
+    // `system.part_log` outlives a dropped database, so the rows are those of
+    // this build's table, by its UUID: a second run on one cluster reads
+    // only its own.
+    let sql = format!(
+        "SELECT concat(toString(event_type), ' ', toString(ProfileEvents['FileSync'])) AS s \
+         FROM system.part_log WHERE database = '{db}' AND table = 'metric_samples' \
+         AND table_uuid = (SELECT uuid FROM system.tables \
+         WHERE database = '{db}' AND name = 'metric_samples') \
+         AND event_type IN ('NewPart', 'MergeParts', 'DownloadPart') \
+         ORDER BY event_time_microseconds, part_name"
+    );
+    let parse = |row: &str| -> (String, u64) {
+        let (event, n) = row.split_once(' ').expect("`<event> <n>`");
+        (event.to_string(), n.parse().expect("a count"))
+    };
+
+    let on_shard1: Vec<(String, u64)> = strings_on(&shard1, &sql)
+        .await
+        .iter()
+        .map(|r| parse(r))
+        .collect();
+    let inserts = on_shard1
+        .iter()
+        .filter(|(e, n)| e == "NewPart" && *n == 0)
+        .count();
+    assert_eq!(inserts, 2, "shard1: two unflushed inserts: {on_shard1:?}");
+    let merges: Vec<u64> = on_shard1
+        .iter()
+        .filter(|(e, _)| e == "MergeParts")
+        .map(|(_, n)| *n)
+        .collect();
+    assert!(!merges.is_empty(), "shard1: no merge: {on_shard1:?}");
+    assert!(
+        merges.iter().all(|n| *n >= 1),
+        "shard1: a merge that flushed nothing: {on_shard1:?}"
+    );
+    assert_eq!(
+        on_shard1.len(),
+        inserts + merges.len(),
+        "shard1: a row that is neither an unflushed insert nor a merge: {on_shard1:?}"
+    );
+
+    let on_shard1b: Vec<(String, u64)> = strings_on(&shard1b, &sql)
+        .await
+        .iter()
+        .map(|r| parse(r))
+        .collect();
+    assert!(
+        !on_shard1b.is_empty(),
+        "shard1b: neither fetched nor merged anything"
+    );
+    assert!(
+        on_shard1b.iter().all(|(e, _)| e != "NewPart"),
+        "shard1b: an insert on the replica that only copies: {on_shard1b:?}"
+    );
+    assert!(
+        on_shard1b.iter().all(|(_, n)| *n >= 1),
+        "shard1b: a fetch or merge that flushed nothing: {on_shard1b:?}"
+    );
+    drop_cluster_db(&shard1, db).await;
 }

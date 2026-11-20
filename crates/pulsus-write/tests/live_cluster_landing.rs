@@ -83,6 +83,8 @@ static DB_RESEND_CONTROL: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_resend_control");
 static DB_BATCH_POISON: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_batch_poison");
+static DB_DROP_REPLICA: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_drop_replica");
 
 /// One case at a time: each builds a clustered database through the
 /// cluster's DDL queue, and 1-L6 reads the servers' query logs.
@@ -2085,6 +2087,284 @@ async fn a_batch_whose_member_throws_fails_every_member_on_one_shard() {
 
     drop_db(&nodes, db).await;
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// The one-shard cluster whose first replica no host answers (issue #888),
+/// defined beside `pulsus_test_cluster` in the fixture's `remote_servers.xml`.
+const DROP_CLUSTER: &str = "pulsus_test_cluster_drop";
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PollLagRow {
+    lag_s: u64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PollIdentityRow {
+    ids: Vec<String>,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StoredRow {
+    n: u64,
+    u: u64,
+}
+
+/// Runs `sql` through `client.query_stream` and reads the stream to its
+/// end, as the read cache's `fetch` does: the elapsed time and one result
+/// cover the call, every row and the end of the stream.
+async fn timed_poll<R: ChRow>(client: &ChClient, sql: &str) -> (Duration, Result<(), ChError>) {
+    let start = std::time::Instant::now();
+    let result = async {
+        let mut stream = client.query_stream::<R>(sql, &QuerySettings::new()).await?;
+        while let Some(row) = stream.next().await {
+            row?;
+        }
+        Ok(())
+    }
+    .await;
+    (start.elapsed(), result)
+}
+
+/// **T9 (issue #888).** With the first replica of the landing table's
+/// shard an address no host answers, one pool of four keeps answering for
+/// 20 s: 200 pushes at 10 a second through the writer, the read cache's
+/// two every-replica poll statements every 5 s and a `/ready` probe every
+/// second, all beside each other. No push fails or waits a second, no probe
+/// fails, each poll statement leaves the replica out in under a second, and
+/// every push is stored once on both replicas of the shard.
+#[tokio::test]
+async fn pushes_keep_being_answered_while_a_replica_is_unreachable() {
+    skip_unless_live!();
+    let _serial = SERIAL.lock().await;
+    let db = DB_DROP_REPLICA.name();
+    build_schema(db);
+    let nodes = Nodes::of(db).await;
+
+    // The unanswered address, as the fixture's cluster names it.
+    let drop_host = texts(
+        &nodes.s1a,
+        &format!(
+            "SELECT host_address AS s FROM system.clusters \
+             WHERE cluster = '{DROP_CLUSTER}' AND replica_num = 1"
+        ),
+    )
+    .await
+    .pop()
+    .unwrap_or_else(|| panic!("the fixture defines no '{DROP_CLUSTER}'"));
+
+    // S2: a connect to it times out inside the fixture's network.
+    let probe = nodes
+        .s1a
+        .execute(
+            &format!(
+                "SELECT 1 FROM remote('{drop_host}:9000', system.one) \
+                 SETTINGS connections_with_failover_max_tries = 1"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await;
+    match probe {
+        Err(err)
+            if err
+                .to_string()
+                .contains("Timeout exceeded while connecting") => {}
+        Err(err) => panic!("DROP did not time out on the fixture network: {err}"),
+        Ok(()) => panic!("DROP did not time out on the fixture network: it answered"),
+    }
+
+    // S3: no error remembered for it, so the first inserts try it first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(130);
+    loop {
+        let errors = num(
+            &nodes.s1a,
+            &format!(
+                "SELECT toUInt64(errors_count) AS n FROM system.clusters \
+                 WHERE cluster = '{DROP_CLUSTER}' AND host_address = '{drop_host}'"
+            ),
+        )
+        .await;
+        if errors == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{drop_host}'s errors_count stayed at {errors} for 130 s"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // S4, S5, S6.
+    exec(
+        &nodes.s1a,
+        &format!(
+            "CREATE TABLE {db}.log_landing_drop AS {db}.log_landing \
+             ENGINE = Distributed('{DROP_CLUSTER}', '{db}', 'log_landing', cityHash64(received_ms))"
+        ),
+    )
+    .await;
+    let client = Arc::new(client(&[(&shard1(), None)], db).await);
+    let root = spool_root("drop-replica");
+    let mut rt = runtime(&root, 3);
+    rt.log_landing_inserters = 4;
+    let writer = Arc::new(LogWriter::with_landing_inserter_and_runtime(
+        Arc::new(ChBlockInserter::new(client.clone())),
+        rt,
+        WriterTables::landing_for(Some("_drop")),
+    ));
+
+    let tail = pulsus_clickhouse::replica_connect_timeout_clause();
+    let lag_sql = format!(
+        "SELECT max(absolute_delay) AS lag_s FROM clusterAllReplicas('{DROP_CLUSTER}', system.replicas) \
+         WHERE database = '{db}' AND startsWith(table, 'metric_') \
+         SETTINGS skip_unavailable_shards = 1, {tail}"
+    );
+    let identity_sql = format!(
+        "SELECT arraySort(groupUniqArray(toString(uuid))) AS ids \
+         FROM clusterAllReplicas('{DROP_CLUSTER}', system.databases) WHERE name = '{db}' \
+         SETTINGS skip_unavailable_shards = 1, {tail}"
+    );
+
+    type PushOutcome = (Duration, Result<(), String>);
+    let pushes = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            let mut handles = Vec::with_capacity(200);
+            for i in 0..200u32 {
+                tick.tick().await;
+                let writer = writer.clone();
+                handles.push(tokio::spawn(async move {
+                    let sent = std::time::Instant::now();
+                    let body = format!("sustained {i}");
+                    let result = match writer.admit_flush(
+                        &no_tenant(),
+                        log_push(1000 + u128::from(i), &[body.as_str()]),
+                        PushHeaders::default(),
+                    ) {
+                        Ok(wait) => wait.await.map_err(|e| format!("{e:?}")),
+                        Err(refusal) => Err(format!("refused at admission: {refusal:?}")),
+                    };
+                    (sent.elapsed(), result)
+                }));
+            }
+            let mut out: Vec<PushOutcome> = Vec::with_capacity(200);
+            for h in handles {
+                out.push(h.await.expect("a push task panicked"));
+            }
+            out
+        })
+    };
+    let poll = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                tick.tick().await;
+                out.push(("lag", timed_poll::<PollLagRow>(&client, &lag_sql).await));
+                out.push((
+                    "identity",
+                    timed_poll::<PollIdentityRow>(&client, &identity_sql).await,
+                ));
+            }
+            out
+        })
+    };
+    let ready = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut out = Vec::new();
+            for _ in 0..20 {
+                tick.tick().await;
+                let start = std::time::Instant::now();
+                let answer = tokio::time::timeout(Duration::from_secs(2), client.ping()).await;
+                out.push((start.elapsed(), answer));
+            }
+            out
+        })
+    };
+    let pushes = pushes.await.expect("the push task");
+    let poll = poll.await.expect("the poll task");
+    let ready = ready.await.expect("the ready task");
+    writer.shutdown(Duration::from_secs(10)).await;
+    sync_everywhere(&nodes, db).await;
+
+    let mut failures = Vec::new();
+    // P1, P2.
+    for (i, (elapsed, result)) in pushes.iter().enumerate() {
+        if let Err(e) = result {
+            failures.push(format!("P1: push {i} failed after {elapsed:?}: {e}"));
+        }
+        if *elapsed >= Duration::from_secs(1) {
+            failures.push(format!("P2: push {i} answered after {elapsed:?}"));
+        }
+    }
+    if pushes.len() != 200 {
+        failures.push(format!("P1: {} pushes, 200 expected", pushes.len()));
+    }
+    // P3.
+    if ready.len() < 20 {
+        failures.push(format!("P3: {} probes, at least 20 expected", ready.len()));
+    }
+    for (i, (elapsed, answer)) in ready.iter().enumerate() {
+        if !matches!(answer, Ok(Ok(()))) {
+            failures.push(format!("P3: probe {i} after {elapsed:?}: {answer:?}"));
+        }
+    }
+    // P4.
+    if poll.len() < 8 {
+        failures.push(format!(
+            "P4: {} poll statements, at least 8 expected",
+            poll.len()
+        ));
+    }
+    for (i, (name, (elapsed, result))) in poll.iter().enumerate() {
+        if let Err(e) = result {
+            failures.push(format!(
+                "P4: poll {i} ({name}) failed after {elapsed:?}: {e}"
+            ));
+        }
+        if *elapsed >= Duration::from_secs(1) {
+            failures.push(format!("P4: poll {i} ({name}) took {elapsed:?}"));
+        }
+    }
+    // P5.
+    for (name, node) in [
+        ("shard 1, first replica", &nodes.s1a),
+        ("shard 1, second replica", &nodes.s1b),
+    ] {
+        let sql = format!(
+            "SELECT count() AS n, uniqExact(body) AS u FROM {db}.log_landing \
+             WHERE kind = 0 AND startsWith(body, 'sustained ')"
+        );
+        let mut stream = node
+            .query_stream::<StoredRow>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        let row = stream
+            .next()
+            .await
+            .expect("one row")
+            .unwrap_or_else(|e| panic!("decode: {e}\nSQL:\n{sql}"));
+        if (row.n, row.u) != (200, 200) {
+            failures.push(format!(
+                "P5: {name} holds {} lines, {} distinct; 200 of each expected",
+                row.n, row.u
+            ));
+        }
+    }
+
+    drop_db(&nodes, db).await;
+    std::fs::remove_dir_all(&root).ok();
+    assert!(
+        failures.is_empty(),
+        "{} conditions failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// `WriterConfig::default()` with log and trace batching off (issue #494

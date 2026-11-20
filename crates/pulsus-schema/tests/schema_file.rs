@@ -2437,7 +2437,7 @@ ENGINE = ReplacingMergeTree(ver)
 PARTITION BY toDate(minute)
 ORDER BY (org_id, conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400), 4294967295))
-SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 
 /// `service_edges_mv` as the design writes it (part A §3.2, part C §3),
 /// rendered the same way, with the production row ceiling. Its first line
@@ -3267,7 +3267,7 @@ fn the_rollup_levels_render_from_one_template() {
                         format!(
                             "TTL staged_at + toIntervalHour(6 + 2 * intDiv({next}000 + 3599999, 3600000) + 1)"
                         ),
-                        "SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
+                        "SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
                     ] {
                         assert!(
                             stage_lines.contains(&line.as_str()),
@@ -3802,22 +3802,23 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     };
     // The digests moved with issue #813, which adds the six profile tables,
     // their four wrappers and five views, with issue #814, which gives
-    // `profile_landing`'s ten upload columns a `DEFAULT`, and with issue
-    // #828, which adds `mapping_flags` and `period`.
+    // `profile_landing`'s ten upload columns a `DEFAULT`, with issue #889,
+    // which puts the replaced-parts settings first in every table's
+    // `SETTINGS`, and with issue #828, which adds `mapping_flags` and `period`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "e35b4a6623dd0d1d02baf5d1201b88284e471985c61b7ebe5afa8ece3e5b4930",
+            "e4f3f491dd045193a26507530cb0cf1ac9b94e83d8b7ce605ca1af1483b28f95",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "a4969874260d51b30a47b57ef5ef11b3c9591e5b2b319cfaa1dc00c2c951a941",
+            "180ede665ed9dfaac56bbc059cc2af7db4c4f737cad725e7d154ba93ceaa95e0",
         ),
         (
             "clustered with a storage policy",
@@ -3827,7 +3828,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "4800ff4f3cff9fa858626dedd53ab446c478e397fe440debe28c7d1d93c05721",
+            "6553e418fe685ba036829f378af24bbcf41643016108d4b03dc9e9b36825fa7e",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -6834,5 +6835,54 @@ fn the_profile_landing_upload_columns_carry_defaults() {
             defaulted, want,
             "{what}: the columns of profile_landing that carry a DEFAULT"
         );
+    }
+}
+
+/// Issue #889: every table keeps its replaced parts 60 s, and a merge and a
+/// fetch flush the files of the part they write before it replaces anything.
+/// The tuple comes first in each table's `SETTINGS`, once, in both renders.
+/// No wrapper or view carries any of it, no statement flushes a part's
+/// directory, and only the `Distributed` wrappers flush their inserts.
+#[test]
+fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and_fetches() {
+    const TUPLE: &str = "SETTINGS old_parts_lifetime = 60, \
+                         min_compressed_bytes_to_fsync_after_merge = 1, \
+                         min_compressed_bytes_to_fsync_after_fetch = 1, ";
+    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
+        let mut tables = 0;
+        for s in rendered_statements(&ctx) {
+            let is_wrapper = s.contains("ENGINE = Distributed(");
+            let is_table = s.trim_start().starts_with("CREATE TABLE") && !is_wrapper;
+            if is_table {
+                assert_eq!(
+                    s.matches(TUPLE).count(),
+                    1,
+                    "{what}: a table without the replaced-parts settings once: {s}"
+                );
+                tables += 1;
+            } else {
+                for name in [
+                    "old_parts_lifetime",
+                    "fsync_after_merge",
+                    "fsync_after_fetch",
+                ] {
+                    assert!(
+                        !s.contains(name),
+                        "{what}: {name} reached a wrapper or a view: {s}"
+                    );
+                }
+            }
+            assert!(
+                !s.contains("fsync_part_directory"),
+                "{what}: a statement flushes a part's directory: {s}"
+            );
+            if s.contains("fsync_after_insert") {
+                assert!(
+                    is_wrapper,
+                    "{what}: fsync_after_insert outside a wrapper: {s}"
+                );
+            }
+        }
+        assert_eq!(tables, 37, "{what}: table count");
     }
 }

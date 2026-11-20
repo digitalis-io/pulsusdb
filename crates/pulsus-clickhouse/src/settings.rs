@@ -46,6 +46,22 @@ pub const MAX_JSON_PATHS_PER_VALUE: u64 = 100_000;
 /// its spans and resources absent from the new tables.
 pub const MAX_PARTITIONS_PER_INSERT_BLOCK: u64 = 100;
 
+/// How long a statement's server waits to open a connection to another
+/// server of the cluster, in milliseconds, plain and TLS (issue #888). The
+/// server's own default is 1000 per try, three tries per replica.
+pub const REPLICA_CONNECT_TIMEOUT_MS: u64 = 100;
+
+/// The same two settings as [`QuerySettings::replica_connect_timeout`], for
+/// a statement that carries its settings in its text:
+/// `connect_timeout_with_failover_ms = 100,
+/// connect_timeout_with_failover_secure_ms = 100`.
+pub fn replica_connect_timeout_clause() -> String {
+    format!(
+        "connect_timeout_with_failover_ms = {REPLICA_CONNECT_TIMEOUT_MS}, \
+         connect_timeout_with_failover_secure_ms = {REPLICA_CONNECT_TIMEOUT_MS}"
+    )
+}
+
 /// The settings that can turn a read into a partial or changed answer that
 /// still succeeds (#603 plan, "Answer pins"). Every read of every signal sends them.
 pub const ANSWER_PIN_NAMES: [&str; 17] = [
@@ -223,6 +239,20 @@ impl QuerySettings {
     pub fn without(mut self, key: &str) -> Self {
         self.0.retain(|(k, _)| k != key);
         self
+    }
+
+    /// `connect_timeout_with_failover_ms` and
+    /// `connect_timeout_with_failover_secure_ms` at
+    /// [`REPLICA_CONNECT_TIMEOUT_MS`].
+    pub fn replica_connect_timeout(self) -> Self {
+        self.set(
+            "connect_timeout_with_failover_ms",
+            REPLICA_CONNECT_TIMEOUT_MS,
+        )
+        .set(
+            "connect_timeout_with_failover_secure_ms",
+            REPLICA_CONNECT_TIMEOUT_MS,
+        )
     }
 
     /// The value of one setting, if present. Introspection only (tests /
@@ -510,6 +540,14 @@ impl QuerySettings {
     /// |---|---|---|
     /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
     /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
+    ///
+    /// Two more, on every landing insert since issue #888, through
+    /// [`Self::replica_connect_timeout`]:
+    ///
+    /// | setting | pinned to | why |
+    /// |---|---|---|
+    /// | `connect_timeout_with_failover_ms` | `100` | **how long one try at a replica waits to connect.** On a cluster the wrapper writes one replica of the shard, tried in turn. At the server's default 1000, a replica whose address drops packets holds the insert, and this process's connection lease, 1 s per try (issue #888). A connect within one region takes milliseconds. An insert that reaches no replica fails `Code: 279` as before; a try that does not connect has sent no row |
+    /// | `connect_timeout_with_failover_secure_ms` | `100` | the same, when the cluster's servers talk TLS |
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
         Self::deduplicate_through_views()
             .set("insert_deduplication_token", token)
@@ -534,6 +572,7 @@ impl QuerySettings {
                 MAX_PARTITIONS_PER_INSERT_BLOCK,
             )
             .set("throw_on_max_partitions_per_insert_block", 1)
+            .replica_connect_timeout()
     }
 
     /// The settings every insert of one traces landing block carries (issues
@@ -894,7 +933,7 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            21,
+            23,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
@@ -921,6 +960,23 @@ mod tests {
         for (key, value) in PINS {
             assert_eq!(landing.get(key), Some(value), "landing_insert: {key}");
             assert_eq!(traces.get(key), Some(value), "trace_landing_insert: {key}");
+        }
+    }
+
+    /// **T3 (issue #888): every landing insert pins the replica connect
+    /// timeout**, logs and metrics through [`QuerySettings::landing_insert`]
+    /// and traces through [`QuerySettings::trace_landing_insert`], both
+    /// names at 100 ms.
+    #[test]
+    fn every_landing_insert_pins_the_replica_connect_timeout() {
+        let landing = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        for key in [
+            "connect_timeout_with_failover_ms",
+            "connect_timeout_with_failover_secure_ms",
+        ] {
+            assert_eq!(landing.get(key), Some("100"), "landing_insert: {key}");
+            assert_eq!(traces.get(key), Some("100"), "trace_landing_insert: {key}");
         }
     }
 
