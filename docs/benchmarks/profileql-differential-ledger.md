@@ -345,3 +345,52 @@ own error, as PulsusDB does.
 - **Why:** owner, 2026-11-19, "Cut exactly";
   `docs/reference-defects-we-do-not-copy.md` entry 52.
 - **Case:** `C44` and `C45` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `stats-bounds-are-hours`
+
+- **Route:** `GetProfileStats`, `GET /api/profiles/v1/stats`.
+- **Request:** a tenant holding profiles.
+- **PulsusDB:** `oldestProfileTime` the start of the oldest profile's UTC
+  hour and `newestProfileTime` the last millisecond of the newest profile's
+  UTC hour, read from the series table.
+- **Reference:** `oldestProfileTime` 0 (mechanism not located) and
+  `newestProfileTime` the newest profile's millisecond.
+- **Why:** issue #830: the exploration app sends it on every load and reads
+  only `dataIngested`, and the exact times would read every entry the tenant
+  holds: 25,921,000 rows for three days of a 1,500-series tenant, past the
+  scan budget after 5.8 days.
+- **Case:** `C59` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `analyze-query-is-not-computed`
+
+- **Route:** `AnalyzeQuery`.
+- **Request:** a window holding data.
+- **PulsusDB:** `{}`, with no statement sent.
+- **Reference:** two scopes, `Short term storage` and `Long term storage`,
+  every count zero.
+- **Why:** owner, 2026-11-21, "I'll go with your recommendations": the
+  figure would read every sample of the window, and the exploration app's
+  only caller of it is disabled.
+- **Case:** `C60` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `recording-rules-unimplemented`
+
+- **Route:** `settings.v1.RecordingRulesService/*`.
+- **Request:** any.
+- **PulsusDB:** `501`
+  `{"code":"unimplemented","message":"recording rules are not served"}`.
+- **Reference:** `404` `404 page not found`: the service is not mounted
+  without recording rules.
+- **Why:** owner decision Q15 on #772.
+- **Case:** `C61` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `vcs-get-file-unimplemented`
+
+- **Route:** `vcs.v1.VCSService/GetFile`.
+- **Request:** no session.
+- **PulsusDB:** `501`
+  `{"code":"unimplemented","message":"GitHub integration is not configured"}`,
+  as every method of the service answers.
+- **Reference:** `401` `{"code":"unauthenticated","message":"invalid token"}`.
+- **Why:** owner decision Q16 on #772.
+- **Case:** `C63` in `crates/pulsus-server/tests/profileql_differential.rs`.
