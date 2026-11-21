@@ -3303,6 +3303,41 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: PROFILES_LABEL_VALUES_BASE_QUERY,
         cases: &[],
     },
+    // Issue #832: the compat paths under the native prefix, where the
+    // profiles datasource sends them, mounted without the compat flag.
+    RouteSpec {
+        path: "/api/profiles/v1/pyroscope/render",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_RENDER_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/pyroscope/render-diff",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_RENDER_DIFF_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/pyroscope/label-values",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_LABEL_VALUES_BASE_QUERY,
+        cases: &[],
+    },
     // -- Profiles settings, stats and query analysis (issue #830,
     // docs/api.md §5). The settings rows are in this order on purpose:
     // both `Get`s answer `{}` before either `Set` stores, both `Set`s write

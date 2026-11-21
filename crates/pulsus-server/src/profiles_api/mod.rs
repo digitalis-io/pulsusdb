@@ -18,6 +18,9 @@
 //! `/label-values`, and their compat paths `/pyroscope/render`,
 //! `/pyroscope/render-diff` and `/pyroscope/label-values`, each in one
 //! statement; `SelectMergeStacktraces` with `PROFILE_FORMAT_TREE`.
+//! Issue #832: the three compat paths also under the native prefix,
+//! `/api/profiles/v1/pyroscope/{render,render-diff,label-values}`, where the
+//! profiles datasource sends them.
 //! Issue #830: the exploration app's `settings.v1.SettingsService/{Get,Set,
 //! Delete}`, `GetProfileStats` (and `GET /api/profiles/v1/stats`) and
 //! `AnalyzeQuery` at the two Connect surfaces, one statement each and none
@@ -148,6 +151,15 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/profiles/v1/render-diff", get(render::render_diff_get))
         .route(
             "/api/profiles/v1/label-values",
+            get(render::label_values_get),
+        )
+        .route("/api/profiles/v1/pyroscope/render", get(render::render_get))
+        .route(
+            "/api/profiles/v1/pyroscope/render-diff",
+            get(render::render_diff_get),
+        )
+        .route(
+            "/api/profiles/v1/pyroscope/label-values",
             get(render::label_values_get),
         )
 }

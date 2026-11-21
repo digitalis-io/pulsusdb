@@ -1802,20 +1802,46 @@ Messages, with their JSON names (proto3 JSON: a field at its default is omitted,
 | `unimplemented` | `501` | an unknown `Content-Encoding`; a `SelectSeries` exemplar type `EXEMPLAR_TYPE_SPAN`; every method of `settings.v1.RecordingRulesService` and `vcs.v1.VCSService` |
 | `internal` | `500` | anything else |
 | `unavailable` | `503` | the database cannot be reached |
-| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed`. On the fourteen `GET` paths (the eight `GET` routes, the three render routes and their compat paths) the body ends with a newline and carries `X-Content-Type-Options: nosniff`, as the reference's HTTP handlers write it |
+| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed`. On the seventeen `GET` paths (the eight `GET` routes, the three render routes, their compat paths and those paths under `/api/profiles/v1`) the body ends with a newline and carries `X-Content-Type-Options: nosniff`, as the reference's HTTP handlers write it |
 
-**Render routes** (issue #829), `GET` only, each one handler at its native path and, with `PULSUS_COMPAT_ENDPOINTS=true`, its compat path. Each answers `Content-Type: application/json`, except `render` with `format=dot` (below), the body ending with a newline, every string escaped as the reference escapes it (`<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`):
+**Render routes** (issue #829), `GET` only, each one handler at its native path and under `/api/profiles/v1/pyroscope/` and, with `PULSUS_COMPAT_ENDPOINTS=true`, its compat path. Each answers `Content-Type: application/json`, except `render` with `format=dot` (below), the body ending with a newline, every string escaped as the reference escapes it (`<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`):
 
 | Native route | Compat path | Parameters |
 |---|---|---|
-| `GET /api/profiles/v1/render` | `/pyroscope/render` | `query` (`<type>{selector}`, required), `from`, `until`, `max-nodes` or `maxNodes`, `groupBy` (repeated), `aggregation` (`avg`, else the sum), `format` |
-| `GET /api/profiles/v1/render-diff` | `/pyroscope/render-diff` | `leftQuery`, `leftFrom`, `leftUntil`, `rightQuery`, `rightFrom`, `rightUntil`, `max-nodes` or `maxNodes` |
-| `GET /api/profiles/v1/label-values` | `/pyroscope/label-values` | `label` (required) |
+| `GET /api/profiles/v1/render`, `GET /api/profiles/v1/pyroscope/render` | `/pyroscope/render` | `query` (`<type>{selector}`, required), `from`, `until`, `max-nodes` or `maxNodes`, `groupBy` (repeated), `aggregation` (`avg`, else the sum), `format` |
+| `GET /api/profiles/v1/render-diff`, `GET /api/profiles/v1/pyroscope/render-diff` | `/pyroscope/render-diff` | `leftQuery`, `leftFrom`, `leftUntil`, `rightQuery`, `rightFrom`, `rightUntil`, `max-nodes` or `maxNodes` |
+| `GET /api/profiles/v1/label-values`, `GET /api/profiles/v1/pyroscope/label-values` | `/pyroscope/label-values` | `label` (required) |
 
 - **Parameters.** A query is the type up to its first `{` and the selector from it, `{}` when there is none; a missing one is `invalid_argument`, and the type is checked as `SelectMergeStacktraces` checks it. `from` and `until` are read as the `GET` routes read them, an absent or empty one being now. `max-nodes`, then `maxNodes`, is the flame graph's `maxNodes`, the later winning; a value that is not an integer, or 0, is ignored.
 - **`render`** answers `{"version":1,"flamebearer":{"names","levels","numTicks","maxSelf"},"metadata":{"format":"single","spyName":"","sampleRate","units","name"},"timeline","groups","heatmap":null}`. `flamebearer` is `SelectMergeStacktraces`'s flame graph, `levels` written as integers. `metadata.name` is the type's sample type; `units` and `sampleRate` are `samples` and `1000000000` for `cpu`, `objects` and `100` for `inuse_objects`, `alloc_objects`, `goroutine` and `samples`, else the sample unit and `100`. `timeline` is `{"startTime","samples","durationDelta","watermarks":null}`: `durationDelta` is the window over 1500 points in seconds, at least 15 and rounded as the reference rounds it; `startTime` is `from` aligned down to it, in seconds, and `samples` holds one value per step up to `until` aligned down, 0 where there is none, from the selection's series when there is exactly one, else all 0. The steps start at `from` whatever data the window holds; the reference starts them at the tenant's first profile when the window begins before it, as recorded in [reference-defects-we-do-not-copy.md](reference-defects-we-do-not-copy.md) §50. With `groupBy`, `groups` maps each series' value of the first `groupBy` label, `*` when it has none, to its own timeline, keys in byte order; otherwise `null`. `format=dot` answers the merged profile as a DOT graph, `Content-Type: text/plain; charset=utf-8`: the profile is cut to `max(512, n)` function nodes as the pprof export cuts it ([reference-defects-we-do-not-copy.md](reference-defects-we-do-not-copy.md) §52), nodes tied at the cut kept, so it can keep more, and drawn with at most `n` nodes, `n` the `max-nodes` value when above 0, else 100. A selection with no samples answers `200`, `Content-Type: text/plain` and no body. `groupBy` and `aggregation` are not read.
 - **`render-diff`** answers the `Diff` of the two selections, both trimmed with the one `max-nodes`, as `render`'s object with `"format":"double"`, `timeline` and `groups` `null`, and `leftTicks` and `rightTicks`, each omitted at 0. Two different types are `invalid_argument` `profile types must match`.
 - **`label-values`** answers a JSON array of strings, or `null` when there is none: for `__name__` the profile types' ids over the last hour, for any other label its values over the last hour with no matchers. The reference answers `400` for every label but `__name__`, as recorded in [reference-defects-we-do-not-copy.md](reference-defects-we-do-not-copy.md) §49.
+
+### 5.1 Pointing the profiles datasource and the exploration app at PulsusDB
+
+Neither needs `PULSUS_COMPAT_ENDPOINTS`. The exploration app sends every call through the datasource.
+
+| Setting | Value |
+|---------|-------|
+| Datasource URL | the PulsusDB base URL followed by `/api/profiles/v1`, on a process whose `PULSUS_MODE` is `all` or `reader`. With `PULSUS_COMPAT_ENDPOINTS=true` the base URL alone also works. |
+| Tenant | a custom HTTP header `X-Scope-OrgID` with the tenant as its value. Without it the datasource reads the empty tenant. |
+| Datasource basic authentication | on, with the `PULSUS_AUTH_USER` and `PULSUS_AUTH_PASSWORD` pair, when PulsusDB has both set. |
+| Heatmap and exemplars | the front end's `profilesHeatmap` and `profilesExemplars` feature toggles. PulsusDB needs no setting. |
+| Trace to profiles | in the trace datasource (§8.3), set this datasource as the profiles source, its profile type, and the tag `service.name` mapped to `service_name`. The trace view offers a span's profile only when the span carries the attribute `pyroscope.profile.id`, and asks for the samples whose span id is that attribute's value: OTLP samples linked to the span (§1.1), or pprof samples labelled `span_id` (§1.3). An instrumentation that profiles spans sets the attribute to the span's own id. |
+
+The app's pages and the calls they send:
+
+| Page | Calls |
+|------|-------|
+| every page | `GetProfileStats`, settings `Get` |
+| services, profile types, labels | `Series`, `LabelNames`, `LabelValues`, flame graph and time series queries |
+| flame graph, with or without the span heatmap | `LabelNames`, `Series`, `SelectHeatmap`, flame graph queries, and `settings.v1.RecordingRulesService/ListRecordingRules`, answered `501` `unimplemented`; the page does not show this error, which appears only in the create-recording-rule dialog, reachable with the recording-rules feature on |
+| diff | `GET <datasource URL>/pyroscope/render-diff` |
+| export menu | `GET <datasource URL>/pyroscope/render`, `SelectMergeProfile` |
+| settings | settings `Get`, `Set` |
+| ad hoc | `adhocprofiles.v1.AdHocProfileService/Upload`, `Get`, `Diff` |
+
+Not served, answered `501` `unimplemented`: recording rules (`settings.v1.RecordingRulesService/*`) and source code links (`vcs.v1.VCSService/*`).
 
 ---
 
