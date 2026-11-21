@@ -6,6 +6,8 @@
 #
 # Run by hand only. Copies one pinned digest of moby/buildkit:buildx-stable-1;
 # the last step prints the copy's digest, which is what the workflows pin.
+# The job runs in the `ghcr-publish` environment, which deploys from `main`
+# only after its reviewer approves (#832).
 # To move to a newer build image, change the source digest, run this, and
 # update the pins.
 name: buildkit-mirror
@@ -15,13 +17,16 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
+    environment: ghcr-publish
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
