@@ -235,6 +235,7 @@ async fn render_answer(
         groups,
         left_ticks: 0,
         right_ticks: 0,
+        meta: None,
     }
     .to_json())
 }
@@ -292,6 +293,7 @@ async fn render_diff_answer(
         groups: None,
         left_ticks: g.left_ticks,
         right_ticks: g.right_ticks,
+        meta: None,
     }
     .to_json())
 }

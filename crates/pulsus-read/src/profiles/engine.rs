@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::traces::tenant_scope::TenantTerm;
 
+use super::adhoc::convert::Converted;
+use super::adhoc::{AdhocRow, UploadRow};
 use super::app::{SettingRow, StatsRow, Written};
 use super::catalogue::{Read, compat_sets};
 use super::diff::DiffRow;
@@ -54,6 +56,11 @@ pub struct ProfilesReadConfig {
     pub samples_table: String,
     /// Issue #824: `profile_entries`, or its wrapper on a cluster.
     pub entries_table: String,
+    /// Issue #831: `profile_landing`, or its wrapper on a cluster: where an
+    /// upload is inserted.
+    pub landing_table: String,
+    /// Issue #831: `profile_adhoc`, or its wrapper on a cluster.
+    pub adhoc_table: String,
     /// The wrapper suffix when clustered, else empty: the tenant check's
     /// table list.
     pub dist_suffix: String,
@@ -84,6 +91,8 @@ impl ProfilesReadConfig {
             series_table: format!("profile_series{dist}"),
             samples_table: format!("profile_samples{dist}"),
             entries_table: format!("profile_entries{dist}"),
+            landing_table: format!("profile_landing{dist}"),
+            adhoc_table: format!("profile_adhoc{dist}"),
             dist_suffix: dist.to_string(),
             limits: WindowLimits {
                 max_length_ms: millis(r.profiles_max_query_length.0),
@@ -138,6 +147,17 @@ fn tree_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Quer
 /// merged stacks as the build side of both joins (D3).
 fn pprof_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
     tree_settings(config, log_comment)
+}
+
+/// Issue #831: the settings an upload's one insert carries: the landing
+/// insert's pins for one block of `rows` rows under `token` (the upload's
+/// id), and the request id as `log_comment`.
+fn upload_settings(token: &str, rows: u64, log_comment: Option<&str>) -> QuerySettings {
+    let mut s = QuerySettings::landing_insert(token, rows);
+    if let Some(comment) = log_comment {
+        s = s.set("log_comment", comment);
+    }
+    s
 }
 
 /// The class of a failed profiles statement (plan §6).
@@ -196,6 +216,8 @@ pub struct ProfilesEngine {
     dispatch: ProfileDispatch,
     config: ProfilesReadConfig,
     log_comment: Option<String>,
+    /// Issue #831: the tenant an upload's rows are stamped with.
+    tenant: pulsus_model::Tenant,
 }
 
 impl ProfilesEngine {
@@ -206,6 +228,7 @@ impl ProfilesEngine {
             dispatch: ProfileDispatch::new(client, TenantTerm::of(&tenant), tables),
             config,
             log_comment: None,
+            tenant,
         }
     }
 
@@ -326,6 +349,34 @@ impl ProfilesEngine {
         }
         self.dispatch.write(sql, &settings).await
     }
+
+    /// Issue #831: sends S14 (`super::adhoc`) and returns its rows.
+    pub async fn read_adhoc(&self, sql: &str) -> Result<Vec<AdhocRow>, ProfilesReadError> {
+        let settings = tree_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #831: sends S15 (`super::adhoc`) and returns the uploads.
+    pub async fn read_uploads(&self, sql: &str) -> Result<Vec<UploadRow>, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #831: stores upload `id` as one insert of its rows (§3.3),
+    /// every row stamped with this engine's tenant.
+    pub async fn store_upload(
+        &self,
+        id: &str,
+        name: &str,
+        uploaded_at: i64,
+        converted: &Converted,
+    ) -> Result<(), ProfilesReadError> {
+        let rows = super::adhoc::rows(&self.tenant, id, name, uploaded_at, converted);
+        let settings = upload_settings(id, rows.len() as u64, self.log_comment.as_deref());
+        self.dispatch
+            .insert(&self.config.landing_table, &rows, &settings)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +388,8 @@ mod tests {
             series_table: "profile_series".to_string(),
             samples_table: "profile_samples".to_string(),
             entries_table: "profile_entries".to_string(),
+            landing_table: "profile_landing".to_string(),
+            adhoc_table: "profile_adhoc".to_string(),
             dist_suffix: String::new(),
             limits: WindowLimits::default(),
             scan_budget_rows: 11,
@@ -495,6 +548,8 @@ mod tests {
             assert_eq!(c.series_table, format!("profile_series{dist}"));
             assert_eq!(c.samples_table, format!("profile_samples{dist}"));
             assert_eq!(c.entries_table, format!("profile_entries{dist}"));
+            assert_eq!(c.landing_table, format!("profile_landing{dist}"));
+            assert_eq!(c.adhoc_table, format!("profile_adhoc{dist}"));
             assert_eq!(c.max_nodes_default, 17);
             assert_eq!(c.max_nodes_max, 19);
             assert_eq!(c.dist_suffix, dist);
@@ -512,5 +567,18 @@ mod tests {
             assert_eq!(c.distributed, cluster.is_some());
             assert!(c.skip_unavailable_shards);
         }
+    }
+
+    /// u10 (issue #831): an upload's insert carries the landing insert's
+    /// pins for its one block, under its id, and the request id.
+    #[test]
+    fn u10_upload_insert_settings() {
+        assert_eq!(
+            format!("{:?}", upload_settings("u", 7, Some("rid"))),
+            format!(
+                "{:?}",
+                QuerySettings::landing_insert("u", 7).set("log_comment", "rid")
+            )
+        );
     }
 }

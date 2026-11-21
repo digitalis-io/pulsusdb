@@ -245,6 +245,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `metric_samples_<N>s` | the end of the UTC day of `t_end − 1 ms` + `L` days | whole part | UTC day of `t_end − 1 ms` |
 | `metric_samples_<N>s_stage` | `staged_at` + `H` + 2 × ⌈the next level ÷ 3600 s⌉ + 1 hours | whole part | hour of `staged_at` |
 | `metric_series` | the end of the UTC day `day` + `C` days | whole part | `day`, a UTC day |
+| `profile_adhoc` | `uploaded_at` + `R` days | whole part | UTC day of `uploaded_at` |
 | `profile_entries` | `timestamp_ns` + `R` days | whole part | UTC day of `timestamp_ns` |
 | `profile_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
 | `profile_locations` | the end of the UTC day `day` + 1 day + `R` days | whole part | `day`, the UTC day the row was received |
@@ -278,7 +279,7 @@ With `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` set, `schema/schema.sh` gi
 | traces | `spans`, `error_spans`, `tag_bucket_values`, `service_bucket_resources`, `service_edges` | `PULSUS_TRACES_HOT_DAYS` |
 | profiles | `profile_samples`, `profile_entries` | `PULSUS_PROFILES_HOT_DAYS` |
 | levels | `metric_samples_<N>s` | its `PULSUS_ROLLUP_HOT_DAYS` item; no move rule when that is unset or equals the level's retention |
-| never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `profile_landing`, `profile_locations`, `profile_series`, `profile_settings`, `profile_stacks`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces`, and each rollup stage `metric_samples_<N>s_stage` | created without `storage_policy`, on the server's `default` policy |
+| never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `profile_adhoc`, `profile_landing`, `profile_locations`, `profile_series`, `profile_settings`, `profile_stacks`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces`, and each rollup stage `metric_samples_<N>s_stage` | created without `storage_policy`, on the server's `default` policy |
 
 A part moves when its newest row is older than the move age, so a UTC day `D` of raw data with move age `H` is local until `D + 1 + H` days; rows written for a day already moved go straight to the cold volume. A level's UTC day `D` with move age `H` is local until `D + 1 + H` days, as raw data is.
 

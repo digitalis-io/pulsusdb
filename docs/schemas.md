@@ -881,10 +881,10 @@ it, and reads and writes its markers under the empty tenant (`org_id = ''`), one
 | `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:1215-1219` |
 | `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:1141-1166` |
 | `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:1221-1238` |
-| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:1256-1260` |
-| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:928-940` |
-| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:976-983` |
-| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:985-994` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:1310-1314` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:959-971` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:1007-1014` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:1016-1025` |
 | `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:1091-1139` |
 
 So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
@@ -927,7 +927,9 @@ The full text of all three is `docs/TraceQL/sql-schema.md` §5.4, which is where
 
 ## 5. Profiles
 
-A batch of pushes is one insert of one block into `profile_landing`; five views copy each `kind` to its table. A sample row carries its profile's pushed `period`, and a location row its mapping's `has_functions`, `has_filenames`, `has_line_numbers` and `has_inline_frames` as bits 0–3 of `mapping_flags` (issue #828). `org_id` leads every sorting key. On a cluster `profile_stacks` and `profile_locations` are one replica set across every shard (`/clickhouse/tables/all/`); the other four are per shard, and a batch's rows sit on the shard that took it. Kinds 5 and 6 are reserved for uploaded files and have no view.
+A batch of pushes is one insert of one block into `profile_landing`; five views copy each `kind` to its table, and a sixth copies an ad hoc upload's kinds 5 and 6 (issue #831). A sample row carries its profile's pushed `period`, and a location row its mapping's `has_functions`, `has_filenames`, `has_line_numbers` and `has_inline_frames` as bits 0–3 of `mapping_flags` (issue #828). `org_id` leads every sorting key. On a cluster `profile_stacks` and `profile_locations` are one replica set across every shard (`/clickhouse/tables/all/`); the other four are per shard, and a batch's rows sit on the shard that took it.
+
+`profile_adhoc` (issue #831) holds the ad hoc uploads: an upload is one insert of one block of kinds 5 and 6 into `profile_landing` under the landing insert's block settings, and one view, `profile_adhoc_mv`, copies both kinds into the one table, so an upload is stored whole or not at all. `row_kind` 1 is a type row (its name, format and metadata), 0 a sample row (a type's value for a stack) and 2 a stack row (its node ids and frame names). On a cluster it is per shard, and an upload's rows sit on one shard, all carrying one `received_ms`.
 
 `profile_settings` (issue #830) holds the exploration app's settings and is written by the query API, not through the landing table: one row per write, `ReplacingMergeTree(version)` keyed `(org_id, name)` with no TTL and no partition, `version` the write's `modified_at` in the high 64 bits and `cityHash64(value, deleted)` in the low, and a read takes each name's `argMax(value, version)` and leaves out a name whose newest row is a tombstone (`deleted` 1). On a cluster it is one replica set across every shard.
 
@@ -938,6 +940,7 @@ A batch of pushes is one insert of one block into `profile_landing`; five views 
 | 2 | `profile_series_mv` | `profile_series` | `AggregatingMergeTree` | `(org_id, type_id, service, fingerprint)` | `day`, the UTC day of `timestamp_ns` |
 | 3 | `profile_entries_mv` | `profile_entries` | `MergeTree` | `(org_id, type_id, service, fingerprint, timestamp_ns, profile_id)` | UTC day of `timestamp_ns` |
 | 4 | `profile_locations_mv` | `profile_locations` | `ReplacingMergeTree` | `(org_id, location_id)` | `day`, the UTC day of `received_ms` |
+| 5, 6 | `profile_adhoc_mv` | `profile_adhoc` | `MergeTree` | `(org_id, upload_id, row_kind, type_ordinal, stack_id)` | UTC day of `uploaded_at` |
 
 ```sql
 CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
@@ -1089,6 +1092,30 @@ PARTITION BY day
 ORDER BY (org_id, location_id)
 TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
 SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_adhoc{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    upload_id UUID CODEC(ZSTD(1)),
+    row_kind UInt8 CODEC(ZSTD(1)),
+    type_ordinal UInt16 CODEC(ZSTD(1)),
+    stack_id UInt128 CODEC(ZSTD(1)),
+    value Int64 CODEC(T64, ZSTD(1)),
+    node_ids Array(UInt128) CODEC(ZSTD(1)),
+    names Array(LowCardinality(String)) CODEC(ZSTD(1)),
+    upload_name String CODEC(ZSTD(1)),
+    uploaded_at Int64 CODEC(ZSTD(1)),
+    format LowCardinality(String),
+    display_name String CODEC(ZSTD(1)),
+    spy_name String CODEC(ZSTD(1)),
+    sample_rate UInt32 CODEC(ZSTD(1)),
+    units LowCardinality(String)
+)
+ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Milli(uploaded_at), 'UTC')
+ORDER BY (org_id, upload_id, row_kind, type_ordinal, stack_id)
+TTL toDateTime(least(intDiv(uploaded_at, 1000) + ({{retention_days}} * 86400), 4294967295))
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 ```
 
 ---
@@ -1117,7 +1144,7 @@ PULSUS_CLUSTER=prod schema/schema.sh  # clustered
 schema/schema.sh --print              # render the statements, send nothing
 ```
 
-The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 72 statements single-node, 97 clustered, at the default levels, after the drop.
+The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 74 statements single-node, 100 clustered, at the default levels, after the drop.
 
 **There are no migrations.** No numbered list, no bookkeeping table, no checksum drift guard. A schema change is an edit to `schema.sql` and another run of the script; the cost is the data in the database, and the development workflow is to drop and recreate. Nothing is upgraded in place, including retention: `PULSUS_RETENTION_DAYS`, `PULSUS_ROLLUP_RETENTION_DAYS` and the four landing hours are each declared in the `CREATE` of the tables whose TTL they set ([configuration.md §7](configuration.md)), so changing one is a rebuild.
 
@@ -1140,6 +1167,7 @@ Enabled by `PULSUS_CLUSTER`. Every table but the rollup stages becomes `Replicat
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | **this expression governs reads, not writes** (issue #603). The writer inserts into `log_landing` under its bare name and the views write that shard's local targets, so a fingerprint's rows sit wherever its pushes landed and can sit on several shards. The reads tolerate it: the stream-resolution `GROUP BY fingerprint HAVING ...` counts distinct `(key, val)` pairs and `log_streams_idx`'s sorting key covers its whole row, so a cross-shard duplicate changes nothing; stage-2 hydration already keeps one row per fingerprint; the rollup, `/patterns` and volume reads merge partial aggregates at the initiator. What it ends is shard-local **label discovery**, whose semi-join asked whether a fingerprint was active *anywhere* and could only be answered per shard while one fingerprint's index and rollup rows co-resided — see the paragraph below the tables  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
 | `spans`, `traces`, `error_spans` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local. `spans` and `traces` are the two tables the TraceQL read design queries (issues #584 to #586); their wrappers carry the key as a literal rather than through `Ddl::Dist`, and `the_routing_wrappers_use_the_family_sharding_expression` is what keeps the two forms identical |
 | `profile_samples`, `profile_entries`, `profile_series` | `cityHash64(fingerprint)` | reads only. On a cluster a batch reaches `profile_landing` through its wrapper, keyed `cityHash64(received_ms)`, so it is one block on one shard, and the views write that shard's tables: a series' entries and samples sit beside the series rows of the same block |
+| `profile_adhoc` | `cityHash64(upload_id)` | reads only. An upload is one block of one `received_ms`, written through `profile_landing`'s wrapper, so it sits on one shard |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
 Fan-out analysis for the canonical operations:

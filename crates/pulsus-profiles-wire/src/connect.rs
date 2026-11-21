@@ -16,6 +16,8 @@ pub enum Code {
     DeadlineExceeded,
     /// Issue #830: a settings write older than the stored one.
     AlreadyExists,
+    /// Issue #831: an ad hoc upload that is not there.
+    NotFound,
 }
 
 impl Code {
@@ -30,6 +32,7 @@ impl Code {
             Code::Unknown => "unknown",
             Code::DeadlineExceeded => "deadline_exceeded",
             Code::AlreadyExists => "already_exists",
+            Code::NotFound => "not_found",
         }
     }
 
@@ -42,6 +45,7 @@ impl Code {
             Code::Unavailable => 503,
             Code::Internal | Code::Unknown => 500,
             Code::AlreadyExists => 409,
+            Code::NotFound => 404,
             Code::DeadlineExceeded => 504,
         }
     }

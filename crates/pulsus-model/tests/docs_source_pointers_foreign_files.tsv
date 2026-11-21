@@ -123,10 +123,12 @@ pkg/model/stacktraces.go
 pkg/model/timeseries/exemplar_builder.go
 pkg/model/tree.go
 pkg/og/convert/parser.go
+pkg/og/convert/perf/script.go
 pkg/og/convert/speedscope/parser.go
 pkg/og/convert/speedscope/units.go
 pkg/og/storage/tree/serialize.go
 pkg/og/storage/tree/tree.go
+pkg/og/structs/flamebearer/convert/convert.go
 pkg/pattern/drain/chunk.go
 pkg/pattern/ingester.go
 pkg/pattern/ingester_querier.go

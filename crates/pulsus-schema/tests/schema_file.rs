@@ -51,16 +51,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 38 tables, 33 views, and
+/// The inventory, single-node: one database, 39 tables, 34 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 72, "statement count");
+    assert_eq!(stmts.len(), 74, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 38);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 39);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 34);
 
     let text = rendered(&single());
     assert!(
@@ -89,18 +89,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 25 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 26 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 97, "statement count");
+    assert_eq!(stmts.len(), 100, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        63,
-        "38 tables + 25 wrappers"
+        65,
+        "39 tables + 26 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 34);
 
     let text = rendered(&clustered());
     assert!(
@@ -109,20 +109,20 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        97,
+        100,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 27 tables take a per-shard replica set and 9 take the
-    // cluster-wide one, so 36 paths name `{replica}` and 27 name `{shard}`.
+    // literally. 28 tables take a per-shard replica set and 9 take the
+    // cluster-wide one, so 37 paths name `{replica}` and 28 name `{shard}`.
     // The four default rollup levels are four of the per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
-        27,
+        28,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 36, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 37, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         9,
@@ -184,7 +184,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 36, "every replicated table's path was checked");
+    assert_eq!(checked, 37, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -331,6 +331,9 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             || wrapper == "profile_landing_dist"
         {
             "landing"
+        } else if wrapper == "profile_adhoc_dist" {
+            // Issue #831: an upload's rows sit on one shard by its id.
+            "uploads"
         } else if name.starts_with("profile") {
             "profiles"
         } else if name.starts_with("metric") {
@@ -342,7 +345,11 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         };
         by_family.entry(family).or_default().insert(expr);
     }
-    assert_eq!(by_family.len(), 5, "five families have wrappers");
+    assert_eq!(by_family.len(), 6, "six families have wrappers");
+    assert!(
+        text.contains("'profile_adhoc', cityHash64(upload_id));"),
+        "profile_adhoc_dist shards by the upload's id, cityHash64(upload_id)"
+    );
     for (family, exprs) in &by_family {
         assert_eq!(
             exprs.len(),
@@ -404,7 +411,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 38);
+    assert_eq!(on_tables, 39);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -810,6 +817,43 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
             .unwrap_or_else(|| panic!("{target} is in the file"));
         assert_eq!(names, columns, "{mv} projects {target}'s columns in order");
     }
+    // Issue #831: one view copies an upload's two landing kinds into
+    // `profile_adhoc`, projecting its columns in order, and no other view
+    // writes that table.
+    let projection = pulsus_schema::mv_projection("profile_adhoc_mv", &ctx)
+        .expect("profile_adhoc_mv is in the file");
+    assert!(
+        projection.contains("FROM pulsus.profile_landing\n"),
+        "profile_adhoc_mv must read the profile landing table: {projection}"
+    );
+    assert!(
+        projection.ends_with("\nWHERE kind IN (5, 6)"),
+        "profile_adhoc_mv must read the landing rows of kinds 5 and 6: {projection}"
+    );
+    let select = projection
+        .strip_prefix("SELECT\n")
+        .and_then(|rest| rest.split_once("\nFROM "))
+        .map(|(cols, _)| cols)
+        .expect("profile_adhoc_mv: SELECT ... FROM");
+    let names: Vec<&str> = select
+        .lines()
+        .map(|l| {
+            l.trim_end_matches(',')
+                .rsplit_once(" AS ")
+                .unwrap_or_else(|| panic!("profile_adhoc_mv: a column without AS: {l}"))
+                .1
+        })
+        .collect();
+    assert_eq!(
+        names,
+        pulsus_schema::table_column_names("profile_adhoc").expect("profile_adhoc is in the file"),
+        "profile_adhoc_mv projects profile_adhoc's columns in order"
+    );
+    let writers = rendered_statements(&single())
+        .into_iter()
+        .filter(|s| s.contains(" TO pulsus.profile_adhoc\n"))
+        .count();
+    assert_eq!(writers, 1, "one view writes profile_adhoc");
     assert!(pulsus_schema::mv_projection("not_a_view", &ctx).is_none());
 
     let spans = pulsus_schema::table_column_names("spans").expect("spans is in the file");
@@ -1615,7 +1659,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 }
             }
         }
-        assert_eq!(targets.len(), 33, "{variant:?}: thirty-three views");
+        assert_eq!(targets.len(), 34, "{variant:?}: thirty-four views");
         stage_views.sort();
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -2340,6 +2384,11 @@ fn the_profile_tables_lead_with_the_tenant_in_both_forms() {
             "(org_id, name)",
             "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.profile_settings', '{replica}', version)",
         ),
+        (
+            "profile_adhoc",
+            "(org_id, upload_id, row_kind, type_ordinal, stack_id)",
+            "ReplicatedMergeTree('/clickhouse/tables/{shard}/pulsus.profile_adhoc', '{replica}')",
+        ),
     ];
     let clustered = RenderCtx {
         cluster: Some("c1".to_string()),
@@ -2786,6 +2835,12 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
+    (
+        "profile_adhoc",
+        Some("TTL toDateTime(least(intDiv(uploaded_at, 1000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
     ("profile_settings", None, false, None),
     (
         "profile_stacks",
@@ -2890,6 +2945,7 @@ fn every_day_partition_is_a_utc_day() {
                 "PARTITION BY month",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Milli(uploaded_at), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')",
@@ -3813,21 +3869,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     // `profile_landing`'s ten upload columns a `DEFAULT`, with issue #889,
     // which puts the replaced-parts settings first in every table's
     // `SETTINGS`, with issue #828, which adds `mapping_flags` and `period`,
-    // and with issue #830, which adds `profile_settings`.
+    // with issue #830, which adds `profile_settings`, and with issue #831,
+    // which adds `profile_adhoc`, its view and its wrapper.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "03bdfd12781a2e90476308a29f7229dbae25b352833adffc2b31eedab222e37a",
+            "628194d721df7c9a3d048f092a046298298ffc51098cc64b40b39bd13e9151a6",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "23b31be30853976fc967c8bf62af921ed3bedffb5fa96ae394719ba1c9cde1d5",
+            "bd270376d112f4b85287b96d80f84230de1b09f2e764da695f75bcf36046074d",
         ),
         (
             "clustered with a storage policy",
@@ -3837,7 +3894,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "e9e3e688be3e15010b0d5cf0cf1375c3495d04f9b48dc6ac8a4eea56fdfc5053",
+            "5fdc49ebe80bc108539060fc61b504b546ecb5222c704c6de91a7923a15c36d6",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -4095,8 +4152,8 @@ const TRACES_FAMILY: [&str; 5] = [
     "service_edges",
 ];
 const PROFILES_FAMILY: [&str; 2] = ["profile_samples", "profile_entries"];
-/// The twenty-one tables that never move (docs/configuration.md §7).
-const NEVER_MOVE: [&str; 21] = [
+/// The twenty-two tables that never move (docs/configuration.md §7).
+const NEVER_MOVE: [&str; 22] = [
     "log_landing",
     "log_streams",
     "log_streams_idx",
@@ -4108,6 +4165,7 @@ const NEVER_MOVE: [&str; 21] = [
     "metric_samples_60s_stage",
     "metric_samples_720s_stage",
     "metric_series",
+    "profile_adhoc",
     "profile_landing",
     "profile_locations",
     "profile_series",
@@ -4140,7 +4198,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 38, "{what}: thirty-eight tables");
+    assert_eq!(tables.len(), 39, "{what}: thirty-nine tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }
@@ -6893,6 +6951,6 @@ fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and
                 );
             }
         }
-        assert_eq!(tables, 38, "{what}: table count");
+        assert_eq!(tables, 39, "{what}: table count");
     }
 }

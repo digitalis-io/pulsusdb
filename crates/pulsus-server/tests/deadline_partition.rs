@@ -155,7 +155,7 @@ fn the_two_classes_partition_the_mounted_prefix_exactly_once() {
 }
 
 /// Issue #821 (#823, #824, #827, #825 and #828 add two each; #830 ten paths
-/// and four `{name}` templates): the profiles Connect paths, which answer a deadline breach with the Connect
+/// and four `{name}` templates; #831 eight): the profiles Connect paths, which answer a deadline breach with the Connect
 /// `deadline_exceeded` body.
 const CONNECT_PATHS: &[&str] = &[
     "/querier.v1.QuerierService/ProfileTypes",
@@ -190,6 +190,14 @@ const CONNECT_PATHS: &[&str] = &[
     "/settings.v1.RecordingRulesService/{name}",
     "/api/profiles/v1/vcs.v1.VCSService/{name}",
     "/vcs.v1.VCSService/{name}",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
+    "/adhocprofiles.v1.AdHocProfileService/Upload",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Get",
+    "/adhocprofiles.v1.AdHocProfileService/Get",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/List",
+    "/adhocprofiles.v1.AdHocProfileService/List",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Diff",
+    "/adhocprofiles.v1.AdHocProfileService/Diff",
 ];
 
 /// Issue #821 (#823 adds `/merge`, #824 `/select_series`, #828 `/export`, #829

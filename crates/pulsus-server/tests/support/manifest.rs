@@ -302,7 +302,8 @@ pub enum Surface {
     /// `/querier.v1.QuerierService/<M>` (compat) and
     /// `/api/profiles/v1/querier.v1.QuerierService/<M>` (native), `POST`
     /// only, and issue #830's settings service and the two unimplemented
-    /// services, each a `{name}` template answering `501`. The base request
+    /// services, each a `{name}` template answering `501`, and issue #831's
+    /// ad hoc upload service. The base request
     /// is a JSON body; success and errors as [`Surface::ProfilesQuery`].
     ProfilesConnect,
     /// The four OTLP gRPC `Export` paths (issue #816, docs/api.md §1.1),
@@ -1830,6 +1831,18 @@ const PROFILES_EMPTY_BODY: &str = "{}";
 /// the answer echoes.
 pub const PROFILES_SETTINGS_SET_BODY: &str =
     r#"{"setting":{"name":"conformance","value":"v","modifiedAt":"1"}}"#;
+
+/// Issue #831: an ad hoc upload of the collapsed file `a 1`.
+const PROFILES_ADHOC_UPLOAD_BODY: &str = r#"{"name":"c.txt","profile":"YSAxCg=="}"#;
+
+/// Issue #831: that upload's flame graph.
+pub const PROFILES_ADHOC_UPLOAD_FLAMEBEARER: &str = r#"{"version":1,"flamebearer":{"names":["total","a"],"levels":[[0,1,0,0],[0,1,1,1]],"numTicks":1,"maxSelf":1},"metadata":{"format":"single","spyName":"unknown","sampleRate":100,"units":"","name":"c.txt"},"timeline":null,"groups":{},"heatmap":null}"#;
+
+/// Issue #831: `Get` of an id no upload has.
+const PROFILES_ADHOC_GET_BODY: &str = r#"{"id":"00000000-0000-0000-0000-000000000000"}"#;
+
+/// Issue #831: `Diff` of that id with itself.
+const PROFILES_ADHOC_DIFF_BODY: &str = r#"{"leftId":"00000000-0000-0000-0000-000000000000","rightId":"00000000-0000-0000-0000-000000000000"}"#;
 
 /// Issue #830: a settings `Delete` of `conformance`.
 const PROFILES_SETTINGS_DELETE_BODY: &str = r#"{"name":"conformance"}"#;
@@ -3457,6 +3470,96 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 501,
         base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    // -- Profiles ad hoc uploads (issue #831, docs/api.md §5): `Get` and
+    // `Diff` of the zero id answer `404`.
+    RouteSpec {
+        path: "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_ADHOC_UPLOAD_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/adhocprofiles.v1.AdHocProfileService/Upload",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_ADHOC_UPLOAD_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Get",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: PROFILES_ADHOC_GET_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/adhocprofiles.v1.AdHocProfileService/Get",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: PROFILES_ADHOC_GET_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/List",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/adhocprofiles.v1.AdHocProfileService/List",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Diff",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: PROFILES_ADHOC_DIFF_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/adhocprofiles.v1.AdHocProfileService/Diff",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: PROFILES_ADHOC_DIFF_BODY,
         cases: &[],
     },
     // -- OTLP over gRPC (issue #816, docs/api.md §1.1) -------------------

@@ -228,7 +228,7 @@ fn uvarint(out: &mut Vec<u8>, mut v: u64) {
 /// below the `raw`-th largest total, or named `other`, is summed into one
 /// generated `other`, pushed last. Each level is then reversed and its x
 /// offsets delta-encoded.
-fn flame_graph_of(tree: &Tree, raw: i64) -> FlameGraph {
+pub(crate) fn flame_graph_of(tree: &Tree, raw: i64) -> FlameGraph {
     enum Item {
         Root,
         Node(usize),
@@ -304,7 +304,7 @@ fn flame_graph_of(tree: &Tree, raw: i64) -> FlameGraph {
 }
 
 /// The `k`-th largest of `values`, `k` from 1; 0 when there are fewer.
-fn kth(values: impl Iterator<Item = i64>, k: i64) -> i64 {
+pub(crate) fn kth(values: impl Iterator<Item = i64>, k: i64) -> i64 {
     let mut v: Vec<i64> = values.collect();
     v.sort_unstable_by(|a, b| b.cmp(a));
     usize::try_from(k - 1)
@@ -314,6 +314,49 @@ fn kth(values: impl Iterator<Item = i64>, k: i64) -> i64 {
 }
 
 impl Tree {
+    /// Issue #831: the tree of `stacks`, frames root first, as the
+    /// reference's `Tree.InsertStack` builds it (`pkg/model/tree.go`): a
+    /// value of 0 or below adds nothing, each frame's total grows by the
+    /// value and the leaf's self too; children sorted by name.
+    pub fn from_stacks(stacks: &[(Vec<String>, i64)]) -> Tree {
+        let mut tree = Tree::default();
+        let mut index: HashMap<(Option<usize>, &str), usize> = HashMap::new();
+        for (frames, v) in stacks {
+            if *v <= 0 || frames.is_empty() {
+                continue;
+            }
+            let mut at: Option<usize> = None;
+            for name in frames {
+                let i = match index.get(&(at, name.as_str())) {
+                    Some(&i) => i,
+                    None => {
+                        let i = tree.push(TreeNode {
+                            name: name.clone(),
+                            ..TreeNode::default()
+                        });
+                        tree.children_mut(at).push(i);
+                        index.insert((at, name.as_str()), i);
+                        i
+                    }
+                };
+                tree.nodes[i].total += v;
+                at = Some(i);
+            }
+            if let Some(leaf) = at {
+                tree.nodes[leaf].self_value += v;
+            }
+        }
+        let mut roots = std::mem::take(&mut tree.roots);
+        tree.sort_by_name(&mut roots);
+        tree.roots = roots;
+        for i in 0..tree.nodes.len() {
+            let mut children = std::mem::take(&mut tree.nodes[i].children);
+            tree.sort_by_name(&mut children);
+            tree.nodes[i].children = children;
+        }
+        tree
+    }
+
     fn push(&mut self, node: TreeNode) -> usize {
         self.nodes.push(node);
         self.nodes.len() - 1
