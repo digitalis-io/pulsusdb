@@ -7,8 +7,7 @@
 # Run by hand only. Copies one pinned digest of moby/buildkit:buildx-stable-1;
 # the last step prints the copy's digest, which is what the workflows pin.
 # The job runs in the `ghcr-publish` environment, which deploys from `main`
-# only after its reviewer approves, and logs in with that environment's
-# secret; the workflow token asks for no package permission (#832).
+# only after its reviewer approves (#832).
 # To move to a newer build image, change the source digest, run this, and
 # update the pins.
 name: buildkit-mirror
@@ -23,17 +22,15 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     environment: ghcr-publish
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Refuse without the environment's credential
-        run: test -n "$TOKEN" || { echo "ghcr-publish environment or its GHCR_PUBLISH_TOKEN secret is missing"; exit 1; }
-        env:
-          TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
-
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
-          username: ${{ vars.GHCR_PUBLISH_USER }}
-          password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Copy the pinned build image
         run: >-

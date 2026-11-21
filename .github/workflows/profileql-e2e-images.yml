@@ -5,12 +5,13 @@
 #   deploy/e2e/profileql/browser.Dockerfile  -> profileql-e2e-browser
 #
 # Run by hand only. The job runs in the `ghcr-publish` environment, which
-# deploys from `main` only after its reviewer approves, and logs in with that
-# environment's secret; the workflow token asks for no package permission.
+# deploys from `main` only after its reviewer approves, and pushes with the
+# workflow token, whose package write is granted to this job alone.
 # Each image is built for linux/amd64 only, the platform of the CI runners
 # that pull it. The step after each push prints the digest that push
-# returned; the e2e stack pins those digests. To update: change an ARG, or package.json and its lock,
-# merge, run this on `main`, and pin the printed digests.
+# returned; the e2e stack pins those digests. To update: change an ARG, or
+# package.json and its lock, merge, run this on `main`, and pin the printed
+# digests.
 name: profileql-e2e-images
 
 on:
@@ -23,19 +24,17 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: ghcr-publish
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Refuse without the environment's credential
-        run: test -n "$TOKEN" || { echo "ghcr-publish environment or its GHCR_PUBLISH_TOKEN secret is missing"; exit 1; }
-        env:
-          TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
-          username: ${{ vars.GHCR_PUBLISH_USER }}
-          password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
