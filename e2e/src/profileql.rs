@@ -228,8 +228,296 @@ pub(crate) struct PageRecord {
 
 /// Every rule R1–R6 a page breaks, one line each.
 pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
-    let _ = (spec, page);
-    vec!["page_failures: not implemented".to_string()]
+    let name = &spec.name;
+    let mut out = Vec::new();
+    let browser = page
+        .error
+        .as_deref()
+        .map(|e| format!("; the browser: {e}"))
+        .unwrap_or_default();
+
+    // R1: every expected request answered 200, and the wait met.
+    let mut expected = spec.expect.clone();
+    if spec.save.is_some() {
+        expected.push(expect(SETTINGS_SET));
+    }
+    let mut missing = false;
+    for e in &expected {
+        if !page
+            .records
+            .iter()
+            .any(|r| r.status == 200 && matches(r, e))
+        {
+            missing = true;
+            let answers: Vec<u16> = page
+                .records
+                .iter()
+                .filter(|r| matches(r, e))
+                .map(|r| r.status)
+                .collect();
+            out.push(format!(
+                "{name}: R1 no 200 answer to {} {:?} (answers {answers:?}){browser}",
+                e.path, e.req
+            ));
+        }
+    }
+    if !page.complete && !missing {
+        out.push(format!(
+            "{name}: R1 the expected requests did not all arrive in time{browser}"
+        ));
+    }
+
+    // R2: the datasource's requests, except the one accepted error.
+    for r in &page.records {
+        let judged = [DS_QUERY, "/api/datasources/proxy/", "/api/datasources/uid/"]
+            .iter()
+            .any(|prefix| r.path.starts_with(prefix));
+        if !judged || r.status < 400 {
+            continue;
+        }
+        let unimplemented = serde_json::from_str::<Value>(&r.body)
+            .is_ok_and(|body| body["code"] == "unimplemented");
+        if r.path.ends_with(RECORDING_RULES) && r.status == 501 && unimplemented {
+            continue;
+        }
+        out.push(format!(
+            "{name}: R2 {} {} answered {}: {:.300}",
+            r.method, r.path, r.status, r.body
+        ));
+    }
+
+    // R3: an error inside a query answer.
+    for r in page.records.iter().filter(|r| r.path == DS_QUERY) {
+        let Ok(body) = serde_json::from_str::<Value>(&r.body) else {
+            continue;
+        };
+        for (ref_id, result) in body["results"].as_object().into_iter().flatten() {
+            let status = result["status"].as_u64().unwrap_or(0);
+            if result.get("error").is_some() || status >= 400 {
+                out.push(format!(
+                    "{name}: R3 /api/ds/query result {ref_id}: status {status}, error {}",
+                    result["error"]
+                ));
+            }
+        }
+    }
+
+    // R4
+    out.extend(
+        value_failures(&spec.check, &page.records)
+            .into_iter()
+            .map(|f| format!("{name}: R4 {f}")),
+    );
+
+    // R5
+    for e in &spec.absent.requests {
+        if page.records.iter().any(|r| matches(r, e)) {
+            out.push(format!("{name}: R5 {} {:?} was sent", e.path, e.req));
+        }
+    }
+    for text in &page.absent_found {
+        out.push(format!("{name}: R5 {text:?} is on the page"));
+    }
+
+    // R6
+    let shown = |list: &[Shown], t: &Text| {
+        list.iter()
+            .any(|s| s.scope == t.scope && s.text == t.text && s.shown)
+    };
+    for t in &spec.visible {
+        if !shown(&page.visible, t) {
+            out.push(format!(
+                "{name}: R6 not visible in {}: {:?}",
+                t.scope.as_deref().unwrap_or("the page"),
+                t.text
+            ));
+        }
+    }
+    for t in &spec.invisible {
+        if shown(&page.invisible, t) {
+            out.push(format!(
+                "{name}: R6 visible in {}: {:?}",
+                t.scope.as_deref().unwrap_or("the page"),
+                t.text
+            ));
+        }
+    }
+    out
+}
+
+fn matches(r: &Record, e: &Expect) -> bool {
+    r.path.ends_with(&e.path) && e.req.iter().all(|s| r.request.contains(s.as_str()))
+}
+
+/// The JSON bodies of the 200 answers whose path ends in `path`.
+fn answers(records: &[Record], path: &str) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|r| r.status == 200 && r.path.ends_with(path))
+        .filter_map(|r| serde_json::from_str(&r.body).ok())
+        .collect()
+}
+
+/// An int64 written as a JSON number or as a string.
+fn int(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// R4: what [`Check`] asks of the answers.
+fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
+    let mut out = Vec::new();
+    match check {
+        Check::None => {}
+        Check::Services(want) => {
+            let bodies = answers(records, SERIES);
+            let got: BTreeSet<String> = bodies.iter().flat_map(series_services).collect();
+            let want: BTreeSet<String> = want.iter().map(|s| s.to_string()).collect();
+            if bodies.is_empty() || got != want {
+                out.push(format!("Series lists {got:?}, expected {want:?}"));
+            }
+        }
+        Check::FlameRoot(want) => {
+            let roots: Vec<i64> = answers(records, DS_QUERY)
+                .iter()
+                .flat_map(|body| {
+                    body["results"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(_, result)| flame_root(result))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            if roots.is_empty() || roots.iter().any(|root| root != want) {
+                out.push(format!(
+                    "flame graph root values {roots:?}, expected {want}"
+                ));
+            }
+        }
+        Check::Heatmap { count, exemplars } => {
+            let bodies = answers(records, "/querier.v1.QuerierService/SelectHeatmap");
+            if bodies.is_empty() {
+                out.push("no SelectHeatmap answer".to_string());
+            }
+            let mut want: Vec<(String, i64)> =
+                exemplars.iter().map(|(s, v)| (s.to_string(), *v)).collect();
+            want.sort();
+            for body in &bodies {
+                let slots: Vec<&Value> = body["series"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|series| series["slots"].as_array())
+                    .flatten()
+                    .collect();
+                let got_count: i64 = slots
+                    .iter()
+                    .filter_map(|slot| slot["counts"].as_array())
+                    .flatten()
+                    .filter_map(int)
+                    .sum();
+                let mut got: Vec<(String, i64)> = slots
+                    .iter()
+                    .filter_map(|slot| slot["exemplars"].as_array())
+                    .flatten()
+                    .map(|e| {
+                        (
+                            e["spanId"].as_str().unwrap_or("").to_string(),
+                            int(&e["value"]).unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                got.sort();
+                if got_count != *count || got != want {
+                    out.push(format!(
+                        "heatmap counts sum {got_count}, exemplars {got:?}; expected {count}, {want:?}"
+                    ));
+                }
+            }
+        }
+        Check::Diff { left, right } => {
+            let bodies = answers(records, "/pyroscope/render-diff");
+            if bodies.is_empty() {
+                out.push("no render-diff answer".to_string());
+            }
+            for body in &bodies {
+                let got = (int(&body["leftTicks"]), int(&body["rightTicks"]));
+                if got != (Some(*left), Some(*right)) {
+                    out.push(format!(
+                        "render-diff totals {got:?}, expected {left}, {right}"
+                    ));
+                }
+            }
+        }
+        Check::Upload(want) => {
+            let ticks: Vec<Option<i64>> =
+                answers(records, "/adhocprofiles.v1.AdHocProfileService/Upload")
+                    .iter()
+                    .map(|body| {
+                        let profile: Value =
+                            serde_json::from_str(body["flamebearerProfile"].as_str()?).ok()?;
+                        int(&profile["flamebearer"]["numTicks"])
+                    })
+                    .collect();
+            if ticks.is_empty() || ticks.iter().any(|t| *t != Some(*want)) {
+                out.push(format!("upload totals {ticks:?}, expected {want}"));
+            }
+        }
+        Check::Settings(text) => {
+            let found = records.iter().any(|r| {
+                r.status == 200 && r.path.ends_with(SETTINGS_GET) && r.body.contains(text)
+            });
+            if !found {
+                out.push(format!("no settings Get answer contains {text}"));
+            }
+        }
+        Check::Span {
+            span,
+            value,
+            labels,
+        } => {
+            for ref_id in ["span-flamegraph-refId", "profile"] {
+                let mut seen = false;
+                for r in records
+                    .iter()
+                    .filter(|r| r.status == 200 && r.path == DS_QUERY)
+                {
+                    let Ok(request) = serde_json::from_str::<Value>(&r.request) else {
+                        continue;
+                    };
+                    let asked = request["queries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|q| {
+                            q["refId"] == ref_id
+                                && q["spanSelector"] == json!([span])
+                                && q["labelSelector"] == OTLP_SELECTOR
+                                && q["profileTypeId"] == CPU
+                        });
+                    if !asked {
+                        continue;
+                    }
+                    seen = true;
+                    let body: Value = serde_json::from_str(&r.body).unwrap_or_default();
+                    let result = &body["results"][ref_id];
+                    let root = flame_root(result);
+                    let got = flame_labels(result);
+                    if root != Some(*value) || got != *labels {
+                        out.push(format!(
+                            "{ref_id} for span {span}: root {root:?}, labels {got:?}; \
+                             expected {value}, {labels:?}"
+                        ));
+                    }
+                }
+                if !seen {
+                    out.push(format!("no {ref_id} query for span {span}"));
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------
@@ -833,6 +1121,7 @@ fn svc(service: &str, type_id: &str) -> String {
 const LAST_HOUR: &str = "&from=now-1h&to=now";
 const STATS: &str = "/querier.v1.QuerierService/GetProfileStats";
 const SETTINGS_GET: &str = "/settings.v1.SettingsService/Get";
+const SETTINGS_SET: &str = "/settings.v1.SettingsService/Set";
 const SERIES: &str = "/querier.v1.QuerierService/Series";
 const DS_QUERY: &str = "/api/ds/query";
 
