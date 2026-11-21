@@ -8,17 +8,22 @@
 //! heatmap's messages. W11 (#823 part B): the flame graph's tree bytes.
 //! W11 (issue #826): an exemplar. W12 (issue #828): the pprof `Profile`'s
 //! JSON, and `SelectMergeProfile`'s request as the exploration app sends it.
+//! W14 (issue #830): the settings, stats and query analysis messages.
 
 use pulsus_profiles_wire::google_v1::Profile;
 use pulsus_profiles_wire::querier_v1::{
-    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
-    ProfileTypesRequest, ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
-    SelectMergeProfileRequest, SelectMergeStacktracesRequest, SelectMergeStacktracesResponse,
-    SelectSeriesRequest, SelectSeriesResponse, SeriesRequest, SeriesResponse,
+    AnalyzeQueryRequest, AnalyzeQueryResponse, DiffRequest, DiffResponse, FlameGraph,
+    FlameGraphDiff, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse, QueryScope,
+    SelectHeatmapRequest, SelectHeatmapResponse, SelectMergeProfileRequest,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
+    SelectSeriesResponse, SeriesRequest, SeriesResponse,
+};
+use pulsus_profiles_wire::settings_v1::{
+    GetSettingsResponse, SetSettingsRequest, SetSettingsResponse, Setting,
 };
 use pulsus_profiles_wire::types_v1::{
-    Exemplar, GoPgo, HeatmapSeries, HeatmapSlot, LabelPair, Labels, Location, Point, ProfileType,
-    Series, StackTraceSelector,
+    Exemplar, GetProfileStatsResponse, GoPgo, HeatmapSeries, HeatmapSlot, LabelPair, Labels,
+    Location, Point, ProfileType, Series, StackTraceSelector,
 };
 
 fn split(id: &str) -> ProfileType {
@@ -526,4 +531,89 @@ fn w12_the_apps_merge_profile_request_is_read() {
         (m.profile_id_selector, m.trace_id_selector),
         (vec!["x".to_string()], vec!["y".to_string()])
     );
+}
+
+/// **W14** (issue #830): a setting writes its JSON names, `modifiedAt` as a
+/// string, and reads `modifiedAt` as a string or a number; the stats and
+/// analysis answers write their names, and an empty one writes `{}`.
+#[test]
+fn w14_the_settings_stats_and_analysis_json() {
+    let s = Setting {
+        name: "a".to_string(),
+        value: "1".to_string(),
+        modified_at: 10,
+    };
+    assert_eq!(
+        serde_json::to_string(&s).expect("encode"),
+        r#"{"name":"a","value":"1","modifiedAt":"10"}"#
+    );
+    for text in [
+        r#"{"name":"a","value":"1","modifiedAt":"10"}"#,
+        r#"{"name":"a","value":"1","modifiedAt":10}"#,
+    ] {
+        let got: Setting = serde_json::from_str(text).expect("decode");
+        assert_eq!(got, s, "{text}");
+    }
+    let set: SetSettingsRequest =
+        serde_json::from_str(r#"{"setting":{"name":"pluginSettings","value":"v"}}"#)
+            .expect("decode");
+    assert_eq!(
+        set.setting.map(|s| (s.name, s.value, s.modified_at)),
+        Some(("pluginSettings".to_string(), "v".to_string(), 0))
+    );
+    assert_eq!(
+        serde_json::to_string(&SetSettingsResponse {
+            setting: Some(s.clone())
+        })
+        .expect("encode"),
+        r#"{"setting":{"name":"a","value":"1","modifiedAt":"10"}}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&GetSettingsResponse { settings: vec![s] }).expect("encode"),
+        r#"{"settings":[{"name":"a","value":"1","modifiedAt":"10"}]}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&GetSettingsResponse::default()).expect("encode"),
+        "{}"
+    );
+    assert_eq!(
+        serde_json::to_string(&GetProfileStatsResponse::default()).expect("encode"),
+        "{}"
+    );
+    assert_eq!(
+        serde_json::to_string(&GetProfileStatsResponse {
+            data_ingested: true,
+            oldest_profile_time: 1,
+            newest_profile_time: 2,
+        })
+        .expect("encode"),
+        r#"{"dataIngested":true,"oldestProfileTime":"1","newestProfileTime":"2"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&AnalyzeQueryResponse::default()).expect("encode"),
+        "{}"
+    );
+    // The reference's answer reads back as two scopes.
+    let r: AnalyzeQueryResponse = serde_json::from_str(
+        r#"{"queryScopes":[{"componentType":"Short term storage"},{"componentType":"Long term storage","blockCount":"3"}],"queryImpact":{}}"#,
+    )
+    .expect("decode");
+    assert_eq!(
+        r.query_scopes,
+        [
+            QueryScope {
+                component_type: "Short term storage".to_string(),
+                ..QueryScope::default()
+            },
+            QueryScope {
+                component_type: "Long term storage".to_string(),
+                block_count: 3,
+                ..QueryScope::default()
+            },
+        ]
+    );
+    assert!(r.query_impact.is_some());
+    let q: AnalyzeQueryRequest =
+        serde_json::from_str(r#"{"start":"1","end":2,"query":"{}"}"#).expect("decode");
+    assert_eq!((q.start, q.end, q.query.as_str()), (1, 2, "{}"));
 }

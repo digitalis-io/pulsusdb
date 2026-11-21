@@ -388,3 +388,21 @@ pub struct HeatmapSlot {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exemplars: Vec<Exemplar>,
 }
+
+/// Issue #830: `GetProfileStats`' request.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GetProfileStatsRequest {}
+
+/// Issue #830: `GetProfileStats`' response: whether the tenant holds any
+/// profile, and the bounds of the times they hold, in milliseconds.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GetProfileStatsResponse {
+    #[prost(bool, tag = "101")]
+    pub data_ingested: bool,
+    #[prost(int64, tag = "102")]
+    pub oldest_profile_time: i64,
+    #[prost(int64, tag = "103")]
+    pub newest_profile_time: i64,
+}

@@ -987,6 +987,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // the reference answers an empty window. Issue #827: the diff
             // paths answer the empty diff. Issue #829: the render routes answer
             // the empty flamebearer, and `label-values` reads the last hour.
+            // Issue #830: the settings, stats and analysis paths answer `{}`,
+            // a `Set` its setting, and the two services not served `501`.
             assert_eq!(
                 res.content_type(),
                 Some("application/json"),
@@ -1017,6 +1019,15 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             } else if spec.path.ends_with("/label-values") {
                 // Issue #829: the last hour of an empty database.
                 "null\n".to_string()
+            } else if spec.path.ends_with("/settings.v1.SettingsService/Set") {
+                // Issue #830: the setting as stored.
+                manifest::PROFILES_SETTINGS_SET_BODY.to_string()
+            } else if spec.path.contains("/settings.v1.RecordingRulesService/") {
+                // Issue #830: not served.
+                r#"{"code":"unimplemented","message":"recording rules are not served"}"#.to_string()
+            } else if spec.path.contains("/vcs.v1.VCSService/") {
+                r#"{"code":"unimplemented","message":"GitHub integration is not configured"}"#
+                    .to_string()
             } else {
                 "{}".to_string()
             };
@@ -1782,7 +1793,12 @@ fn assert_full_route_matrix(port: u16, spec: &RouteSpec, spawn: &str) {
     assert_405_with_allow(&res, &ctx, spec.methods);
 
     let ctx = format!("[{spawn}] GET {} case=sibling-nonexistent-404", spec.path);
-    let sibling = format!("{}-conformance-nonexistent", resolve_path(spec.path));
+    // Issue #830: a template ending in `{name}` takes any last segment, so
+    // its sibling differs in the segment before it.
+    let sibling = match spec.path.strip_suffix("/{name}") {
+        Some(head) => format!("{head}-conformance-nonexistent/env"),
+        None => format!("{}-conformance-nonexistent", resolve_path(spec.path)),
+    };
     let res = get(port, &sibling, &ctx);
     assert_404_empty(&res, &ctx);
 

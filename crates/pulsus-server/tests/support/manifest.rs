@@ -287,21 +287,23 @@ pub enum Surface {
     /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
-    /// The profiles query API's twelve `GET` routes (issue #821, docs/api.md
+    /// The profiles query API's `GET` routes (issue #821, docs/api.md
     /// §5): `types`, `labels`, `label/{name}/values` and `series`, `merge`
-    /// (#823), `select_series` (#824), and `render`, `render-diff` and
-    /// `label-values` (#829), native and at their three compat paths. Success
+    /// (#823), `select_series` (#824), `render`, `render-diff` and
+    /// `label-values` (#829), native and at their three compat paths, and
+    /// `stats` (#830). Success
     /// is the method's JSON response message; against this suite's empty
     /// databases the base window ends before the lookback floor, so the
     /// body is `{}` and nothing is read, except the render routes' answers
     /// (`api_conformance.rs`). Errors are the Connect JSON body
     /// `{"code","message"}`.
     ProfilesQuery,
-    /// The profiles query API's sixteen Connect paths (issue #821): the
-    /// eight methods at `/querier.v1.QuerierService/<M>` (compat) and
+    /// The profiles query API's Connect paths (issue #821): the methods at
+    /// `/querier.v1.QuerierService/<M>` (compat) and
     /// `/api/profiles/v1/querier.v1.QuerierService/<M>` (native), `POST`
-    /// only. The base request is a JSON body; success and errors as
-    /// [`Surface::ProfilesQuery`].
+    /// only, and issue #830's settings service and the two unimplemented
+    /// services, each a `{name}` template answering `501`. The base request
+    /// is a JSON body; success and errors as [`Surface::ProfilesQuery`].
     ProfilesConnect,
     /// The four OTLP gRPC `Export` paths (issue #816, docs/api.md §1.1),
     /// `POST` only: the `/v1/*` export handlers behind a unary gRPC shim.
@@ -1821,6 +1823,17 @@ const PROFILES_RENDER_DIFF_BASE_QUERY: &str = "leftQuery=process_cpu:cpu:nanosec
 /// Issue #829: `label-values`'s base request, which reads the last hour.
 const PROFILES_LABEL_VALUES_BASE_QUERY: &str = "label=pod";
 
+/// Issue #830: the body of a Connect call that needs no field.
+const PROFILES_EMPTY_BODY: &str = "{}";
+
+/// Issue #830: a settings `Set` of `conformance` at a fixed time, which
+/// the answer echoes.
+pub const PROFILES_SETTINGS_SET_BODY: &str =
+    r#"{"setting":{"name":"conformance","value":"v","modifiedAt":"1"}}"#;
+
+/// Issue #830: a settings `Delete` of `conformance`.
+const PROFILES_SETTINGS_DELETE_BODY: &str = r#"{"name":"conformance"}"#;
+
 /// Issue #827: that window on both sides of a `Diff`.
 const PROFILES_DIFF_BASE_BODY: &str =
     r#"{"left":{"start":"1000","end":"4000"},"right":{"start":"1000","end":"4000"}}"#;
@@ -3275,6 +3288,175 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: PROFILES_LABEL_VALUES_BASE_QUERY,
+        cases: &[],
+    },
+    // -- Profiles settings, stats and query analysis (issue #830,
+    // docs/api.md §5). The settings rows are in this order on purpose:
+    // both `Get`s answer `{}` before either `Set` stores, both `Set`s write
+    // the same time, and both `Delete`s come last.
+    RouteSpec {
+        path: "/api/profiles/v1/settings.v1.SettingsService/Get",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/settings.v1.SettingsService/Get",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/settings.v1.SettingsService/Set",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_SETTINGS_SET_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/settings.v1.SettingsService/Set",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_SETTINGS_SET_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/settings.v1.SettingsService/Delete",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_SETTINGS_DELETE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/settings.v1.SettingsService/Delete",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_SETTINGS_DELETE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/GetProfileStats",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/stats",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/AnalyzeQuery",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/settings.v1.RecordingRulesService/{name}",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 501,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/settings.v1.RecordingRulesService/{name}",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 501,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/vcs.v1.VCSService/{name}",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 501,
+        base_query: PROFILES_EMPTY_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/vcs.v1.VCSService/{name}",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 501,
+        base_query: PROFILES_EMPTY_BODY,
         cases: &[],
     },
     // -- OTLP over gRPC (issue #816, docs/api.md §1.1) -------------------

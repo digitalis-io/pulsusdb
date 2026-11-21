@@ -7,8 +7,10 @@
 //! selections, its statement (`diff`) and its trim (`flamegraph_diff`).
 //! Issue #825: the heatmap of profile and span totals (`heatmap`). Issue
 //! #828: the merged profile as pprof (`pprof`). Issue #829: the render
-//! route's one statement and its timeline (`render`).
+//! route's one statement and its timeline (`render`). Issue #830: the
+//! exploration app's settings and profile stats (`app`).
 
+pub mod app;
 pub mod catalogue;
 pub mod diff;
 mod dispatch;

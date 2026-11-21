@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::traces::tenant_scope::TenantTerm;
 
+use super::app::{SettingRow, StatsRow, Written};
 use super::catalogue::{Read, compat_sets};
 use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
@@ -295,6 +296,27 @@ impl ProfilesEngine {
     ) -> Result<Vec<HeatmapExemplarRow>, ProfilesReadError> {
         let settings = read_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #830: stub (tests first).
+    pub async fn read_settings_rows(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<SettingRow>, ProfilesReadError> {
+        let _ = sql;
+        Ok(Vec::new())
+    }
+
+    /// Issue #830: stub (tests first).
+    pub async fn read_stats(&self, sql: &str) -> Result<StatsRow, ProfilesReadError> {
+        let _ = sql;
+        Ok(StatsRow::default())
+    }
+
+    /// Issue #830: stub (tests first).
+    pub async fn write_setting(&self, sql: &str) -> Result<Written, ProfilesReadError> {
+        let _ = sql;
+        Ok(Written::Stored)
     }
 }
 

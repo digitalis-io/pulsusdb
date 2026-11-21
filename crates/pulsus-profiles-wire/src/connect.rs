@@ -14,6 +14,8 @@ pub enum Code {
     Internal,
     Unknown,
     DeadlineExceeded,
+    /// Issue #830: stub (tests first).
+    AlreadyExists,
 }
 
 impl Code {
@@ -27,6 +29,7 @@ impl Code {
             Code::Internal => "internal",
             Code::Unknown => "unknown",
             Code::DeadlineExceeded => "deadline_exceeded",
+            Code::AlreadyExists => "unknown",
         }
     }
 
@@ -37,7 +40,7 @@ impl Code {
             Code::ResourceExhausted => 429,
             Code::Unimplemented => 501,
             Code::Unavailable => 503,
-            Code::Internal | Code::Unknown => 500,
+            Code::Internal | Code::Unknown | Code::AlreadyExists => 500,
             Code::DeadlineExceeded => 504,
         }
     }
@@ -114,6 +117,17 @@ pub fn go_string_array(v: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #830: a refused settings write is `already_exists`, `409`.
+    #[test]
+    fn already_exists_is_its_name_and_409() {
+        assert_eq!(Code::AlreadyExists.as_str(), "already_exists");
+        assert_eq!(Code::AlreadyExists.http_status(), 409);
+        assert_eq!(
+            error_json(Code::AlreadyExists, "x"),
+            r#"{"code":"already_exists","message":"x"}"#
+        );
+    }
 
     #[test]
     fn the_error_body_escapes_as_go_does() {

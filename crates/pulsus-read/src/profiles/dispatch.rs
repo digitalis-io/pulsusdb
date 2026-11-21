@@ -9,6 +9,9 @@ use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
 use crate::logql::exec::escape_query_placeholders;
 use crate::traces::tenant_scope::TenantTerm;
 
+use pulsus_clickhouse::ChError;
+
+use super::app::Written;
 use super::engine::{ProfilesReadError, map_read_error};
 
 /// The profiles read path's ClickHouse handle, one per engine.
@@ -59,5 +62,37 @@ impl ProfileDispatch {
             out.push(row.map_err(map_read_error)?);
         }
         Ok(out)
+    }
+}
+
+/// Issue #830: a settings write's outcome. Stub (tests first).
+pub(super) fn written(result: Result<(), ChError>) -> Result<Written, ProfilesReadError> {
+    result.map(|()| Written::Stored).map_err(map_read_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A4: the guard's `throwIf` (395) is a refusal, not a failure; any
+    /// other error keeps its class.
+    #[test]
+    fn a4_refusal_maps() {
+        let server = |code: i32| ChError::Server {
+            code,
+            message: format!("Code: {code}. DB::Exception: x"),
+        };
+        assert_eq!(written(Ok(())), Ok(Written::Stored));
+        assert_eq!(written(Err(server(395))), Ok(Written::Refused));
+        assert_eq!(
+            written(Err(server(158))),
+            Err(ProfilesReadError::TooBroad(
+                "query_too_broad: PULSUS_PROFILES_SCAN_BUDGET_ROWS".to_string()
+            ))
+        );
+        assert!(matches!(
+            written(Err(server(60))),
+            Err(ProfilesReadError::Internal(_))
+        ));
     }
 }

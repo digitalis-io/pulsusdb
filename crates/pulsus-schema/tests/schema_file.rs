@@ -51,15 +51,15 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 37 tables, 33 views, and
+/// The inventory, single-node: one database, 38 tables, 33 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 71, "statement count");
+    assert_eq!(stmts.len(), 72, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 37);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 38);
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
 
     let text = rendered(&single());
@@ -94,11 +94,11 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 96, "statement count");
+    assert_eq!(stmts.len(), 97, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        62,
-        "37 tables + 25 wrappers"
+        63,
+        "38 tables + 25 wrappers"
     );
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
 
@@ -109,23 +109,23 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        96,
+        97,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 27 tables take a per-shard replica set and 8 take the
-    // cluster-wide one, so 35 paths name `{replica}` and 27 name `{shard}`.
+    // literally. 27 tables take a per-shard replica set and 9 take the
+    // cluster-wide one, so 36 paths name `{replica}` and 27 name `{shard}`.
     // The four default rollup levels are four of the per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
         27,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 35, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 36, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
-        8,
+        9,
         "cluster-wide replica sets"
     );
     assert!(
@@ -404,7 +404,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 37);
+    assert_eq!(on_tables, 38);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -1704,7 +1704,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     }
 }
 
-/// **The cluster-wide replica set is exactly these eight tables.** A data
+/// **The cluster-wide replica set is exactly these nine tables.** A data
 /// table given an `/all/` path would make every shard a replica of one
 /// table and silently collapse the cluster to one shard's worth of data.
 #[test]
@@ -1720,6 +1720,7 @@ fn the_cluster_wide_replica_set_is_exactly_the_catalog_tables() {
         vec![
             "metric_metadata",
             "profile_locations",
+            "profile_settings",
             "profile_stacks",
             "resources",
             "service_bucket_resources",
@@ -2132,7 +2133,7 @@ fn the_write_path_tables_write_with_adaptive_buffers_in_both_modes() {
 }
 
 /// **T-S2 (issue #653): the log tables lead with the tenant, in both
-/// forms.** In the single-node and the clustered rendering, each of the six
+/// forms.** In the single-node and the clustered rendering, each of the seven
 /// log tables is created once, keyed with `org_id` first, and neither
 /// aggregating table carries the tests-first seam's
 /// `allow_dimensions_outside_sorting_key`. One assertion per rendering,
@@ -2293,10 +2294,10 @@ fn the_trace_tables_lead_with_the_tenant_in_both_forms() {
 }
 
 /// **S1 (issue #813): the profile tables lead with the tenant, in both
-/// forms.** In the single-node and the clustered rendering, each of the six
-/// profile tables is created once, with its `ORDER BY` line and its
-/// clustered `ENGINE` line exactly as written here; only `profile_series`,
-/// whose `labels` sit outside its key, carries
+/// forms.** In the single-node and the clustered rendering, each of the seven
+/// profile tables (#830 adds `profile_settings`) is created once, with its
+/// `ORDER BY` line and its clustered `ENGINE` line exactly as written here;
+/// only `profile_series`, whose `labels` sit outside its key, carries
 /// `allow_dimensions_outside_sorting_key`. One assertion per rendering,
 /// naming every failure.
 #[test]
@@ -2332,6 +2333,11 @@ fn the_profile_tables_lead_with_the_tenant_in_both_forms() {
             "profile_locations",
             "(org_id, location_id)",
             "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.profile_locations', '{replica}')",
+        ),
+        (
+            "profile_settings",
+            "(org_id, name)",
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.profile_settings', '{replica}', version)",
         ),
     ];
     let clustered = RenderCtx {
@@ -2779,6 +2785,7 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
+    ("profile_settings", None, false, None),
     (
         "profile_stacks",
         Some("TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + (17 * 86400), 4294967295))"),
@@ -4086,8 +4093,8 @@ const TRACES_FAMILY: [&str; 5] = [
     "service_edges",
 ];
 const PROFILES_FAMILY: [&str; 2] = ["profile_samples", "profile_entries"];
-/// The twenty tables that never move (docs/configuration.md §7).
-const NEVER_MOVE: [&str; 20] = [
+/// The twenty-one tables that never move (docs/configuration.md §7).
+const NEVER_MOVE: [&str; 21] = [
     "log_landing",
     "log_streams",
     "log_streams_idx",
@@ -4102,6 +4109,7 @@ const NEVER_MOVE: [&str; 20] = [
     "profile_landing",
     "profile_locations",
     "profile_series",
+    "profile_settings",
     "profile_stacks",
     "resources",
     "tag_names",
@@ -4130,7 +4138,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 37, "{what}: thirty-seven tables");
+    assert_eq!(tables.len(), 38, "{what}: thirty-eight tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }
@@ -6883,6 +6891,6 @@ fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and
                 );
             }
         }
-        assert_eq!(tables, 37, "{what}: table count");
+        assert_eq!(tables, 38, "{what}: table count");
     }
 }

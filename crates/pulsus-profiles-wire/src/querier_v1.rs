@@ -613,3 +613,61 @@ pub struct SelectHeatmapResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<crate::types_v1::HeatmapSeries>,
 }
+
+/// Issue #830: `AnalyzeQuery`'s request: a query and its window.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyzeQueryRequest {
+    #[prost(int64, tag = "102")]
+    pub start: i64,
+    #[prost(int64, tag = "103")]
+    pub end: i64,
+    #[prost(string, tag = "104")]
+    pub query: String,
+}
+
+/// Issue #830: `AnalyzeQuery`'s response.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyzeQueryResponse {
+    #[prost(message, repeated, tag = "101")]
+    pub query_scopes: Vec<QueryScope>,
+    #[prost(message, optional, tag = "102")]
+    pub query_impact: Option<QueryImpact>,
+}
+
+/// Issue #830: one component a query would read, and what it would read.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryScope {
+    #[prost(string, tag = "101")]
+    pub component_type: String,
+    #[prost(uint64, tag = "102")]
+    pub component_count: u64,
+    #[prost(uint64, tag = "103")]
+    pub block_count: u64,
+    #[prost(uint64, tag = "104")]
+    pub series_count: u64,
+    #[prost(uint64, tag = "105")]
+    pub profile_count: u64,
+    #[prost(uint64, tag = "106")]
+    pub sample_count: u64,
+    #[prost(uint64, tag = "107")]
+    pub index_bytes: u64,
+    #[prost(uint64, tag = "108")]
+    pub profile_bytes: u64,
+    #[prost(uint64, tag = "109")]
+    pub symbol_bytes: u64,
+}
+
+/// Issue #830: a query's impact in sum.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryImpact {
+    #[prost(uint64, tag = "102")]
+    pub total_bytes_in_time_range: u64,
+    #[prost(uint64, tag = "103")]
+    pub total_queried_series: u64,
+    #[prost(bool, tag = "104")]
+    pub deduplication_needed: bool,
+}
