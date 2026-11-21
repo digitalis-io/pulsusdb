@@ -238,12 +238,12 @@ Content-Type: application/grpc
   |---|---|
   | resource attributes, then scope attributes | series labels under their OTel names, unchanged; of two equal keys the first is kept; a value that is not a non-empty string, an integer, or a one-element array of either adds no label |
   | `service.name` | from the sample's attributes, else the resource's, as `service_name`; with neither, `unknown_service`, followed by `:<value>` for each `process.executable.name` on the resource |
-  | the sample's other attributes | labels added to its series: a name the resource or scope already gives keeps that value, of two attributes of one name the first is kept, and an empty value adds nothing; samples that add different labels are different series |
-  | the sample's link | the sample's span id and trace id, stored with the sample, not as series labels; `spanSelector` and `traceIdSelector` select by them (§5) |
-  | sample type `samples` `count` with period type `cpu` `nanoseconds` and a period | series `process_cpu`, sample type `cpu` `nanoseconds`, each value multiplied by the period |
+  | the sample's other attributes | labels added to its series: a name the resource or scope already gives keeps that value, of two attributes of one name the first is kept, and an empty value adds nothing; samples that add different labels are different series. An attribute named `span_id`, `profile_id` or `trace_id` adds no label: the first `span_id` or `profile_id` of 16 hex digits is the sample's span id, the first `trace_id` of 32 hex digits its trace id, and any other value of the three is dropped |
+  | the sample's link | the sample's span id and trace id where its attributes give none, stored with the sample, not as series labels; `spanSelector` and `traceIdSelector` select by them (§5) |
+  | sample type `samples` `count` with period type `cpu` `nanoseconds` and a period | series `process_cpu`, sample type `cpu` `nanoseconds`, the sample's value (the `values` row) multiplied by the period, held at `-9223372036854775808` or `9223372036854775807` when the product would pass either |
   | sample type `off_cpu` `nanoseconds` with a period of 0 or no period type | series `off_cpu` |
   | any other sample type | the series named by the period type; a period of 0, or no period type, leaves `__name__` empty, which the checks refuse (§1.3) |
-  | `values` | their sum; with no `values`, the number of `timestamps_unix_nano`; both present with different lengths is refused, `sample values length mismatch <values> <timestamps>` |
+  | `values` | their sum, each addition held at `-9223372036854775808` or `9223372036854775807` when it would pass either; with no `values`, the number of `timestamps_unix_nano`; both present with different lengths is refused, `sample values length mismatch <values> <timestamps>` |
   | `time_unix_nano` 0, `duration_nano` 0 | the receive time; 10 s |
   | `profile_id` | the profile id; all zero is none |
   | — | `__delta__="false"` and `__otel__="true"` on every series |
@@ -410,7 +410,7 @@ Six behaviours differ from the reference on purpose: a folded line of 65,536 byt
 | at most 100 labels on a sample | `the profile with labels '<labels>' exceeds the sample labels limit (max_profile_stacktrace_sample_labels, actual: <n>, limit: 100)` |
 | no location or function id is 0 | `location id is 0`, `function id is 0` |
 | each sample has one value per sample type | `sample value length mismatch` |
-| the string table starts with `""`, and no string index is at or past its end | `string 0 should be empty string`, or a `… string index out of range` message naming the field |
+| the string table starts with `""`, and no string index is at or past its end | `string 0 should be empty string`, or a message naming the field, such as `sample label string index out of range` |
 | no sample type name contains `-` | `sample type contains -` |
 | each series has at most 30 labels | `profile series '<labels>' has <n> label names; limit 30` |
 | each series has a `__name__` | `invalid labels '<labels>' with error: invalid metric name` |
