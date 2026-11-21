@@ -162,8 +162,8 @@ pub struct SelectMergeStacktracesRequest {
 }
 
 /// `SelectMergeStacktraces`' response: the flame graph, field 1, the
-/// trimmed tree's bytes, field 2, and the merged profile, field 5 (issue
-/// #828). The DOT field is a later part's (#829).
+/// trimmed tree's bytes, field 2, the DOT text, field 3 (issue #829 part
+/// B), and the merged profile, field 5 (issue #828).
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeStacktracesResponse {
@@ -177,6 +177,10 @@ pub struct SelectMergeStacktracesResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub tree: Vec<u8>,
+    /// Issue #829 part B: the DOT text, with `PROFILE_FORMAT_DOT`.
+    #[prost(string, tag = "3")]
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub dot: String,
     /// Issue #828: the merged profile, with `PROFILE_FORMAT_PPROF`.
     #[prost(message, optional, tag = "5")]
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -8,7 +8,7 @@
 //! the tree format, the render routes and `label-values` (C31–C38), and
 //! issue #826 part B the exemplars of the series and the heatmap (C39–C43)
 //! over that pair. Issue #828 adds the pprof export (C44–C49), compared
-//! decoded (rule R4).
+//! decoded (rule R4). Issue #829 part B adds the DOT format (C50–C54).
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -278,6 +278,18 @@ enum Method {
     },
     /// Issue #829: `GET /pyroscope/label-values?label=<label>`.
     LabelValuesGet(&'static str),
+    /// Issue #829 part B: `GET /pyroscope/render` of `TYPE_A` over `R` with
+    /// `format=dot`.
+    RenderDot {
+        selector: &'static str,
+        max_nodes: Option<i64>,
+    },
+    /// Issue #829 part B: `SelectMergeStacktraces` of `TYPE_A` over `W`,
+    /// format `PROFILE_FORMAT_DOT`.
+    Dot {
+        selector: &'static str,
+        max_nodes: Option<i64>,
+    },
 }
 
 impl Method {
@@ -299,6 +311,8 @@ impl Method {
             Method::Render { .. } => "render",
             Method::RenderDiff { .. } => "render-diff",
             Method::LabelValuesGet(_) => "label-values",
+            Method::RenderDot { .. } => "render",
+            Method::Dot { .. } => "SelectMergeStacktraces",
         }
     }
 
@@ -307,7 +321,10 @@ impl Method {
     fn is_get(&self) -> bool {
         matches!(
             self,
-            Method::Render { .. } | Method::RenderDiff { .. } | Method::LabelValuesGet(_)
+            Method::Render { .. }
+                | Method::RenderDiff { .. }
+                | Method::LabelValuesGet(_)
+                | Method::RenderDot { .. }
         )
     }
 
@@ -443,6 +460,21 @@ enum Fixture {
     /// Issue #829: a render-diff answer: this diff with the `cpu` metadata
     /// and no timeline.
     RenderDiff(&'static DiffGraph),
+    /// Issue #829 part B: this DOT graph, the text of `render`, or the
+    /// `dot` of a `SelectMergeStacktraces` answer with no flame graph and no
+    /// tree.
+    Dot(&'static DotGraph),
+    /// Issue #829 part B: an empty body.
+    NoBody,
+}
+
+/// Issue #829 part B: a DOT graph as §5.3 checks it: its title, its node
+/// tooltips as `(name, count)`, a multiset, and its edge count.
+#[derive(Debug)]
+struct DotGraph {
+    title: &'static str,
+    nodes: &'static [(&'static str, i64)],
+    edges: usize,
 }
 
 /// One pinned answer of a ledger case: its status, and its body when the
@@ -570,6 +602,65 @@ const fn diff(
         right_max_nodes,
     }
 }
+
+/// Issue #829 part B, C50: `q-trim` as a DOT graph of 100 nodes.
+static Q_TRIM_DOT: DotGraph = DotGraph {
+    title: "unnamed",
+    nodes: &[
+        ("main", 32),
+        ("a", 24),
+        ("b", 17),
+        ("c", 5),
+        ("other", 4),
+        ("x", 4),
+        ("d", 3),
+        ("e", 1),
+        ("f", 1),
+    ],
+    edges: 8,
+};
+
+/// C51: `q-trim` as a DOT graph of 4 nodes.
+static Q_TRIM_DOT_4: DotGraph = DotGraph {
+    title: "unnamed",
+    nodes: &[("b", 17), ("main", 32), ("a", 24), ("c", 5)],
+    edges: 3,
+};
+
+/// C52: `q-pprof` as our DOT graph: the address-only stack kept.
+static Q_PPROF_DOT: DotGraph = DotGraph {
+    title: "app",
+    nodes: &[
+        ("main main.go:10", 20),
+        ("a main.go:20", 12),
+        ("b main.go:30", 10),
+        ("00000000007f0100 [libx.so]", 6),
+        ("a main.go:21", 4),
+        ("d main.go:50", 4),
+        ("e main.go:60", 4),
+        ("zz main.go:70", 1),
+        ("c main.go:40", 1),
+    ],
+    edges: 6,
+};
+
+/// C52: `q-pprof` as the reference's DOT graph: the address-only stack
+/// folded into `other`.
+static Q_PPROF_DOT_REF: DotGraph = DotGraph {
+    title: "app",
+    nodes: &[
+        ("main main.go:10", 20),
+        ("a main.go:20", 12),
+        ("b main.go:30", 10),
+        ("other", 6),
+        ("a main.go:21", 4),
+        ("d main.go:50", 4),
+        ("e main.go:60", 4),
+        ("zz main.go:70", 1),
+        ("c main.go:40", 1),
+    ],
+    edges: 6,
+};
 
 /// C16's and C18's graph: `q-trim` uncut.
 static Q_TRIM: Graph = Graph {
@@ -1434,6 +1525,59 @@ static CASES: &[Case] = &[
             pprof_format: true,
         }),
         expect: Expect::Parity(Fixture::Pprof(&nf::P1)),
+    },
+    Case {
+        id: "C50",
+        client: "exploration app, AI panel",
+        request: get_query(Method::RenderDot {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: Some(100),
+        }),
+        expect: Expect::Parity(Fixture::Dot(&Q_TRIM_DOT)),
+    },
+    Case {
+        id: "C51",
+        client: "AI panel, max nodes set",
+        request: get_query(Method::RenderDot {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: Some(4),
+        }),
+        expect: Expect::Parity(Fixture::Dot(&Q_TRIM_DOT_4)),
+    },
+    Case {
+        id: "C52",
+        client: "AI panel, an unsymbolised frame",
+        request: get_query(Method::RenderDot {
+            selector: r#"{service_name="q-pprof"}"#,
+            max_nodes: Some(100),
+        }),
+        expect: Expect::LedgerFixture {
+            row: "pprof-cut-keeps-max-nodes-exactly",
+            ours: Fixture::Dot(&Q_PPROF_DOT),
+            theirs: Fixture::Dot(&Q_PPROF_DOT_REF),
+        },
+    },
+    Case {
+        id: "C53",
+        client: "Connect client, DOT format",
+        request: query(Method::Dot {
+            selector: r#"{service_name="q-trim"}"#,
+            max_nodes: None,
+        }),
+        expect: Expect::LedgerFixture {
+            row: "dot-format-answers-dot",
+            ours: Fixture::Dot(&Q_TRIM_DOT),
+            theirs: Fixture::Graph(&Q_TRIM),
+        },
+    },
+    Case {
+        id: "C54",
+        client: "AI panel, no data",
+        request: get_query(Method::RenderDot {
+            selector: r#"{service_name="q-none"}"#,
+            max_nodes: Some(100),
+        }),
+        expect: Expect::Parity(Fixture::NoBody),
     },
 ];
 
@@ -2934,6 +3078,71 @@ fn render_failure(graph: &Graph, b: i64, body: &[u8]) -> Option<String> {
     None
 }
 
+/// Issue #829 part B: `ns` nanoseconds as the DOT text writes them, in
+/// seconds with two decimals, `.00` dropped.
+fn dot_seconds(ns: i64) -> String {
+    let s = format!("{:.2}", ns as f64 / 1e9);
+    format!("{}s", s.strip_suffix(".00").unwrap_or(&s))
+}
+
+/// Issue #829 part B: a DOT answer against `graph` in the unit `b`: the
+/// text of `render`, or the `dot` of a `SelectMergeStacktraces` answer with
+/// no flame graph and no tree.
+fn dot_failure(
+    graph: &DotGraph,
+    method: &Method,
+    encoding: Encoding,
+    b: i64,
+    body: &[u8],
+) -> Option<String> {
+    let text = if matches!(method, Method::Dot { .. }) {
+        match decode_as::<SelectMergeStacktracesResponse>(encoding, body) {
+            Ok(r) if r.flamegraph.is_none() && r.tree.is_empty() => r.dot,
+            Ok(r) => {
+                return Some(format!(
+                    "flame graph {:?} and tree {} bytes beside the dot",
+                    r.flamegraph.as_ref().map(nodes),
+                    r.tree.len()
+                ));
+            }
+            Err(e) => return Some(format!("undecodable: {e}")),
+        }
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    };
+    let head = format!("digraph \"{}\" {{", graph.title);
+    if !text.starts_with(&head) || !text.trim_end().ends_with('}') {
+        return Some(format!("not a DOT graph titled {:?}: {text}", graph.title));
+    }
+    let mut got: Vec<String> = text
+        .lines()
+        .filter(|l| l.starts_with('N') && !l.contains(" -> "))
+        .filter_map(|l| {
+            let rest = &l[l.find(" tooltip=\"")? + 10..];
+            Some(rest[..rest.find('"')?].to_string())
+        })
+        .collect();
+    let mut want: Vec<String> = graph
+        .nodes
+        .iter()
+        .map(|(name, count)| format!("{name} ({})", dot_seconds(count * b)))
+        .collect();
+    got.sort();
+    want.sort();
+    if got != want {
+        return Some(format!("node tooltips {got:?}, want {want:?}"));
+    }
+    let edges = text
+        .lines()
+        .filter(|l| {
+            l.split_once(" -> ").is_some_and(|(a, rest)| {
+                a.starts_with('N') && rest.starts_with('N') && rest.contains(" [")
+            })
+        })
+        .count();
+    (edges != graph.edges).then(|| format!("{edges} edges, want {}", graph.edges))
+}
+
 /// Issue #829: the index of a render answer's first non-zero timeline
 /// sample.
 fn timeline_index(body: &[u8]) -> Option<usize> {
@@ -3198,6 +3407,10 @@ fn check_fixture(
             };
         }
         Fixture::Render(graph) => return render_failure(graph, b, body),
+        Fixture::Dot(graph) => return dot_failure(graph, method, encoding, b, body),
+        Fixture::NoBody => {
+            return (!body.is_empty()).then(|| format!("{} bytes, want none", body.len()));
+        }
         Fixture::RenderDiff(g) => return render_diff_failure(g, b, body),
         Fixture::DiffGraph(g) => {
             let want = FlameGraphDiff {
@@ -3379,7 +3592,9 @@ fn check_fixture(
         | Fixture::Exemplars(_)
         | Fixture::Tree(_)
         | Fixture::Render(_)
-        | Fixture::RenderDiff(_) => None,
+        | Fixture::RenderDiff(_)
+        | Fixture::Dot(_)
+        | Fixture::NoBody => None,
     }
 }
 
@@ -3570,10 +3785,28 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
             };
             encoded(&msg, encoding)
         }
-        // Issue #829: a `GET` route's parameters are its query string.
-        (Method::Render { .. } | Method::RenderDiff { .. } | Method::LabelValuesGet(_), _) => {
-            Vec::new()
+        // Issue #829 part B: `PROFILE_FORMAT_DOT`.
+        (
+            Method::Dot {
+                selector,
+                max_nodes,
+            },
+            _,
+        ) => {
+            let msg = SelectMergeStacktracesRequest {
+                format: 3,
+                ..side(selector, *max_nodes)
+            };
+            encoded(&msg, encoding)
         }
+        // Issue #829: a `GET` route's parameters are its query string.
+        (
+            Method::Render { .. }
+            | Method::RenderDiff { .. }
+            | Method::LabelValuesGet(_)
+            | Method::RenderDot { .. },
+            _,
+        ) => Vec::new(),
         (
             Method::SelectSeries {
                 selector,
@@ -3825,6 +4058,17 @@ fn get_target(method: &Method, win: Windows) -> String {
         Method::LabelValuesGet(label) => {
             params.push(("label", label.to_string()));
             "label-values"
+        }
+        Method::RenderDot {
+            selector,
+            max_nodes,
+        } => {
+            params.push(("query", format!("{TYPE_A}{selector}")));
+            params.push(("from", from.to_string()));
+            params.push(("until", until.to_string()));
+            params.push(("format", "dot".to_string()));
+            params.extend(max(max_nodes));
+            "render"
         }
         _ => panic!("{} is not a GET route", method.name()),
     };
@@ -4492,7 +4736,7 @@ async fn profileql_matches_the_reference() {
     eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
-    // §4: C0–C49.
+    // §4: C0–C54.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {

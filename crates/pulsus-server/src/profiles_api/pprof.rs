@@ -20,6 +20,7 @@ use pulsus_profiles_wire::google_v1::Profile;
 use pulsus_profiles_wire::querier_v1::SelectMergeProfileRequest;
 use pulsus_profiles_wire::types_v1::StackTraceSelector;
 use pulsus_read::profiles::ProfilesReadConfig;
+use pulsus_read::profiles::dot;
 use pulsus_read::profiles::pprof::{self, PprofRequest};
 
 use crate::app::AppState;
@@ -59,6 +60,18 @@ pub(super) async fn merged_profile(
     })
     .await?;
     Ok(pprof::build(&planned, rows))
+}
+
+/// Issue #829 part B: the DOT text of the merged profile `req` selects,
+/// drawn with at most `dot_max` nodes; `None` when it holds no sample.
+pub(super) async fn dot_text(
+    state: &AppState,
+    tenant: &Tenant,
+    req: PprofRequest<'_>,
+    dot_max: i64,
+) -> Result<Option<String>, ConnectError> {
+    let profile = merged_profile(state, tenant, req).await?;
+    Ok(dot::write(&profile, dot_max))
 }
 
 /// `msg` as the planner's request, and its merged profile.

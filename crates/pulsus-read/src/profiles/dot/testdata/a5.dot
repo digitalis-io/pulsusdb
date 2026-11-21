@@ -1,0 +1,8 @@
+digraph "app" {
+node [style=filled fillcolor="#f8f8f8"]
+subgraph cluster_L { "File: app" [shape=box fontsize=16 label="File: app\lBuild ID: bid\lType: cpu\lTime: Nov 20, 2026 at 7:53pm (UTC)\lShowing nodes accounting for 0.32s, 59.26% of 0.54s total\lShowing top 3 nodes out of 9\l\lSee https://git.io/JfYMW for how to read the graph\l" tooltip="app"] }
+N1 [label="b\nmain.go:30\n0.20s (37.04%)" id="node1" fontsize=24 shape=box tooltip="b main.go:30 (0.20s)" color="#b22d00" fillcolor="#eddbd5"]
+N2 [label="main\nmain.go:10\n0 of 0.40s (74.07%)" id="node2" fontsize=8 shape=box tooltip="main main.go:10 (0.40s)" color="#b20f00" fillcolor="#edd7d5"]
+N3 [label="other\n0.12s (22.22%)" id="node3" fontsize=21 shape=box tooltip="other (0.12s)" color="#b24000" fillcolor="#edded5"]
+N2 -> N1 [label=" 0.20s" weight=38 penwidth=2 color="#b22d00" tooltip="main main.go:10 ... b main.go:30 (0.20s)" labeltooltip="main main.go:10 ... b main.go:30 (0.20s)" style="dotted"]
+}

@@ -1,0 +1,17 @@
+digraph "unnamed" {
+node [style=filled fillcolor="#f8f8f8"]
+subgraph cluster_L { "Type: cpu" [shape=box fontsize=16 label="Type: cpu\lTime: Nov 20, 2026 at 7:53pm (UTC)\lShowing nodes accounting for 1003s, 100% of 1003s total\l\lSee https://git.io/JfYMW for how to read the graph\l"] }
+N1 [label="helper\n999.99s (99.70%)" id="node1" fontsize=24 shape=box tooltip="(anonymous namespace)::helper (999.99s)" color="#b20000" fillcolor="#edd5d5"]
+N2 [label="main\n0 of 1003s (100%)" id="node2" fontsize=8 shape=box tooltip="main (1003s)" color="#b20000" fillcolor="#edd5d5"]
+N3 [label="mid\n3s (0.3%)" id="node3" fontsize=9 shape=box tooltip="mid (3s)" color="#b2b2af" fillcolor="#ededec"]
+N4 [label="tiny\n0.01s (0.001%)" id="node4" fontsize=9 shape=box tooltip="tiny (0.01s)" color="#b2b2b2" fillcolor="#ededed"]
+N5 [label="Foo\nbar\n0 of 999.99s (99.70%)" id="node5" fontsize=8 shape=box tooltip="com.example.Foo.bar (999.99s)" color="#b20000" fillcolor="#edd5d5"]
+N6 [label="pkg\n(*T)\nRun\n0 of 999.99s (99.70%)" id="node6" fontsize=8 shape=box tooltip="github.com/x/y/v2/pkg.(*T).Run (999.99s)" color="#b20000" fillcolor="#edd5d5"]
+N7 [label="Widget\ndraw<int>\n0 of 999.99s (99.70%)" id="node7" fontsize=8 shape=box tooltip="ns::Widget::draw<int> (999.99s)" color="#b20000" fillcolor="#edd5d5"]
+N5 -> N7 [label=" 999.99s" weight=100 penwidth=5 color="#b20000" tooltip="com.example.Foo.bar -> ns::Widget::draw<int> (999.99s)" labeltooltip="com.example.Foo.bar -> ns::Widget::draw<int> (999.99s)"]
+N6 -> N5 [label=" 999.99s" weight=100 penwidth=5 color="#b20000" tooltip="github.com/x/y/v2/pkg.(*T).Run -> com.example.Foo.bar (999.99s)" labeltooltip="github.com/x/y/v2/pkg.(*T).Run -> com.example.Foo.bar (999.99s)"]
+N2 -> N6 [label=" 999.99s" weight=100 penwidth=5 color="#b20000" tooltip="main -> github.com/x/y/v2/pkg.(*T).Run (999.99s)" labeltooltip="main -> github.com/x/y/v2/pkg.(*T).Run (999.99s)"]
+N7 -> N1 [label=" 999.99s" weight=100 penwidth=5 color="#b20000" tooltip="ns::Widget::draw<int> -> (anonymous namespace)::helper (999.99s)" labeltooltip="ns::Widget::draw<int> -> (anonymous namespace)::helper (999.99s)"]
+N2 -> N3 [label=" 3s" color="#b2b2af" tooltip="main -> mid (3s)" labeltooltip="main -> mid (3s)"]
+N2 -> N4 [label=" 0.01s" color="#b2b2b2" tooltip="main -> tiny (0.01s)" labeltooltip="main -> tiny (0.01s)"]
+}

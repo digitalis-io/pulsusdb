@@ -1,0 +1,11 @@
+digraph "unnamed" {
+node [style=filled fillcolor="#f8f8f8"]
+subgraph cluster_L { "Type: cpu" [shape=box fontsize=16 label="Type: cpu\lTime: Nov 20, 2026 at 7:53pm (UTC)\lShowing nodes accounting for 0.24s, 75.00% of 0.32s total\lShowing top 4 nodes out of 9\l\lSee https://git.io/JfYMW for how to read the graph\l"] }
+N1 [label="b\n0.17s (53.12%)" id="node1" fontsize=24 shape=box tooltip="b (0.17s)" color="#b21e00" fillcolor="#edd9d5"]
+N2 [label="main\n0 of 0.32s (100%)" id="node2" fontsize=8 shape=box tooltip="main (0.32s)" color="#b20000" fillcolor="#edd5d5"]
+N3 [label="a\n0.02s (6.25%)\nof 0.24s (75.00%)" id="node3" fontsize=14 shape=box tooltip="a (0.24s)" color="#b20e00" fillcolor="#edd7d5"]
+N4 [label="c\n0.05s (15.62%)" id="node4" fontsize=17 shape=box tooltip="c (0.05s)" color="#b26227" fillcolor="#ede2da"]
+N2 -> N3 [label=" 0.24s" weight=76 penwidth=4 color="#b20e00" tooltip="main -> a (0.24s)" labeltooltip="main -> a (0.24s)"]
+N3 -> N1 [label=" 0.17s" weight=54 penwidth=3 color="#b21e00" tooltip="a -> b (0.17s)" labeltooltip="a -> b (0.17s)"]
+N3 -> N4 [label=" 0.05s" weight=16 color="#b26227" tooltip="a -> c (0.05s)" labeltooltip="a -> c (0.05s)"]
+}

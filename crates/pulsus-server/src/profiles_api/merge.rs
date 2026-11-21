@@ -10,7 +10,8 @@
 //! then the planner's own checks. Issue #828: `PROFILE_FORMAT_PPROF`
 //! answers the merged profile (`super::pprof`) in `pprof.profile`. Issue
 //! #829: `PROFILE_FORMAT_TREE` answers the trimmed tree's bytes alone, from
-//! the same statement.
+//! the same statement; part B: `PROFILE_FORMAT_DOT` answers the merged
+//! profile's DOT text alone, in `dot`.
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -22,6 +23,7 @@ use pulsus_profiles_wire::querier_v1::{
     SelectMergeStacktracesResponse,
 };
 use pulsus_read::profiles::ProfilesReadConfig;
+use pulsus_read::profiles::dot;
 use pulsus_read::profiles::flamegraph;
 use pulsus_read::profiles::pprof::PprofRequest;
 use pulsus_read::profiles::tree::{self, TreeRequest, TreeRow};
@@ -44,16 +46,7 @@ async fn flame_graph(
     with_tree: bool,
 ) -> Result<SelectMergeStacktracesResponse, ConnectError> {
     tree::refuse_span_with_trace(&msg.span_selector, &msg.trace_id_selector)?;
-    let tree_only = match ProfileFormat::try_from(msg.format) {
-        Ok(f @ ProfileFormat::Dot) => {
-            return Err(ConnectError::new(
-                Code::Unimplemented,
-                format!("profile format {} is not served yet", f.as_str_name()),
-            ));
-        }
-        Ok(ProfileFormat::Tree) => true,
-        _ => false,
-    };
+    let tree_only = msg.format == ProfileFormat::Tree as i32;
     let config = ProfilesReadConfig::from_config(&state.config);
     let call_site: Vec<String> = msg
         .stack_trace_selector
@@ -76,8 +69,7 @@ async fn flame_graph(
             .transpose()?;
         return Ok(SelectMergeStacktracesResponse {
             flamegraph,
-            tree: Vec::new(),
-            pprof: None,
+            ..SelectMergeStacktracesResponse::default()
         });
     };
     let sql = planned.sql.as_str();
@@ -87,16 +79,15 @@ async fn flame_graph(
     .await?;
     if tree_only {
         return Ok(SelectMergeStacktracesResponse {
-            flamegraph: None,
             tree: flamegraph::tree_only(&rows, planned.max_nodes)?,
-            pprof: None,
+            ..SelectMergeStacktracesResponse::default()
         });
     }
     let (graph, tree) = trimmed(&rows, planned.max_nodes, planned.raw_max_nodes, with_tree)?;
     Ok(SelectMergeStacktracesResponse {
         flamegraph: Some(wire(graph)),
         tree,
-        pprof: None,
+        ..SelectMergeStacktracesResponse::default()
     })
 }
 
@@ -144,6 +135,9 @@ pub(crate) async fn select_merge_stacktraces(
         Ok(p) => p,
         Err(refused) => return refused.into_response(),
     };
+    if msg.format == ProfileFormat::Dot as i32 {
+        return finish(codec, dot_answer(&state, &tenant, msg).await);
+    }
     if msg.format == ProfileFormat::Pprof as i32 {
         return finish(codec, pprof_answer(&state, &tenant, msg).await);
     }
@@ -175,6 +169,36 @@ async fn pprof_answer(
         pprof: Some(PprofProfile {
             profile: Some(profile),
         }),
+        ..SelectMergeStacktracesResponse::default()
+    })
+}
+
+/// Issue #829 part B (D3): `PROFILE_FORMAT_DOT`: the DOT text of `msg`'s
+/// merged profile, with its span selector, in `dot` alone; the profile cut
+/// to `source` function nodes and drawn with at most `dot` nodes (D2).
+async fn dot_answer(
+    state: &AppState,
+    tenant: &Tenant,
+    msg: SelectMergeStacktracesRequest,
+) -> Result<SelectMergeStacktracesResponse, ConnectError> {
+    tree::refuse_span_with_trace(&msg.span_selector, &msg.trace_id_selector)?;
+    let (dot_max, source) = dot::limits(msg.max_nodes);
+    let (call_site, go_pgo) = super::pprof::stack_trace_selector(msg.stack_trace_selector);
+    let req = PprofRequest {
+        profile_type: &msg.profile_type_id,
+        label_selector: &msg.label_selector,
+        start_ms: msg.start,
+        end_ms: msg.end,
+        max_nodes: Some(source),
+        call_site: &call_site,
+        span_selector: &msg.span_selector,
+        trace_id_selector: &msg.trace_id_selector,
+        profile_id_selector: &msg.profile_id_selector,
+        go_pgo,
+    };
+    let dot = super::pprof::dot_text(state, tenant, req, dot_max).await?;
+    Ok(SelectMergeStacktracesResponse {
+        dot: dot.unwrap_or_default(),
         ..SelectMergeStacktracesResponse::default()
     })
 }

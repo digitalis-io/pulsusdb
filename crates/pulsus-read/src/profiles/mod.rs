@@ -7,11 +7,13 @@
 //! selections, its statement (`diff`) and its trim (`flamegraph_diff`).
 //! Issue #825: the heatmap of profile and span totals (`heatmap`). Issue
 //! #828: the merged profile as pprof (`pprof`). Issue #829: the render
-//! route's one statement and its timeline (`render`).
+//! route's one statement and its timeline (`render`); part B, the merged
+//! profile as a DOT graph (`dot`).
 
 pub mod catalogue;
 pub mod diff;
 mod dispatch;
+pub mod dot;
 pub mod engine;
 pub mod flamegraph;
 pub mod flamegraph_diff;
