@@ -647,6 +647,38 @@ async fn the_render_routes_answer_in_one_statement() {
         "L12 compat off"
     );
 
+    // L13 (issue #832): the three compat paths under the native prefix,
+    // where the profiles datasource sends them, answer with the compat flag
+    // unset.
+    let (got, id) = answer(
+        &get(b, "/api/profiles/v1/pyroscope/render", "t1", &w(&query)),
+        "L13 render",
+    );
+    assert_eq!(got, l1, "L13 render");
+    counted.push(("L13 render", id, 1));
+    let (got, id) = answer(
+        &get(
+            b,
+            "/api/profiles/v1/pyroscope/render-diff",
+            "t1",
+            &diff_params,
+        ),
+        "L13 render-diff",
+    );
+    assert_eq!(got, B2, "L13 render-diff");
+    counted.push(("L13 render-diff", id, 1));
+    let (got, id) = answer(
+        &get(
+            b,
+            "/api/profiles/v1/pyroscope/label-values",
+            "t1",
+            &[("label", "pod".to_string())],
+        ),
+        "L13 label-values",
+    );
+    assert_eq!(got, "[\"p1\",\"p2\"]\n", "L13 label-values");
+    counted.push(("L13 label-values", id, 1));
+
     let ids: Vec<String> = counted.iter().map(|(_, id, _)| id.clone()).collect();
     let sent = statements(&client, &ids).await;
     for (ctx, id, want) in &counted {

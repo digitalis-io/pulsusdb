@@ -174,6 +174,15 @@ pub const SCENARIOS: &[Scenario] = &[
         variants: &[Variant::Single],
         run: |ctx| Box::pin(crate::traces::traces_differential(ctx)),
     },
+    Scenario {
+        name: "profileql_frontend",
+        // Single-variant only (issue #832): the `profileql-frontend` and
+        // `profileql-browser` services ship only in
+        // `deploy/e2e/compose.single.yaml`. Its own fixture, pushed straight
+        // to PulsusDB under tenants `t1` and `t2`.
+        variants: &[Variant::Single],
+        run: |ctx| Box::pin(crate::profileql::profileql_frontend(ctx)),
+    },
 ];
 
 /// `GET /ready` is already gated on by the harness's own polling

@@ -16,6 +16,7 @@ mod logs_corpus;
 mod logs_sm_corpus;
 mod metrics;
 mod otlp_naming;
+mod profileql;
 mod scenarios;
 mod traces;
 mod traces_corpus;

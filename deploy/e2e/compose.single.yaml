@@ -236,3 +236,41 @@ services:
         ipv4_address: 172.29.0.13
     depends_on: [ pulsusdb ]
     ports: [ "3000:3000" ]
+
+  # The profiles front end (issue #832, `e2e/src/profileql.rs`'s
+  # `profileql_frontend`): the datasource, the exploration app and the trace
+  # datasource installed in the image at build time
+  # (`deploy/e2e/profileql/frontend.Dockerfile`, published by
+  # `.github/workflows/profileql-e2e-images.yml`), so a run fetches nothing
+  # from the plugin catalogue. Pinned by the digest that workflow printed.
+  # Separate from `grafana` above, whose version is below the plugins'
+  # minimum. `Admin`: the app's settings page saves under it.
+  profileql-frontend:
+    image: ghcr.io/digitalis-io/profileql-e2e-frontend@sha256:1c48fcf73e880e914d2fbea2b7b3e7a7f2bc6ba0024b730fb5e2ea5a1c0129af
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      # They gate the datasource's heatmap and exemplar requests.
+      GF_FEATURE_TOGGLES_ENABLE: "profilesHeatmap,profilesExemplars"
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/profileql/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.18
+    depends_on: [ pulsusdb ]
+    ports: [ "3002:3000" ]
+
+  # The headless browser that loads the app's pages (issue #832,
+  # `e2e/profileql/pages.mjs`), its library installed in the image from the
+  # committed lock (`deploy/e2e/profileql/browser.Dockerfile`). Idle until
+  # the scenario runs the script with `exec`.
+  profileql-browser:
+    image: ghcr.io/digitalis-io/profileql-e2e-browser@sha256:6fab0f11edde6b67557b5b0f3940e11cfc475f4d5bb191fa5ea24a3233436131
+    command: [ "sleep", "infinity" ]
+    init: true
+    volumes:
+      - ${PULSUS_E2E_ROOT}/e2e/profileql:/src:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.19
+    depends_on: [ profileql-frontend ]
