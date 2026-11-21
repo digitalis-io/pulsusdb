@@ -727,4 +727,141 @@ mod tests {
             wrong.join("\n")
         );
     }
+
+    /// Every statement of `sqls` answers `Ok` under term `a`, else the
+    /// failures, one per line.
+    fn unaccepted(sqls: &[&str]) -> Vec<String> {
+        let (a, tables) = (term("a"), tables());
+        sqls.iter()
+            .filter_map(|sql| {
+                check(sql, &a, &tables)
+                    .err()
+                    .map(|e| format!("refused: {sql}\n  {e}"))
+            })
+            .collect()
+    }
+
+    /// **A5 (issue #830): a lone tenant term scopes its read.** The term
+    /// alone, at the end of its `WHERE` or before a clause end at that
+    /// depth, is accepted.
+    #[test]
+    fn a5_a_lone_tenant_term_scopes_its_read() {
+        let base = "SELECT 1 FROM spans WHERE org_id = 'a'";
+        let mut sqls: Vec<String> = vec![base.to_string()];
+        for tail in [
+            " GROUP BY x",
+            " ORDER BY x",
+            " LIMIT 1",
+            " HAVING x",
+            " SETTINGS max_threads = 1",
+            " UNION ALL SELECT 2 FROM spans WHERE org_id = 'a'",
+            "\nGROUP BY x",
+        ] {
+            sqls.push(format!("{base}{tail}"));
+        }
+        sqls.push(
+            "SELECT 1 FROM t WHERE y IN (SELECT trace_id FROM spans WHERE org_id = 'a')"
+                .to_string(),
+        );
+        let sqls: Vec<&str> = sqls.iter().map(String::as_str).collect();
+        let wrong = unaccepted(&sqls);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// **A6 (issue #830): the term with anything after it but a clause end
+    /// is refused, and so is an `org_id` the statement defines.**
+    #[test]
+    fn a6_a_lone_term_with_anything_after_it_is_refused() {
+        let (a, tables) = (term("a"), tables());
+        let mut wrong = Vec::new();
+        for (sql, names) in [
+            ("SELECT 1 FROM spans WHERE org_id = 'a' OR x", "FROM spans"),
+            (
+                "SELECT 1 FROM spans WHERE org_id = 'a' OR x GROUP BY y",
+                "FROM spans",
+            ),
+            ("SELECT 1 FROM spans WHERE org_id = 'b'", "FROM spans"),
+            (
+                "SELECT 1 FROM spans WHERE org_id = 'b' GROUP BY x",
+                "FROM spans",
+            ),
+            ("SELECT 1 FROM spans WHERE org_id = 'a''b'", "FROM spans"),
+            ("SELECT 1 FROM spans WHERE org_id = 'a' x", "FROM spans"),
+            ("SELECT 1 FROM spans WHERE org_id = 'a' = 0", "FROM spans"),
+            (
+                "SELECT 1 FROM spans WHERE org_id = 'a' IS NULL",
+                "FROM spans",
+            ),
+            ("SELECT 1 FROM spans WHERE org_id = 'ab'", "FROM spans"),
+            (
+                "SELECT 1 FROM spans WHERE org_id = 'a' AND x OR y",
+                "FROM spans",
+            ),
+            (
+                "SELECT 'a' AS org_id FROM spans WHERE org_id = 'a'",
+                "org_id redefined",
+            ),
+            (
+                "SELECT 'a' AS org_id FROM spans WHERE org_id = 'a' AND x",
+                "org_id redefined",
+            ),
+            (
+                "SELECT 'a' org_id FROM spans WHERE org_id = 'a'",
+                "org_id redefined",
+            ),
+            (
+                "SELECT 'a' AS `org_id` FROM spans WHERE org_id = 'a'",
+                "org_id redefined",
+            ),
+            (
+                "WITH 'a' AS org_id SELECT 1 FROM spans WHERE org_id = 'a'",
+                "org_id redefined",
+            ),
+            (
+                "SELECT 1 FROM spans WHERE org_id = 'a' GROUP BY x, 'a' AS org_id",
+                "org_id redefined",
+            ),
+            (
+                "SELECT 1 FROM spans WHERE org_id = 'a' AND ('a' AS org_id = 'a')",
+                "org_id redefined",
+            ),
+            (
+                "SELECT org_id FROM spans WHERE org_id = 'a'",
+                "org_id redefined",
+            ),
+        ] {
+            match check(sql, &a, &tables) {
+                Err(e) if e.contains(names) => {}
+                other => wrong.push(format!("{sql}: {other:?}, want a refusal naming {names}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// **A7 (issue #830): an `org_id` that is a path component, a qualified
+    /// column or the settings insert's own column is not a redefinition.**
+    #[test]
+    fn a7_a_path_or_an_insert_list_named_org_id_is_allowed() {
+        let wrong = unaccepted(&[
+            "SELECT 1 FROM spans WHERE org_id = 'a' AND attrs.`org_id` = 'x'",
+            "SELECT 1 FROM spans WHERE org_id = 'a' AND dynamicType(attrs.`org_id`) IN ('String')",
+            "SELECT 1 FROM spans WHERE org_id = 'a' AND \
+             arrayExists(x -> dynamicType(x) IN ('String'), events.attrs.`org_id`)",
+            "SELECT attrs.`org_id` FROM spans WHERE org_id = 'a'",
+            "SELECT spans.org_id FROM spans WHERE org_id = 'a'",
+        ]);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        let value = http::HeaderValue::from_static("t1");
+        let t1 = Tenant::from_header(Some(&value), false).expect("a valid tenant");
+        let sql = crate::profiles::app::settings_write_sql(&t1, "a", "1", 10, false);
+        assert_eq!(
+            check(
+                &sql,
+                &TenantTerm::of(&t1),
+                &crate::profiles::tenant_scope::tables("")
+            ),
+            Ok(()),
+            "{sql}"
+        );
+    }
 }

@@ -2294,3 +2294,123 @@ mod trace_shortcut_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod org_id_attribute_tests {
+    use super::*;
+    use crate::traces::metrics_plan::{MetricsCtx, MetricsParams};
+    use crate::traces::spans::metrics::{StatementTables, plan_trace_metrics_routed};
+    use crate::traces::spans::tags::{ValueScope, narrowed_values_sql, narrowing_from_query};
+
+    fn term_a() -> TenantTerm {
+        let value = http::HeaderValue::from_static("a");
+        TenantTerm::of(&pulsus_model::Tenant::from_header(Some(&value), false).expect("a tenant"))
+    }
+
+    fn trace_tables() -> Vec<String> {
+        [
+            "resources",
+            "spans",
+            "tag_names",
+            "tag_values",
+            "trace_landing",
+            "traces",
+            "service_edges",
+            "tag_bucket_values",
+            "error_spans",
+            "service_bucket_resources",
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect()
+    }
+
+    /// **A8 (issue #830): an attribute named `org_id` passes the tenant
+    /// check.** The search, metrics and tag-values statements for a query
+    /// on an `org_id` attribute, under tenant `a`, read it as a path
+    /// component, which is not a redefinition of the column.
+    #[test]
+    fn a8_an_org_id_attribute_passes_the_tenant_check() {
+        let a = term_a();
+        let tables = trace_tables();
+        let w =
+            WindowSql::start_closed_end_open(1_700_000_000_000_000_000, 1_700_003_600_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            spans_table: "spans",
+            resources_table: "resources",
+            indexed: &[],
+            tenant: &a,
+        };
+        let mut statements: Vec<(String, String)> = Vec::new();
+        for q in [
+            r#"{ span.org_id = "x" }"#,
+            r#"{ resource.org_id = "x" }"#,
+            r#"{ .org_id = "x" }"#,
+            r#"{ event.org_id = "x" }"#,
+            r#"{ link.org_id = "x" }"#,
+            r#"{ instrumentation.org_id = "x" }"#,
+            "{ } | select(span.org_id)",
+        ] {
+            let query = pulsus_traceql::parse(q).expect("parses");
+            let s = compile_search(&query, &ctx, "spans", "traces", 20, 3).expect("compiles");
+            statements.push((q.to_string(), s.sql));
+        }
+        let metrics_ctx = MetricsCtx {
+            scan_budget_rows: 50_000_000,
+            max_series: 1_000,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        let params = MetricsParams {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_000_060_000_000_000,
+            step_ms: 60_000,
+            exemplars: None,
+            floor_ns: i64::MIN,
+        };
+        let st = StatementTables {
+            spans: "spans",
+            error_spans: "error_spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+            tenant: &a,
+        };
+        let q = "{ } | rate() by (span.org_id)";
+        let routed = plan_trace_metrics_routed(
+            &pulsus_traceql::parse(q).expect("parses"),
+            &params,
+            &metrics_ctx,
+            &st,
+        )
+        .expect("plans");
+        statements.push((q.to_string(), routed.statement().range_sql().to_string()));
+        let n = narrowing_from_query(r#"{ span.org_id = "x" }"#, &ctx);
+        statements.push((
+            "the values of span.org_id".to_string(),
+            narrowed_values_sql(
+                &a,
+                "spans",
+                "resources",
+                "traces",
+                ValueScope::Span,
+                "org_id",
+                w,
+                &n,
+                1,
+                1001,
+            ),
+        ));
+        let mut wrong = Vec::new();
+        for (q, sql) in &statements {
+            if !sql.contains(".`org_id`") {
+                wrong.push(format!("{q}: no `org_id` path component in\n{sql}"));
+            }
+            if let Err(e) = crate::traces::tenant_scope::check(sql, &a, &tables) {
+                wrong.push(format!("{q}: {e}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
