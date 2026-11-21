@@ -83,6 +83,7 @@ pkg/engine/engine.go
 pkg/engine/handler.go
 pkg/frontend/readpath/query_service_handler.go
 pkg/frontend/readpath/queryfrontend/query_diff.go
+pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go
 pkg/frontend/readpath/queryfrontend/query_select_time_series.go
 pkg/frontend/readpath/router.go
 pkg/iter/entry_iterator.go
