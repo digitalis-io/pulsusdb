@@ -1,0 +1,11 @@
+digraph "unnamed" {
+node [style=filled fillcolor="#f8f8f8"]
+subgraph cluster_L { "Type: alloc_space" [shape=box fontsize=16 label="Type: alloc_space\lTime: Nov 20, 2026 at 7:53pm (UTC)\lShowing nodes accounting for 3221227011B, 100% of 3221227011B total\l\lSee https://git.io/JfYMW for how to read the graph\l"] }
+N1 [label="big\n3221225472B (100%)" id="node1" fontsize=24 shape=box tooltip="big (3221225472B)" color="#b20000" fillcolor="#edd5d5"]
+N2 [label="main\n0 of 3221227011B (100%)" id="node2" fontsize=8 shape=box tooltip="main (3221227011B)" color="#b20000" fillcolor="#edd5d5"]
+N3 [label="alloc\n1536B (4.8e-05%)" id="node3" fontsize=9 shape=box tooltip="alloc (1536B)" color="#b2b2b2" fillcolor="#ededed"]
+N4 [label="small\n3B (9.3e-08%)" id="node4" fontsize=9 shape=box tooltip="small (3B)" color="#b2b2b2" fillcolor="#ededed"]
+N2 -> N1 [label=" 3221225472B" weight=100 penwidth=5 color="#b20000" tooltip="main -> big (3221225472B)" labeltooltip="main -> big (3221225472B)"]
+N2 -> N3 [label=" 1536B" color="#b2b2b2" tooltip="main -> alloc (1536B)" labeltooltip="main -> alloc (1536B)"]
+N2 -> N4 [label=" 3B" color="#b2b2b2" tooltip="main -> small (3B)" labeltooltip="main -> small (3B)"]
+}

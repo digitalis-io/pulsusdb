@@ -111,6 +111,7 @@ fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
             max_self: 17,
         }),
         tree: Vec::new(),
+        dot: String::new(),
         pprof: None,
     };
     assert_eq!(
@@ -125,6 +126,7 @@ fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
             max_self: 0,
         }),
         tree: Vec::new(),
+        dot: String::new(),
         pprof: None,
     };
     assert_eq!(
@@ -147,6 +149,7 @@ fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
     let with = SelectMergeStacktracesResponse {
         flamegraph: Some(graph.clone()),
         tree: vec![0, 0, 1],
+        dot: String::new(),
         pprof: None,
     };
     let text = serde_json::to_string(&with).expect("encode");
@@ -161,6 +164,7 @@ fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
     let without = SelectMergeStacktracesResponse {
         flamegraph: Some(graph.clone()),
         tree: Vec::new(),
+        dot: String::new(),
         pprof: None,
     };
     assert!(
@@ -172,12 +176,27 @@ fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
     let graph_bytes = SelectMergeStacktracesResponse {
         flamegraph: Some(graph),
         tree: Vec::new(),
+        dot: String::new(),
         pprof: None,
     }
     .encode_to_vec();
     let mut want = graph_bytes.clone();
     want.extend_from_slice(&[0x12, 3, 0, 0, 1]);
     assert_eq!(with.encode_to_vec(), want, "tree is field 2");
+}
+
+/// Issue #829 part B: the DOT text is read and written as `dot`; an empty
+/// one is not written.
+#[test]
+fn the_dot_text_is_read_and_written_as_dot() {
+    let r: SelectMergeStacktracesResponse = serde_json::from_str(r#"{"dot":"x"}"#).expect("decode");
+    assert_eq!(r.dot, "x");
+    assert_eq!(serde_json::to_string(&r).expect("encode"), r#"{"dot":"x"}"#);
+    assert_eq!(
+        serde_json::to_string(&SelectMergeStacktracesResponse::default()).expect("encode"),
+        "{}",
+        "an empty dot is written"
+    );
 }
 
 /// W5: the request reads either name, `maxNodes` as a number or a string,

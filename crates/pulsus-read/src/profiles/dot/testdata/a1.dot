@@ -1,0 +1,21 @@
+digraph "unnamed" {
+node [style=filled fillcolor="#f8f8f8"]
+subgraph cluster_L { "Type: cpu" [shape=box fontsize=16 label="Type: cpu\lTime: Nov 20, 2026 at 7:53pm (UTC)\lShowing nodes accounting for 0.32s, 100% of 0.32s total\l\lSee https://git.io/JfYMW for how to read the graph\l"] }
+N1 [label="main\n0 of 0.32s (100%)" id="node1" fontsize=8 shape=box tooltip="main (0.32s)" color="#b20000" fillcolor="#edd5d5"]
+N2 [label="b\n0.17s (53.12%)" id="node2" fontsize=24 shape=box tooltip="b (0.17s)" color="#b21e00" fillcolor="#edd9d5"]
+N3 [label="a\n0.02s (6.25%)\nof 0.24s (75.00%)" id="node3" fontsize=14 shape=box tooltip="a (0.24s)" color="#b20e00" fillcolor="#edd7d5"]
+N4 [label="c\n0.05s (15.62%)" id="node4" fontsize=17 shape=box tooltip="c (0.05s)" color="#b26227" fillcolor="#ede2da"]
+N5 [label="x\n0.04s (12.50%)" id="node5" fontsize=16 shape=box tooltip="x (0.04s)" color="#b27642" fillcolor="#ede5de"]
+N6 [label="d\n0.03s (9.38%)" id="node6" fontsize=15 shape=box tooltip="d (0.03s)" color="#b2895e" fillcolor="#ede7e2"]
+N7 [label="f\n0.01s (3.12%)" id="node7" fontsize=12 shape=box tooltip="f (0.01s)" color="#b2a896" fillcolor="#edebe9"]
+N8 [label="e\n0 of 0.01s (3.12%)" id="node8" fontsize=8 shape=box tooltip="e (0.01s)" color="#b2a896" fillcolor="#edebe9"]
+N9 [label="other\n0 of 0.04s (12.50%)" id="node9" fontsize=8 shape=box tooltip="other (0.04s)" color="#b27642" fillcolor="#ede5de"]
+N1 -> N3 [label=" 0.24s" weight=76 penwidth=4 color="#b20e00" tooltip="main -> a (0.24s)" labeltooltip="main -> a (0.24s)"]
+N3 -> N2 [label=" 0.17s" weight=54 penwidth=3 color="#b21e00" tooltip="a -> b (0.17s)" labeltooltip="a -> b (0.17s)"]
+N3 -> N4 [label=" 0.05s" weight=16 color="#b26227" tooltip="a -> c (0.05s)" labeltooltip="a -> c (0.05s)"]
+N1 -> N9 [label=" 0.04s" weight=13 color="#b27642" tooltip="main -> other (0.04s)" labeltooltip="main -> other (0.04s)"]
+N9 -> N5 [label=" 0.04s" weight=13 color="#b27642" tooltip="other -> x (0.04s)" labeltooltip="other -> x (0.04s)"]
+N1 -> N6 [label=" 0.03s" weight=10 color="#b2895e" tooltip="main -> d (0.03s)" labeltooltip="main -> d (0.03s)"]
+N8 -> N7 [label=" 0.01s" weight=4 color="#b2a896" tooltip="e -> f (0.01s)" labeltooltip="e -> f (0.01s)"]
+N1 -> N8 [label=" 0.01s" weight=4 color="#b2a896" tooltip="main -> e (0.01s)" labeltooltip="main -> e (0.01s)"]
+}

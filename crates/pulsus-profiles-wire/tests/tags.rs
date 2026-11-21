@@ -12,7 +12,8 @@
 //! heatmap's, issue #826 the exemplar's.
 //!
 //! W12 (issue #828): `SelectMergeProfile`'s request, `PprofProfile`, and
-//! `SelectMergeStacktracesResponse.pprof`.
+//! `SelectMergeStacktracesResponse.pprof`. Issue #829 part B:
+//! `SelectMergeStacktracesResponse.dot`.
 //!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
@@ -472,12 +473,22 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
     let m = SelectMergeStacktracesResponse {
         flamegraph: Some(flame_graph()),
         tree: vec![0, 0, 1],
+        dot: String::new(),
         pprof: None,
     };
     let mut b = Vec::new();
     nested(1, &flame_graph_bytes(&flame_graph()), &mut b);
     encoding::bytes::encode(2, &m.tree, &mut b);
     assert_eq!(m.encode_to_vec(), b, "SelectMergeStacktracesResponse");
+
+    // Issue #829 part B: the DOT text is field 3, a string.
+    let m = SelectMergeStacktracesResponse {
+        dot: "digraph".to_string(),
+        ..SelectMergeStacktracesResponse::default()
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(3, &m.dot, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "SelectMergeStacktracesResponse.dot");
 
     let m = SelectMergeStacktracesRequest {
         profile_type_id: "process_cpu:cpu:nanoseconds:cpu:nanoseconds".to_string(),
@@ -926,6 +937,7 @@ fn every_pprof_message_field_encodes_under_the_proto_tag() {
     let r = SelectMergeStacktracesResponse {
         flamegraph: None,
         tree: Vec::new(),
+        dot: String::new(),
         pprof: Some(PprofProfile {
             profile: Some(profile()),
         }),

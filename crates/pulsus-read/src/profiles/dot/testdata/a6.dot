@@ -1,0 +1,19 @@
+digraph "app" {
+node [style=filled fillcolor="#f8f8f8"]
+subgraph cluster_L { "File: app" [shape=box fontsize=16 label="File: app\lBuild ID: bid\lType: cpu\lTime: TIME (UTC)\lShowing nodes accounting for 0.27s, 100% of 0.27s total\l\lSee https://git.io/JfYMW for how to read the graph\l" tooltip="app"] }
+N1 [label="main\nmain.go:10\n0 of 0.20s (74.07%)" id="node1" fontsize=8 shape=box tooltip="main main.go:10 (0.20s)" color="#b20f00" fillcolor="#edd7d5"]
+N2 [label="b\nmain.go:30\n0.10s (37.04%)" id="node2" fontsize=24 shape=box tooltip="b main.go:30 (0.10s)" color="#b22d00" fillcolor="#eddbd5"]
+N3 [label="00000000007f0100\n[libx.so]\n0.06s (22.22%)" id="node3" fontsize=21 shape=box tooltip="00000000007f0100 [libx.so] (0.06s)" color="#b24000" fillcolor="#edded5"]
+N4 [label="a\nmain.go:20\n0.02s (7.41%)\nof 0.12s (44.44%)" id="node4" fontsize=16 shape=box tooltip="a main.go:20 (0.12s)" color="#b22600" fillcolor="#eddad5"]
+N5 [label="e\nmain.go:60\n0.04s (14.81%)" id="node5" fontsize=19 shape=box tooltip="e main.go:60 (0.04s)" color="#b2672e" fillcolor="#ede3db"]
+N6 [label="a\nmain.go:21\n0.03s (11.11%)\nof 0.04s (14.81%)" id="node6" fontsize=17 shape=box tooltip="a main.go:21 (0.04s)" color="#b2672e" fillcolor="#ede3db"]
+N7 [label="zz\nmain.go:70\n0.01s (3.70%)" id="node7" fontsize=14 shape=box tooltip="zz main.go:70 (0.01s)" color="#b2a691" fillcolor="#edebe8"]
+N8 [label="c\nmain.go:40\n0.01s (3.70%)" id="node8" fontsize=14 shape=box tooltip="c main.go:40 (0.01s)" color="#b2a691" fillcolor="#edebe8"]
+N9 [label="d\nmain.go:50\n0 of 0.04s (14.81%)" id="node9" fontsize=8 shape=box tooltip="d main.go:50 (0.04s)" color="#b2672e" fillcolor="#ede3db"]
+N1 -> N4 [label=" 0.12s" weight=45 penwidth=3 color="#b22600" tooltip="main main.go:10 -> a main.go:20 (0.12s)" labeltooltip="main main.go:10 -> a main.go:20 (0.12s)"]
+N4 -> N2 [label=" 0.10s" weight=38 penwidth=2 color="#b22d00" tooltip="a main.go:20 -> b main.go:30 (0.10s)" labeltooltip="a main.go:20 -> b main.go:30 (0.10s)"]
+N9 -> N5 [label=" 0.04s" weight=15 color="#b2672e" tooltip="d main.go:50 -> e main.go:60 (0.04s)" labeltooltip="d main.go:50 -> e main.go:60 (0.04s)"]
+N1 -> N6 [label=" 0.04s" weight=15 color="#b2672e" tooltip="main main.go:10 -> a main.go:21 (0.04s)" labeltooltip="main main.go:10 -> a main.go:21 (0.04s)"]
+N1 -> N9 [label=" 0.04s" weight=15 color="#b2672e" tooltip="main main.go:10 -> d main.go:50 (0.04s)" labeltooltip="main main.go:10 -> d main.go:50 (0.04s)"]
+N6 -> N8 [label=" 0.01s" weight=4 color="#b2a691" tooltip="a main.go:21 -> c main.go:40 (0.01s)" labeltooltip="a main.go:21 -> c main.go:40 (0.01s)"]
+}
