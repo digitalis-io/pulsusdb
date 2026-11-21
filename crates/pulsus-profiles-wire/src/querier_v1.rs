@@ -178,8 +178,8 @@ pub struct SelectMergeStacktracesResponse {
     )]
     pub tree: Vec<u8>,
     /// Issue #829 part B: the DOT text, with `PROFILE_FORMAT_DOT`.
-    // Stub: the tests come first.
-    #[prost(string, tag = "15")]
+    #[prost(string, tag = "3")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub dot: String,
     /// Issue #828: the merged profile, with `PROFILE_FORMAT_PPROF`.
     #[prost(message, optional, tag = "5")]
