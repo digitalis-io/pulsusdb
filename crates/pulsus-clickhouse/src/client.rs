@@ -309,6 +309,28 @@ impl ChClient {
         self.insert_parts_with(table, &[rows], extra).await
     }
 
+    /// Issue #830: one `INSERT … SELECT` whose rows the statement computes,
+    /// sent once on a write lease with the insert settings
+    /// (`insert_settings_with`: the quorum when configured, `async_insert`
+    /// off, the deadline) and `extra`. **Never retried**: the caller owns
+    /// what a repeat would do. A server error keeps its code, so a
+    /// statement may refuse itself with an error of its own choosing.
+    pub async fn insert_select(&self, sql: &str, extra: &QuerySettings) -> Result<(), ChError> {
+        let conn = self.pool.get(StatementClass::Write).await?;
+        let settings = Self::insert_settings_with(&self.consistency, self.default_timeout, extra);
+        let q = settings.apply_to_query(conn.client().query(sql));
+        let result = tokio::time::timeout(self.default_timeout, q.execute())
+            .await
+            .map_err(|_| {
+                ChError::Timeout(format!("insert_select exceeded {:?}", self.default_timeout))
+            })
+            .and_then(|inner| inner.map_err(ChError::from));
+        if let Err(ref e) = result {
+            conn.report_transport_failure(e);
+        }
+        result
+    }
+
     /// [`Self::insert_block_with`] over `parts`, written in order into one
     /// request as one block (issue #494 part 2: a landing batch is its
     /// members' rows, and no row is copied to join them).

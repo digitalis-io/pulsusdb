@@ -617,3 +617,166 @@ pub struct SelectHeatmapResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<crate::types_v1::HeatmapSeries>,
 }
+
+/// Issue #830: `AnalyzeQuery`'s request: a query and its window.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyzeQueryRequest {
+    #[prost(int64, tag = "2")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub start: i64,
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub end: i64,
+    #[prost(string, tag = "4")]
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub query: String,
+}
+
+/// Issue #830: `AnalyzeQuery`'s response.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyzeQueryResponse {
+    #[prost(message, repeated, tag = "1")]
+    #[serde(
+        rename = "queryScopes",
+        alias = "query_scopes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub query_scopes: Vec<QueryScope>,
+    #[prost(message, optional, tag = "2")]
+    #[serde(
+        rename = "queryImpact",
+        alias = "query_impact",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub query_impact: Option<QueryImpact>,
+}
+
+/// Issue #830: one component a query would read, and what it would read.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryScope {
+    #[prost(string, tag = "1")]
+    #[serde(
+        rename = "componentType",
+        alias = "component_type",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub component_type: String,
+    #[prost(uint64, tag = "2")]
+    #[serde(
+        rename = "componentCount",
+        alias = "component_count",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub component_count: u64,
+    #[prost(uint64, tag = "3")]
+    #[serde(
+        rename = "blockCount",
+        alias = "block_count",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub block_count: u64,
+    #[prost(uint64, tag = "4")]
+    #[serde(
+        rename = "seriesCount",
+        alias = "series_count",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub series_count: u64,
+    #[prost(uint64, tag = "5")]
+    #[serde(
+        rename = "profileCount",
+        alias = "profile_count",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub profile_count: u64,
+    #[prost(uint64, tag = "6")]
+    #[serde(
+        rename = "sampleCount",
+        alias = "sample_count",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub sample_count: u64,
+    #[prost(uint64, tag = "7")]
+    #[serde(
+        rename = "indexBytes",
+        alias = "index_bytes",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub index_bytes: u64,
+    #[prost(uint64, tag = "8")]
+    #[serde(
+        rename = "profileBytes",
+        alias = "profile_bytes",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub profile_bytes: u64,
+    #[prost(uint64, tag = "9")]
+    #[serde(
+        rename = "symbolBytes",
+        alias = "symbol_bytes",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub symbol_bytes: u64,
+}
+
+/// Issue #830: a query's impact in sum.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryImpact {
+    #[prost(uint64, tag = "2")]
+    #[serde(
+        rename = "totalBytesInTimeRange",
+        alias = "total_bytes_in_time_range",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub total_bytes_in_time_range: u64,
+    #[prost(uint64, tag = "3")]
+    #[serde(
+        rename = "totalQueriedSeries",
+        alias = "total_queried_series",
+        serialize_with = "crate::uint64::ser",
+        deserialize_with = "crate::uint64::de",
+        skip_serializing_if = "crate::uint64::is_zero"
+    )]
+    pub total_queried_series: u64,
+    #[prost(bool, tag = "4")]
+    #[serde(
+        rename = "deduplicationNeeded",
+        alias = "deduplication_needed",
+        skip_serializing_if = "is_false"
+    )]
+    pub deduplication_needed: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}

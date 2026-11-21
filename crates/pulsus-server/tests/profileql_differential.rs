@@ -9,6 +9,9 @@
 //! issue #826 part B the exemplars of the series and the heatmap (C39–C43)
 //! over that pair. Issue #828 adds the pprof export (C44–C49), compared
 //! decoded (rule R4). Issue #829 part B adds the DOT format (C50–C54).
+//! Issue #830 adds the exploration app's settings, the profile stats, the
+//! query analysis and the two services not served (C55–C63); a settings
+//! case runs its steps in order under a tenant of its own.
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -189,7 +192,45 @@ enum Tenancy {
     Absent,
     /// Run under `q1-<run>` and `q2-<run>`, the query fixture's pair.
     Query,
+    /// Issue #830: run once under `<case id>-<run>`, which holds nothing.
+    Own,
 }
+
+/// Issue #830: a settings call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Call {
+    Get,
+    Set,
+    Delete,
+}
+
+impl Call {
+    fn path(self) -> &'static str {
+        match self {
+            Call::Get => "/settings.v1.SettingsService/Get",
+            Call::Set => "/settings.v1.SettingsService/Set",
+            Call::Delete => "/settings.v1.SettingsService/Delete",
+        }
+    }
+}
+
+/// Issue #830: how a settings step's two answers are checked.
+#[derive(Debug, Clone, Copy)]
+enum StepExpect {
+    /// The JSON parity of every other case: status, `Content-Type`, body.
+    Same,
+    /// On each server: `200`, this setting, `modifiedAt` within the call.
+    Echo {
+        name: &'static str,
+        value: &'static str,
+    },
+    /// On each server: `200`, these settings in this order, each
+    /// `modifiedAt` within the case.
+    Listed(&'static [(&'static str, &'static str)]),
+}
+
+/// Issue #830: one settings step: the call, its JSON body, its check.
+type Step = (Call, &'static str, StepExpect);
 
 #[derive(Debug, Clone, Copy)]
 enum Window {
@@ -290,6 +331,14 @@ enum Method {
         selector: &'static str,
         max_nodes: Option<i64>,
     },
+    /// Issue #830: these settings calls, in order.
+    Settings(&'static [Step]),
+    /// Issue #830: `GetProfileStats`.
+    Stats,
+    /// Issue #830: `AnalyzeQuery` of the empty selector over `W`.
+    Analyze,
+    /// Issue #830: this path, a method of a service not served.
+    Unimplemented(&'static str),
 }
 
 impl Method {
@@ -313,6 +362,18 @@ impl Method {
             Method::LabelValuesGet(_) => "label-values",
             Method::RenderDot { .. } => "render",
             Method::Dot { .. } => "SelectMergeStacktraces",
+            Method::Settings(_) => "settings",
+            Method::Stats => "GetProfileStats",
+            Method::Analyze => "AnalyzeQuery",
+            Method::Unimplemented(path) => path,
+        }
+    }
+
+    /// Issue #830: the path of a method not under `QuerierService`.
+    fn path(&self) -> String {
+        match self {
+            Method::Unimplemented(path) => path.to_string(),
+            _ => format!("/querier.v1.QuerierService/{}", self.name()),
         }
     }
 
@@ -460,6 +521,18 @@ enum Fixture {
     /// Issue #829: a render-diff answer: this diff with the `cpu` metadata
     /// and no timeline.
     RenderDiff(&'static DiffGraph),
+    /// Issue #830: a stats answer: `dataIngested`, and with `hours` the
+    /// start of the UTC hour of the fixture's oldest profile and the last
+    /// millisecond of the hour of its newest; without, the newest exactly
+    /// and `oldestProfileTime` not compared.
+    Stats {
+        hours: bool,
+    },
+    /// Issue #830: an analysis answer of two scopes, `Short term storage`
+    /// and `Long term storage`.
+    Scopes,
+    /// Issue #830: `501` and this body.
+    Unimplemented(&'static str),
     /// Issue #829 part B: this DOT graph, the text of `render`, or the
     /// `dot` of a `SelectMergeStacktraces` answer with no flame graph and no
     /// tree.
@@ -509,6 +582,8 @@ enum Expect {
         ours: &'static [(&'static str, i64)],
         theirs: &'static [(&'static str, i64)],
     },
+    /// Issue #830: a settings case; its steps carry the checks.
+    Steps,
     /// Issue #829: a ledger case on a render answer: both answers are
     /// `Render(graph)`, and each timeline's one non-zero sample is at its
     /// own index.
@@ -565,6 +640,37 @@ const fn get_query(method: Method) -> Request {
         tenancy: Tenancy::Query,
     }
 }
+
+/// Issue #830: a JSON request under a tenant of the case's own.
+const fn own(method: Method) -> Request {
+    Request {
+        method,
+        encoding: Encoding::Json,
+        utf8: false,
+        tenancy: Tenancy::Own,
+    }
+}
+
+/// Issue #830: a JSON request under `t1` and `t2`.
+const fn json_both(method: Method) -> Request {
+    Request {
+        method,
+        encoding: Encoding::Json,
+        utf8: false,
+        tenancy: Tenancy::Both,
+    }
+}
+
+/// Issue #830: the answer to a recording rules method.
+const RULES_501: &[u8] = br#"{"code":"unimplemented","message":"recording rules are not served"}"#;
+
+/// Issue #830: the answer to a VCS method, the reference's own.
+const VCS_501: &str =
+    r#"{"code":"unimplemented","message":"GitHub integration is not configured"}"#;
+
+/// Issue #830: the fixture's newest profile under `t1` and `t2`, after its
+/// oldest (`pushes`: `at(1)`, and the last `/ingest` row's `from`).
+const STATS_SPAN_MS: i64 = 14_000;
 
 const fn merge(selector: &'static str, max_nodes: Option<i64>) -> Method {
     Method::Merge {
@@ -1578,6 +1684,128 @@ static CASES: &[Case] = &[
             max_nodes: Some(100),
         }),
         expect: Expect::Parity(Fixture::NoBody),
+    },
+    Case {
+        id: "C55",
+        client: "exploration app, settings page",
+        request: own(Method::Settings(&[
+            (Call::Get, "{}", StepExpect::Same),
+            (
+                Call::Set,
+                r#"{"setting":{"name":"pluginSettings","value":"{\"maxNodes\":16384}"}}"#,
+                StepExpect::Echo {
+                    name: "pluginSettings",
+                    value: r#"{"maxNodes":16384}"#,
+                },
+            ),
+            (
+                Call::Get,
+                "{}",
+                StepExpect::Listed(&[("pluginSettings", r#"{"maxNodes":16384}"#)]),
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C56",
+        client: "reference API",
+        request: own(Method::Settings(&[
+            (
+                Call::Set,
+                r#"{"setting":{"name":"b","value":"x","modifiedAt":"20"}}"#,
+                StepExpect::Same,
+            ),
+            (
+                Call::Set,
+                r#"{"setting":{"name":"a","value":"1","modifiedAt":"10"}}"#,
+                StepExpect::Same,
+            ),
+            (
+                Call::Set,
+                r#"{"setting":{"name":"a","value":"2","modifiedAt":"5"}}"#,
+                StepExpect::Same,
+            ),
+            (Call::Get, "{}", StepExpect::Same),
+            (Call::Delete, r#"{"name":"a"}"#, StepExpect::Same),
+            (Call::Get, "{}", StepExpect::Same),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C57",
+        client: "reference API",
+        request: own(Method::Settings(&[
+            (Call::Set, "{}", StepExpect::Same),
+            (Call::Delete, "{}", StepExpect::Same),
+            (Call::Delete, r#"{"name":"zz"}"#, StepExpect::Same),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C58",
+        client: "exploration app, onboarding",
+        request: own(Method::Stats),
+        expect: Expect::Parity(Fixture::Empty),
+    },
+    Case {
+        id: "C59",
+        client: "exploration app, onboarding",
+        request: json_both(Method::Stats),
+        expect: Expect::LedgerFixture {
+            row: "stats-bounds-are-hours",
+            ours: Fixture::Stats { hours: true },
+            theirs: Fixture::Stats { hours: false },
+        },
+    },
+    Case {
+        id: "C60",
+        client: "reference API",
+        request: json_both(Method::Analyze),
+        expect: Expect::LedgerFixture {
+            row: "analyze-query-is-not-computed",
+            ours: Fixture::Empty,
+            theirs: Fixture::Scopes,
+        },
+    },
+    Case {
+        id: "C61",
+        client: "exploration app, recording rules page",
+        request: own(Method::Unimplemented(
+            "/settings.v1.RecordingRulesService/ListRecordingRules",
+        )),
+        expect: Expect::Ledger {
+            row: "recording-rules-unimplemented",
+            ours: Pin {
+                status: 501,
+                body: Some(RULES_501),
+            },
+            theirs: Pin {
+                status: 404,
+                body: Some(b"404 page not found\n"),
+            },
+        },
+    },
+    Case {
+        id: "C62",
+        client: "exploration app, function details",
+        request: own(Method::Unimplemented("/vcs.v1.VCSService/GithubApp")),
+        expect: Expect::Parity(Fixture::Unimplemented(VCS_501)),
+    },
+    Case {
+        id: "C63",
+        client: "reference API",
+        request: own(Method::Unimplemented("/vcs.v1.VCSService/GetFile")),
+        expect: Expect::Ledger {
+            row: "vcs-get-file-unimplemented",
+            ours: Pin {
+                status: 501,
+                body: Some(VCS_501.as_bytes()),
+            },
+            theirs: Pin {
+                status: 401,
+                body: Some(br#"{"code":"unauthenticated","message":"invalid token"}"#),
+            },
+        },
     },
 ];
 
@@ -3314,10 +3542,57 @@ fn fixture_failure(
     start_ms: i64,
     res: &Res,
 ) -> Option<String> {
+    // Issue #830: the one fixture of an error answer.
+    if let Fixture::Unimplemented(body) = fixture {
+        return (res.status != 501 || res.body != body.as_bytes())
+            .then(|| format!("status {}, want 501 and {body}", res.status));
+    }
     if res.status != 200 {
         return Some(format!("status {}, want 200", res.status));
     }
     check_fixture(fixture, case, t1, start_ms, &res.body)
+}
+
+/// Issue #830: a stats or analysis answer against `fixture`; `start_ms` is
+/// the fixture's oldest profile time.
+fn app_failure(fixture: Fixture, start_ms: i64, body: &[u8]) -> Option<String> {
+    let v = match json_value(body) {
+        Some(v) => v,
+        None => return Some("not JSON".to_string()),
+    };
+    let ms = |k: &str| v[k].as_str().and_then(|s| s.parse::<i64>().ok());
+    match fixture {
+        Fixture::Empty => (v != json!({})).then(|| format!("{v}, want {{}}")),
+        Fixture::Stats { hours } => {
+            let newest = start_ms + STATS_SPAN_MS;
+            let hour = |t: i64| t.div_euclid(HOUR_MS) * HOUR_MS;
+            let want_newest = if hours {
+                hour(newest) + HOUR_MS - 1
+            } else {
+                newest
+            };
+            if v["dataIngested"] != json!(true) {
+                Some(format!("{v}: dataIngested is not true"))
+            } else if ms("newestProfileTime") != Some(want_newest) {
+                Some(format!("{v}: newestProfileTime, want {want_newest}"))
+            } else if hours && ms("oldestProfileTime") != Some(hour(start_ms)) {
+                Some(format!("{v}: oldestProfileTime, want {}", hour(start_ms)))
+            } else {
+                None
+            }
+        }
+        Fixture::Scopes => {
+            let got: Vec<&str> = v["queryScopes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|s| s["componentType"].as_str().unwrap_or(""))
+                .collect();
+            (got != ["Short term storage", "Long term storage"])
+                .then(|| format!("{v}: scopes {got:?}"))
+        }
+        other => Some(format!("{other:?} is not a stats or analysis fixture")),
+    }
 }
 
 /// Issue #828 (R4): the period each server writes.
@@ -3376,6 +3651,9 @@ fn check_fixture(
     let method = &case.request.method;
     let encoding = case.request.encoding;
     let b = unit(t1);
+    if matches!(method, Method::Stats | Method::Analyze) {
+        return app_failure(fixture, start_ms, body);
+    }
     match fixture {
         Fixture::Merged => {
             let sum: i64 = value_checks(t1)
@@ -3594,7 +3872,10 @@ fn check_fixture(
         | Fixture::Render(_)
         | Fixture::RenderDiff(_)
         | Fixture::Dot(_)
-        | Fixture::NoBody => None,
+        | Fixture::NoBody
+        | Fixture::Stats { .. }
+        | Fixture::Scopes
+        | Fixture::Unimplemented(_) => None,
     }
 }
 
@@ -3715,6 +3996,8 @@ struct Windows {
     r: (i64, i64),
     e: (i64, i64),
     x: (i64, i64),
+    /// Issue #830: the oldest profile time of the `t1` and `t2` fixture.
+    p: i64,
 }
 
 impl Windows {
@@ -3731,6 +4014,8 @@ impl Windows {
     fn case_start(&self, method: &Method) -> i64 {
         match method {
             Method::SelectSeries { over, .. } | Method::Heatmap { over, .. } => self.of(*over).0,
+            // Issue #830: the oldest profile of the `t1` and `t2` fixture.
+            Method::Stats => self.p,
             _ => self.q.0,
         }
     }
@@ -3807,6 +4092,10 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
             | Method::RenderDot { .. },
             _,
         ) => Vec::new(),
+        // Issue #830: built by `send`, or by its steps.
+        (Method::Settings(_) | Method::Stats | Method::Analyze | Method::Unimplemented(_), _) => {
+            panic!("{} has no body here", method.name())
+        }
         (
             Method::SelectSeries {
                 selector,
@@ -4091,7 +4380,19 @@ fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) 
             &[],
         );
     }
-    let body = request_body(&request.method, request.encoding, win);
+    let body = match request.method {
+        // Issue #830: the app's JSON bodies.
+        Method::Stats | Method::Unimplemented(_) => b"{}".to_vec(),
+        Method::Analyze => json!({
+            "start": win.w.0.to_string(),
+            "end": win.w.1.to_string(),
+            "query": "{}",
+        })
+        .to_string()
+        .into_bytes(),
+        Method::Settings(_) => panic!("a settings case sends its steps"),
+        _ => request_body(&request.method, request.encoding, win),
+    };
     let (content_type, accept) = match (request.encoding, request.utf8) {
         (Encoding::Proto, false) => ("application/proto", None),
         (Encoding::Proto, true) => ("application/proto", Some("*/*; allow-utf8-labelnames=true")),
@@ -4111,13 +4412,75 @@ fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) 
     if let Some(t) = tenant {
         headers.push(("X-Scope-OrgID", t));
     }
+    call(server, "POST", &request.method.path(), &headers, &body)
+}
+
+/// Issue #830: one settings step sent to `server` as `tenant`.
+fn send_step(server: &Server, tenant: &str, step: &Step) -> Res {
     call(
         server,
         "POST",
-        &format!("/querier.v1.QuerierService/{}", request.method.name()),
-        &headers,
-        &body,
+        step.0.path(),
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Scope-OrgID", tenant),
+        ],
+        step.1.as_bytes(),
     )
+}
+
+/// Issue #830: a settings answer's `(name, value, modifiedAt)`s: the one
+/// setting of a `Set`, or the list of a `Get`.
+fn settings_of(res: &Res) -> Result<Vec<(String, String, i64)>, String> {
+    let v = json_value(&res.body).ok_or_else(|| "not JSON".to_string())?;
+    let one = |s: &Value| -> Result<(String, String, i64), String> {
+        let text = |k: &str| s[k].as_str().unwrap_or("").to_string();
+        let m = s["modifiedAt"]
+            .as_str()
+            .and_then(|m| m.parse().ok())
+            .ok_or_else(|| format!("no modifiedAt in {s}"))?;
+        Ok((text("name"), text("value"), m))
+    };
+    if v.get("setting").is_some() {
+        return Ok(vec![one(&v["setting"])?]);
+    }
+    v["settings"]
+        .as_array()
+        .map(|a| a.iter().map(one).collect())
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+/// Issue #830: a settings step's answer against `expect` on one server,
+/// `None` when it holds. `call` is the step's own clock window, `case` the
+/// case's.
+fn step_failure(
+    expect: StepExpect,
+    res: &Res,
+    call: (i64, i64),
+    case: (i64, i64),
+) -> Option<String> {
+    let (want, within): (Vec<(&str, &str)>, (i64, i64)) = match expect {
+        StepExpect::Same => return None,
+        StepExpect::Echo { name, value } => (vec![(name, value)], call),
+        StepExpect::Listed(pairs) => (pairs.to_vec(), case),
+    };
+    if res.status != 200 {
+        return Some(format!("status {}, want 200", res.status));
+    }
+    let got = match settings_of(res) {
+        Ok(g) => g,
+        Err(e) => return Some(e),
+    };
+    let pairs: Vec<(&str, &str)> = got
+        .iter()
+        .map(|(n, v, _)| (n.as_str(), v.as_str()))
+        .collect();
+    if pairs != want {
+        return Some(format!("settings {pairs:?}, want {want:?}"));
+    }
+    got.iter()
+        .find(|(_, _, m)| !(within.0..=within.1).contains(m))
+        .map(|(n, _, m)| format!("{n}: modifiedAt {m} not in {within:?}"))
 }
 
 /// `LabelValues` proto for `rx` over `w`, as `tenant`.
@@ -4133,6 +4496,7 @@ fn rx_values(server: &Server, tenant: &str, w: (i64, i64)) -> Option<Vec<String>
             r: w,
             e: w,
             x: w,
+            p: w.0,
         },
     );
     if res.status != 200 {
@@ -4276,8 +4640,9 @@ fn parity(request: &Request, ours: &Res, theirs: &Res) -> Option<&'static str> {
     if ours.status != theirs.status {
         return Some("status differs");
     }
-    // Issue #829: a `GET` route's answer is compared byte for byte.
-    if request.method.is_get() {
+    // Issue #829: a `GET` route's answer is compared byte for byte, and
+    // issue #830's answers of a service not served.
+    if request.method.is_get() || matches!(request.method, Method::Unimplemented(_)) {
         return if ours.content_type != theirs.content_type {
             Some("Content-Type differs")
         } else if ours.body != theirs.body {
@@ -4626,6 +4991,7 @@ async fn profileql_matches_the_reference() {
         r: (w.0.div_euclid(15_000) * 15_000 + 14_999, w.1),
         e: (((t0_s + 1) * 1000).div_euclid(15_000) * 15_000 + 1, w.1),
         x: (e0_ms, e0_ms + 30_500),
+        p: (t0_s + 1) * 1000,
     };
     let mut mismatches = Mismatches::default();
 
@@ -4736,13 +5102,46 @@ async fn profileql_matches_the_reference() {
     eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
-    // §4: C0–C54.
+    // §4: C0–C63.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
+        let own = format!("{}-{run}", case.id.to_ascii_lowercase());
+        // Issue #830: a settings case's steps, in order, on each server.
+        if let Method::Settings(steps) = case.request.method {
+            let case_start = chrono::Utc::now().timestamp_millis();
+            for (i, step) in steps.iter().enumerate() {
+                let what = format!(
+                    "{} ({}, step {} {:?}) under {own}",
+                    case.id,
+                    case.client,
+                    i + 1,
+                    step.0
+                );
+                let before = chrono::Utc::now().timestamp_millis();
+                let a = send_step(&ours, &own, step);
+                let b = send_step(&reference, &own, step);
+                let after = chrono::Utc::now().timestamp_millis();
+                if let StepExpect::Same = step.2 {
+                    if let Some(why) = parity(&case.request, &a, &b) {
+                        mismatches.both(&what, why, &a, &b, "settings", Encoding::Json);
+                    }
+                    continue;
+                }
+                for (res, server) in [(&a, &ours), (&b, &reference)] {
+                    if let Some(why) =
+                        step_failure(step.2, res, (before, after), (case_start, after))
+                    {
+                        mismatches.one(&what, &format!("{}: {why}", server.name));
+                    }
+                }
+            }
+            continue;
+        }
         let tenants: Vec<(Option<&str>, bool)> = match case.request.tenancy {
             Tenancy::Both => vec![(Some(t1.as_str()), true), (Some(t2.as_str()), false)],
             Tenancy::Absent => vec![(None, true)],
             Tenancy::Query => vec![(Some(q1.as_str()), true), (Some(q2.as_str()), false)],
+            Tenancy::Own => vec![(Some(own.as_str()), true)],
         };
         let method = case.request.method.name();
         let enc = case.request.encoding;
@@ -4757,6 +5156,7 @@ async fn profileql_matches_the_reference() {
             let a = send(&ours, &case.request, tenant, win);
             let b = send(&reference, &case.request, tenant, win);
             match case.expect {
+                Expect::Steps => mismatches.one(&what, "a steps case is not a settings case"),
                 Expect::LedgerPprof {
                     row,
                     ours: po,

@@ -158,6 +158,7 @@ and for the one performance cliff it introduces.
 | Time series of profile values | `GET /api/profiles/v1/select_series` | M5 |
 | Merged pprof export | `GET /api/profiles/v1/export` | M5 |
 | Stats | `GET /api/profiles/v1/stats` | M5 |
+| Exploration app settings | `POST /api/profiles/v1/settings.v1.SettingsService/{Get,Set,Delete}` | M5 |
 | Render (flamebearer) | `GET /api/profiles/v1/render` | M5 |
 | Diff render | `GET /api/profiles/v1/render-diff` | M5 |
 | Label values, the reference's form | `GET /api/profiles/v1/label-values` | M5 |

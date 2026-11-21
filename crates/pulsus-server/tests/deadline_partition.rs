@@ -25,8 +25,8 @@
 //!
 //! ## The profiles query paths (issue #821)
 //!
-//! Two more classes: the sixteen profiles Connect paths answer the reference's
-//! Connect error (`DEADLINE_CONNECT_PATHS`), and the twelve profiles `GET`
+//! Two more classes: the profiles Connect paths answer the reference's
+//! Connect error (`DEADLINE_CONNECT_PATHS`), and the profiles `GET`
 //! paths answer as the reference's HTTP read handlers do
 //! (`DEADLINE_PROFILES_HTTP_PATHS`). Both constants are source-scanned and
 //! compared with the manifest's `ProfilesConnect` and `ProfilesQuery` rows
@@ -154,8 +154,8 @@ fn the_two_classes_partition_the_mounted_prefix_exactly_once() {
     assert_eq!(envelope.len() + kept_bare.len(), mounted_api_v1().len());
 }
 
-/// Issue #821 (#823, #824, #827 and #825 add two each): the sixteen profiles
-/// Connect paths, which answer a deadline breach with the Connect
+/// Issue #821 (#823, #824, #827, #825 and #828 add two each; #830 ten paths
+/// and four `{name}` templates): the profiles Connect paths, which answer a deadline breach with the Connect
 /// `deadline_exceeded` body.
 const CONNECT_PATHS: &[&str] = &[
     "/querier.v1.QuerierService/ProfileTypes",
@@ -176,11 +176,25 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
     "/querier.v1.QuerierService/SelectMergeProfile",
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
+    "/api/profiles/v1/settings.v1.SettingsService/Get",
+    "/settings.v1.SettingsService/Get",
+    "/api/profiles/v1/settings.v1.SettingsService/Set",
+    "/settings.v1.SettingsService/Set",
+    "/api/profiles/v1/settings.v1.SettingsService/Delete",
+    "/settings.v1.SettingsService/Delete",
+    "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
+    "/querier.v1.QuerierService/GetProfileStats",
+    "/api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery",
+    "/querier.v1.QuerierService/AnalyzeQuery",
+    "/api/profiles/v1/settings.v1.RecordingRulesService/{name}",
+    "/settings.v1.RecordingRulesService/{name}",
+    "/api/profiles/v1/vcs.v1.VCSService/{name}",
+    "/vcs.v1.VCSService/{name}",
 ];
 
 /// Issue #821 (#823 adds `/merge`, #824 `/select_series`, #828 `/export`, #829
-/// the three render routes and their three compat paths): the thirteen
-/// profiles `GET` routes, which answer it as the reference's HTTP read
+/// the three render routes and their three compat paths, #830 `/stats`): the
+/// fourteen profiles `GET` routes, which answer it as the reference's HTTP read
 /// handlers do.
 const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/types",
@@ -196,6 +210,7 @@ const PROFILES_HTTP_PATHS: &[&str] = &[
     "/pyroscope/render",
     "/pyroscope/render-diff",
     "/pyroscope/label-values",
+    "/api/profiles/v1/stats",
 ];
 
 fn mounted_of(surface: Surface) -> BTreeSet<String> {

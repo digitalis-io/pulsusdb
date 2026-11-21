@@ -9,6 +9,9 @@ use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
 use crate::logql::exec::escape_query_placeholders;
 use crate::traces::tenant_scope::TenantTerm;
 
+use pulsus_clickhouse::ChError;
+
+use super::app::Written;
 use super::engine::{ProfilesReadError, map_read_error};
 
 /// The profiles read path's ClickHouse handle, one per engine.
@@ -59,5 +62,64 @@ impl ProfileDispatch {
             out.push(row.map_err(map_read_error)?);
         }
         Ok(out)
+    }
+
+    /// Issue #830: executes one settings write, S13-W, after the same three
+    /// steps as [`Self::rows`]. One attempt, never retried.
+    pub(super) async fn write(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+    ) -> Result<Written, ProfilesReadError> {
+        let sql = escape_query_placeholders(sql);
+        crate::querytext::ensure_query_text_fits(&sql)
+            .map_err(|_| ProfilesReadError::TooBroad("query_too_broad: query text".to_string()))?;
+        super::tenant_scope::check(&sql, &self.term, &self.tables)
+            .map_err(ProfilesReadError::Internal)?;
+        written(self.client.insert_select(&sql, settings).await)
+    }
+}
+
+/// ClickHouse's `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`: S13-W's guard
+/// refused the write.
+const CODE_THROW_IF: i32 = 395;
+
+/// Issue #830: a settings write's outcome: the guard's error is a refusal,
+/// any other error keeps its class.
+pub(super) fn written(result: Result<(), ChError>) -> Result<Written, ProfilesReadError> {
+    match result {
+        Ok(()) => Ok(Written::Stored),
+        Err(ChError::Server {
+            code: CODE_THROW_IF,
+            ..
+        }) => Ok(Written::Refused),
+        Err(e) => Err(map_read_error(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A4: the guard's `throwIf` (395) is a refusal, not a failure; any
+    /// other error keeps its class.
+    #[test]
+    fn a4_refusal_maps() {
+        let server = |code: i32| ChError::Server {
+            code,
+            message: format!("Code: {code}. DB::Exception: x"),
+        };
+        assert_eq!(written(Ok(())), Ok(Written::Stored));
+        assert_eq!(written(Err(server(395))), Ok(Written::Refused));
+        assert_eq!(
+            written(Err(server(158))),
+            Err(ProfilesReadError::TooBroad(
+                "query_too_broad: PULSUS_PROFILES_SCAN_BUDGET_ROWS".to_string()
+            ))
+        );
+        assert!(matches!(
+            written(Err(server(60))),
+            Err(ProfilesReadError::Internal(_))
+        ));
     }
 }

@@ -39,7 +39,7 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 | D17 | The query ranges at which the resolution switches to each level, and the counter bucket count, are set when the schema is built and stored in each level table's comment, where the server reads them | owner (2026-10-26) | `building.md` §1, `reading.md` §2 |
 | D18 | A level's `sum` and `inc` may differ from build to build by whatever the order of addition produces, as today's builds do; on terms that cancel the difference can be large relative to a small result. Every other column is fixed by the source rows | owner (2026-11-09) | `building.md` §3.2 |
 
-**How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:758`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:1077`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
+**How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:772`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:1091`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
 
 ## 2. Parts
 

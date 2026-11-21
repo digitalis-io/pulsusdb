@@ -835,6 +835,10 @@ fn undocumented_method(spec: &RouteSpec) -> &'static str {
     "DELETE"
 }
 
+/// Issue #830: the tenant the stats routes are asked for, which no cell
+/// pushes to.
+const STATS_TENANT: &str = "conformance-stats";
+
 /// Builds the "valid" request for `spec`'s success-status assertion:
 /// `GET` with `base_query` as the query string, `POST` with `base_query`
 /// as an `application/x-www-form-urlencoded` body — `Surface::Ingest`
@@ -846,6 +850,14 @@ fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
         "ingest routes build their own bodies"
     );
     let mut req = manifest::Req::new(method.as_str(), resolve_path(spec.path));
+    // Issue #830: the stats answer every profile the tenant holds, and the
+    // ingest cells of the same spawn push profiles as the empty tenant, so
+    // the stats are asked for a tenant nothing pushes to: on it the answer
+    // is exactly `{}`.
+    if spec.path.ends_with("/GetProfileStats") || spec.path == "/api/profiles/v1/stats" {
+        req.headers
+            .push(("x-scope-orgid", STATS_TENANT.to_string()));
+    }
     if spec.surface == Surface::ProfilesConnect {
         // Issue #821: a Connect call's request is a JSON body.
         req.content_type = Some("application/json");
@@ -987,6 +999,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // the reference answers an empty window. Issue #827: the diff
             // paths answer the empty diff. Issue #829: the render routes answer
             // the empty flamebearer, and `label-values` reads the last hour.
+            // Issue #830: the settings, stats and analysis paths answer `{}`,
+            // a `Set` its setting, and the two services not served `501`.
             assert_eq!(
                 res.content_type(),
                 Some("application/json"),
@@ -1017,6 +1031,15 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             } else if spec.path.ends_with("/label-values") {
                 // Issue #829: the last hour of an empty database.
                 "null\n".to_string()
+            } else if spec.path.ends_with("/settings.v1.SettingsService/Set") {
+                // Issue #830: the setting as stored.
+                manifest::PROFILES_SETTINGS_SET_BODY.to_string()
+            } else if spec.path.contains("/settings.v1.RecordingRulesService/") {
+                // Issue #830: not served.
+                r#"{"code":"unimplemented","message":"recording rules are not served"}"#.to_string()
+            } else if spec.path.contains("/vcs.v1.VCSService/") {
+                r#"{"code":"unimplemented","message":"GitHub integration is not configured"}"#
+                    .to_string()
             } else {
                 "{}".to_string()
             };
@@ -1782,7 +1805,12 @@ fn assert_full_route_matrix(port: u16, spec: &RouteSpec, spawn: &str) {
     assert_405_with_allow(&res, &ctx, spec.methods);
 
     let ctx = format!("[{spawn}] GET {} case=sibling-nonexistent-404", spec.path);
-    let sibling = format!("{}-conformance-nonexistent", resolve_path(spec.path));
+    // Issue #830: a template ending in `{name}` takes any last segment, so
+    // its sibling differs in the segment before it.
+    let sibling = match spec.path.strip_suffix("/{name}") {
+        Some(head) => format!("{head}-conformance-nonexistent/env"),
+        None => format!("{}-conformance-nonexistent", resolve_path(spec.path)),
+    };
     let res = get(port, &sibling, &ctx);
     assert_404_empty(&res, &ctx);
 

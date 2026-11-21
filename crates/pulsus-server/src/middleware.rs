@@ -64,7 +64,9 @@ pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 /// Issue #821: the profiles Connect paths, named one by one (#823 adds
 /// `SelectMergeStacktraces`'s two, #824 `SelectSeries`'s two, #827
 /// `Diff`'s two, #825 `SelectHeatmap`'s two, #828 `SelectMergeProfile`'s
-/// two). They
+/// two, #830 the settings service's six, `GetProfileStats`' and
+/// `AnalyzeQuery`'s two each, and the two unimplemented services' four
+/// `{name}` templates, one segment). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -87,6 +89,20 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
     "/querier.v1.QuerierService/SelectMergeProfile",
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
+    "/settings.v1.SettingsService/Get",
+    "/api/profiles/v1/settings.v1.SettingsService/Get",
+    "/settings.v1.SettingsService/Set",
+    "/api/profiles/v1/settings.v1.SettingsService/Set",
+    "/settings.v1.SettingsService/Delete",
+    "/api/profiles/v1/settings.v1.SettingsService/Delete",
+    "/querier.v1.QuerierService/GetProfileStats",
+    "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
+    "/querier.v1.QuerierService/AnalyzeQuery",
+    "/api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery",
+    "/settings.v1.RecordingRulesService/{name}",
+    "/api/profiles/v1/settings.v1.RecordingRulesService/{name}",
+    "/vcs.v1.VCSService/{name}",
+    "/api/profiles/v1/vcs.v1.VCSService/{name}",
 ];
 
 /// Issue #816: the four OTLP gRPC export paths. They answer a deadline
@@ -102,7 +118,7 @@ pub(crate) const DEADLINE_GRPC_PATHS: &[&str] = &[
 
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
 /// adds `/merge`, #824 `/select_series`, #828 `/export`, #829 the three
-/// render routes and their compat paths).
+/// render routes and their compat paths, #830 `/stats`).
 /// They answer a deadline as the reference's HTTP read handlers answer one
 /// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
 /// [`DEADLINE_CONNECT_PATHS`].
@@ -120,6 +136,7 @@ pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/pyroscope/render",
     "/pyroscope/render-diff",
     "/pyroscope/label-values",
+    "/api/profiles/v1/stats",
 ];
 
 /// `path` matches `template`, whose one `{name}` is a non-empty segment.
@@ -568,10 +585,11 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823, #824, #827, #825, #828, #829): the eighteen Connect
-    /// paths answer a deadline as a Connect error, the thirteen `GET` paths
-    /// (`{name}` as `env`) as the reference's HTTP handlers do; the profiles
-    /// ingest path keeps the bare `408`.
+    /// C6 (issue #821, #823, #824, #827, #825, #828, #829, #830): the
+    /// twenty-eight Connect paths and the four unimplemented services'
+    /// methods answer a deadline as a Connect error, the fourteen `GET`
+    /// paths (`{name}` as `env`) as the reference's HTTP handlers do; the
+    /// profiles ingest path keeps the bare `408`.
     #[test]
     fn c6_the_profiles_query_paths_answer_a_connect_deadline() {
         for path in [
@@ -593,6 +611,20 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
             "/querier.v1.QuerierService/SelectMergeProfile",
             "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
+            "/settings.v1.SettingsService/Get",
+            "/settings.v1.SettingsService/Set",
+            "/settings.v1.SettingsService/Delete",
+            "/api/profiles/v1/settings.v1.SettingsService/Get",
+            "/api/profiles/v1/settings.v1.SettingsService/Set",
+            "/api/profiles/v1/settings.v1.SettingsService/Delete",
+            "/querier.v1.QuerierService/GetProfileStats",
+            "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
+            "/querier.v1.QuerierService/AnalyzeQuery",
+            "/api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery",
+            "/settings.v1.RecordingRulesService/ListRecordingRules",
+            "/api/profiles/v1/settings.v1.RecordingRulesService/UpsertRecordingRule",
+            "/vcs.v1.VCSService/GithubApp",
+            "/api/profiles/v1/vcs.v1.VCSService/GetFile",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -610,6 +642,7 @@ mod tests {
             "/pyroscope/render",
             "/pyroscope/render-diff",
             "/pyroscope/label-values",
+            "/api/profiles/v1/stats",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
@@ -619,20 +652,20 @@ mod tests {
         );
     }
 
-    /// Issue #821 review note 1: the class names the eighteen Connect paths
+    /// Issue #821 review note 1: the class names the Connect paths
     /// exactly. Another method under either service prefix, and a deeper
     /// path under the values route, keep the class they had.
     #[test]
     fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
         for path in [
-            "/querier.v1.QuerierService/GetProfileStats",
             "/querier.v1.QuerierService/LabelNamesX",
-            "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
             "/api/profiles/v1/querier.v1.QuerierService/",
             "/api/profiles/v1/render/x",
             "/api/profiles/v1/label/a/b/values",
             "/api/profiles/v1/label//values",
-            "/settings.v1.SettingsService/Get",
+            "/settings.v1.SettingsService/GetX",
+            "/vcs.v1.VCSService/",
+            "/vcs.v1.VCSService/a/b",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Bare, "{path}");
         }

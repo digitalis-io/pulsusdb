@@ -15,6 +15,11 @@
 //! `SelectMergeStacktracesResponse.pprof`. Issue #829 part B:
 //! `SelectMergeStacktracesResponse.dot`.
 //!
+//! W13 (issue #830): the settings messages against
+//! `proto/settings/v1/setting.proto`, and `GetProfileStats`' and
+//! `AnalyzeQuery`'s against `proto/types/v1/types.proto` and
+//! `proto/querier/v1/querier.proto`.
+//!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
 //! `proto/push/v1/push.proto`.
@@ -26,15 +31,21 @@ use pulsus_profiles_wire::google_v1::{
 };
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
-    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, PprofProfile, ProfileFormat,
-    ProfileTypesRequest, ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
+    AnalyzeQueryRequest, AnalyzeQueryResponse, DiffRequest, DiffResponse, FlameGraph,
+    FlameGraphDiff, Level, PprofProfile, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
+    QueryImpact, QueryScope, SelectHeatmapRequest, SelectHeatmapResponse,
     SelectMergeProfileRequest, SelectMergeStacktracesRequest, SelectMergeStacktracesResponse,
     SelectSeriesRequest, SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
+use pulsus_profiles_wire::settings_v1::{
+    DeleteSettingsRequest, DeleteSettingsResponse, GetSettingsRequest, GetSettingsResponse,
+    SetSettingsRequest, SetSettingsResponse, Setting,
+};
 use pulsus_profiles_wire::types_v1::{
-    Exemplar, GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
-    LabelValuesRequest, LabelValuesResponse, Labels, Location as CallSite, Point,
-    ProfileAnnotation, ProfileType, Series, StackTraceSelector,
+    Exemplar, GetProfileStatsRequest, GetProfileStatsResponse, GoPgo, HeatmapSeries, HeatmapSlot,
+    LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest, LabelValuesResponse,
+    Labels, Location as CallSite, Point, ProfileAnnotation, ProfileType, Series,
+    StackTraceSelector,
 };
 
 fn value_type() -> ValueType {
@@ -947,4 +958,154 @@ fn every_pprof_message_field_encodes_under_the_proto_tag() {
     let mut b = Vec::new();
     nested(5, &inner, &mut b);
     assert_eq!(r.encode_to_vec(), b, "SelectMergeStacktracesResponse.pprof");
+}
+
+fn setting() -> Setting {
+    Setting {
+        name: "pluginSettings".to_string(),
+        value: "{\"maxNodes\":16384}".to_string(),
+        modified_at: 1_795_202_879_000,
+    }
+}
+
+fn setting_bytes(s: &Setting) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &s.name, &mut b);
+    encoding::string::encode(2, &s.value, &mut b);
+    encoding::int64::encode(3, &s.modified_at, &mut b);
+    b
+}
+
+fn scope() -> QueryScope {
+    QueryScope {
+        component_type: "Short term storage".to_string(),
+        component_count: 2,
+        block_count: 3,
+        series_count: 4,
+        profile_count: 5,
+        sample_count: 6,
+        index_bytes: 7,
+        profile_bytes: 8,
+        symbol_bytes: 9,
+    }
+}
+
+fn scope_bytes(s: &QueryScope) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &s.component_type, &mut b);
+    for (tag, v) in [
+        (2, s.component_count),
+        (3, s.block_count),
+        (4, s.series_count),
+        (5, s.profile_count),
+        (6, s.sample_count),
+        (7, s.index_bytes),
+        (8, s.profile_bytes),
+        (9, s.symbol_bytes),
+    ] {
+        encoding::uint64::encode(tag, &v, &mut b);
+    }
+    b
+}
+
+fn impact() -> QueryImpact {
+    QueryImpact {
+        total_bytes_in_time_range: 10,
+        total_queried_series: 11,
+        deduplication_needed: true,
+    }
+}
+
+fn impact_bytes(i: &QueryImpact) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint64::encode(2, &i.total_bytes_in_time_range, &mut b);
+    encoding::uint64::encode(3, &i.total_queried_series, &mut b);
+    encoding::bool::encode(4, &i.deduplication_needed, &mut b);
+    b
+}
+
+/// **W13** (issue #830): the settings messages, `GetProfileStats`' and
+/// `AnalyzeQuery`'s, every field set, against the vendored `.proto` files'
+/// tags.
+#[test]
+fn every_settings_stats_and_analysis_field_encodes_under_the_proto_tag() {
+    let s = setting();
+    check("Setting", &s, setting_bytes(&s));
+    check("GetSettingsRequest", &GetSettingsRequest {}, Vec::new());
+    let mut b = Vec::new();
+    nested(1, &setting_bytes(&s), &mut b);
+    nested(1, &setting_bytes(&s), &mut b);
+    check(
+        "GetSettingsResponse",
+        &GetSettingsResponse {
+            settings: vec![setting(), setting()],
+        },
+        b,
+    );
+    let mut b = Vec::new();
+    nested(1, &setting_bytes(&s), &mut b);
+    check(
+        "SetSettingsRequest",
+        &SetSettingsRequest {
+            setting: Some(setting()),
+        },
+        b.clone(),
+    );
+    check(
+        "SetSettingsResponse",
+        &SetSettingsResponse {
+            setting: Some(setting()),
+        },
+        b,
+    );
+    let d = DeleteSettingsRequest {
+        name: "pluginSettings".to_string(),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(1, &d.name, &mut b);
+    check("DeleteSettingsRequest", &d, b);
+    check(
+        "DeleteSettingsResponse",
+        &DeleteSettingsResponse {},
+        Vec::new(),
+    );
+
+    check(
+        "GetProfileStatsRequest",
+        &GetProfileStatsRequest {},
+        Vec::new(),
+    );
+    let r = GetProfileStatsResponse {
+        data_ingested: true,
+        oldest_profile_time: 1_794_873_600_000,
+        newest_profile_time: 1_795_132_799_999,
+    };
+    let mut b = Vec::new();
+    encoding::bool::encode(1, &r.data_ingested, &mut b);
+    encoding::int64::encode(2, &r.oldest_profile_time, &mut b);
+    encoding::int64::encode(3, &r.newest_profile_time, &mut b);
+    check("GetProfileStatsResponse", &r, b);
+
+    let q = AnalyzeQueryRequest {
+        start: 1000,
+        end: 2000,
+        query: "{service_name=\"a\"}".to_string(),
+    };
+    let mut b = Vec::new();
+    encoding::int64::encode(2, &q.start, &mut b);
+    encoding::int64::encode(3, &q.end, &mut b);
+    encoding::string::encode(4, &q.query, &mut b);
+    check("AnalyzeQueryRequest", &q, b);
+    let sc = scope();
+    check("QueryScope", &sc, scope_bytes(&sc));
+    let im = impact();
+    check("QueryImpact", &im, impact_bytes(&im));
+    let a = AnalyzeQueryResponse {
+        query_scopes: vec![scope()],
+        query_impact: Some(impact()),
+    };
+    let mut b = Vec::new();
+    nested(1, &scope_bytes(&sc), &mut b);
+    nested(2, &impact_bytes(&im), &mut b);
+    check("AnalyzeQueryResponse", &a, b);
 }

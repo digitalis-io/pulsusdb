@@ -1176,7 +1176,7 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<&str> =
             ROUTE_TEMPLATES.iter().copied().chain([UNMATCHED]).collect();
-        assert_eq!(expected.len(), 121);
+        assert_eq!(expected.len(), 136);
         assert_eq!(seen, expected, "{s}");
     }
 

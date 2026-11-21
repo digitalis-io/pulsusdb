@@ -13,7 +13,10 @@
 //! two enums, in the shape of `profile_format`. Issue #825:
 //! `heatmap_query_type`, and `double`'s repeated form. Issue #828: the
 //! pprof `Profile`'s JSON mapping, and `uint64`, a `uint64` field's JSON
-//! form. Issue #829: `flamebearer`, the render routes' JSON answer.
+//! form. Issue #829: `flamebearer`, the render routes' JSON answer. Issue
+//! #830: `settings_v1`, the exploration app's settings
+//! (`proto/settings/v1/setting.proto`, kept verbatim), and the stats and
+//! query analysis messages of `types_v1` and `querier_v1`.
 
 pub mod connect;
 pub mod flamebearer;
@@ -22,6 +25,7 @@ pub mod int64;
 mod json;
 pub mod push_v1;
 pub mod querier_v1;
+pub mod settings_v1;
 pub mod types_v1;
 pub mod uint64;
 
