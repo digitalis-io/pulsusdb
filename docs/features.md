@@ -168,7 +168,7 @@ and for the one performance cliff it introduces.
 | Render: flame graph and timeline, or DOT with `format=dot` | `GET /api/profiles/v1/render` | M5 |
 | Diff render | `GET /api/profiles/v1/render-diff` | M5 |
 | Label values, the reference's form | `GET /api/profiles/v1/label-values` | M5 |
-| The same methods and render routes at their compatibility paths ([api.md §5](api.md)) | flag-gated (`PULSUS_COMPAT_ENDPOINTS`) | M5 |
+| The same Connect methods, and `render`, `render-diff` and `label-values`, at their compatibility paths ([api.md §5](api.md)) | flag-gated (`PULSUS_COMPAT_ENDPOINTS`) | M5 |
 
 ## 6. Platform features
 

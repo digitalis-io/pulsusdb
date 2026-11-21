@@ -1295,6 +1295,14 @@ mod tests {
             compat_endpoints: true,
             ..Config::default()
         };
+        // The answer `docs/api.md`'s conventions state, which this test pins.
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/api.md"))
+                .expect("read docs/api.md");
+        assert!(
+            docs.contains("and a method a path does not serve is `405` with an empty body."),
+            "docs/api.md no longer states the profiles routes' 405 as an empty body"
+        );
         let router = build_router(test_state(), &cfg).expect("router builds");
         for (method, path) in [
             (Method::POST, "/api/profiles/v1/types"),
