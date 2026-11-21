@@ -92,7 +92,7 @@ clickhouse:
   #profile_landing_inserters: 4   # insert workers on the profiles landing queue
   #profile_landing_max_rows: 1048576   # per-push landing row ceiling
   #profile_max_body_bytes: 256MiB      # largest OTLP profiles request body; 0 is no cap
-  #landing_batch_ms: 1000        # log and trace batch window; 0 sends every push alone
+  #landing_batch_ms: 1000        # log, trace and profiles batch window; 0 sends every push alone
 
 #reader:
   #cache_ttl: 60s
