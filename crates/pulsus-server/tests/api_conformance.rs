@@ -854,7 +854,14 @@ fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
     // ingest cells of the same spawn push profiles as the empty tenant, so
     // the stats are asked for a tenant nothing pushes to: on it the answer
     // is exactly `{}`.
-    if spec.path.ends_with("/GetProfileStats") || spec.path == "/api/profiles/v1/stats" {
+    // Issue #831: likewise `List` of the ad hoc uploads, which the
+    // `Upload` cells store under the empty tenant.
+    if spec.path.ends_with("/GetProfileStats")
+        || spec.path == "/api/profiles/v1/stats"
+        || spec
+            .path
+            .ends_with("/adhocprofiles.v1.AdHocProfileService/List")
+    {
         req.headers
             .push(("x-scope-orgid", STATS_TENANT.to_string()));
     }
@@ -1008,7 +1015,50 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             );
             const EMPTY_FLAME_GRAPH: &str =
                 r#"{"names":["total"],"levels":[{"values":["0","0","0","0"]}]}"#;
-            let expected = if spec.path.ends_with("/SelectMergeStacktraces") {
+            // Issue #831: an upload answers its id, time and flame graph;
+            // the zero id is not found by `Get` or `Diff`; `List` of a tenant
+            // with no upload is `{}`.
+            if spec
+                .path
+                .ends_with("/adhocprofiles.v1.AdHocProfileService/Upload")
+            {
+                let mut got: serde_json::Value = serde_json::from_slice(&res.body)
+                    .unwrap_or_else(|e| panic!("{ctx}: the upload answer is not JSON: {e}"));
+                let id = got["id"].as_str().unwrap_or_default().to_string();
+                assert_eq!(id.len(), 36, "{ctx}: the upload's id: {got}");
+                assert!(
+                    got["uploadedAt"]
+                        .as_str()
+                        .is_some_and(|t| t.parse::<i64>().is_ok()),
+                    "{ctx}: uploadedAt: {got}"
+                );
+                let fields = got.as_object_mut().expect("an object");
+                fields.remove("id");
+                fields.remove("uploadedAt");
+                assert_eq!(
+                    got,
+                    serde_json::json!({
+                        "name": "c.txt",
+                        "profileType": "c.txt",
+                        "profileTypes": ["c.txt"],
+                        "flamebearerProfile": manifest::PROFILES_ADHOC_UPLOAD_FLAMEBEARER,
+                    }),
+                    "{ctx}: profiles body"
+                );
+                return;
+            }
+            let zero = "00000000-0000-0000-0000-000000000000";
+            let expected = if spec
+                .path
+                .ends_with("/adhocprofiles.v1.AdHocProfileService/Get")
+            {
+                format!(r#"{{"code":"not_found","message":"profile {zero} not found"}}"#)
+            } else if spec
+                .path
+                .ends_with("/adhocprofiles.v1.AdHocProfileService/Diff")
+            {
+                format!(r#"{{"code":"not_found","message":"left profile {zero} not found"}}"#)
+            } else if spec.path.ends_with("/SelectMergeStacktraces") {
                 format!(r#"{{"flamegraph":{EMPTY_FLAME_GRAPH}}}"#)
             } else if spec.path.ends_with("/Diff") {
                 r#"{"flamegraph":{"names":["total"],"levels":[{"values":["0","0","0","0","0","0","0"]}]}}"#

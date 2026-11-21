@@ -1262,6 +1262,134 @@ fn every_mounted_route_is_documented_in_docs_api_md() {
     );
 }
 
+/// Splits a table row on `|` not preceded by `\`.
+fn split_table_row(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut prev = '\0';
+    for c in line.chars() {
+        if c == '|' && prev != '\\' {
+            cells.push(std::mem::take(&mut cell));
+        } else {
+            cell.push(c);
+        }
+        prev = c;
+    }
+    cells.push(cell);
+    cells
+}
+
+/// The (method, path) pairs one Endpoint cell of `docs/features.md` §5
+/// names: every backtick span with a leading method, its first `{…}`
+/// group holding a comma expanded into one path per member.
+fn features_endpoint_pairs(cell: &str) -> Vec<(Method, String)> {
+    let mut pairs = Vec::new();
+    for (i, span) in cell.split('`').enumerate() {
+        if i % 2 == 0 {
+            continue;
+        }
+        let (methods, rest) = if let Some(rest) = span.strip_prefix("GET\\|POST ") {
+            (vec![Method::Get, Method::Post], rest)
+        } else if let Some(rest) = span.strip_prefix("GET ") {
+            (vec![Method::Get], rest)
+        } else if let Some(rest) = span.strip_prefix("POST ") {
+            (vec![Method::Post], rest)
+        } else {
+            continue;
+        };
+        if !rest.starts_with('/') {
+            continue;
+        }
+        let path = rest.split('?').next().unwrap_or(rest);
+        let mut paths = vec![path.to_string()];
+        let mut search = 0;
+        let mut expanded = false;
+        while let Some(rel) = path[search..].find('{') {
+            let open = search + rel;
+            let close = open
+                + path[open..]
+                    .find('}')
+                    .unwrap_or_else(|| panic!("unclosed `{{` in features.md §5 span {span:?}"));
+            let group = &path[open + 1..close];
+            if group.contains(',') {
+                assert!(
+                    !expanded,
+                    "features.md §5 span {span:?} has a second `{{…}}` group with a comma"
+                );
+                expanded = true;
+                paths = group
+                    .split(',')
+                    .map(|member| format!("{}{member}{}", &path[..open], &path[close + 1..]))
+                    .collect();
+            }
+            search = close + 1;
+        }
+        for method in methods {
+            for p in &paths {
+                pairs.push((method, p.clone()));
+            }
+        }
+    }
+    pairs
+}
+
+/// #833: `docs/features.md` §5 names exactly the mounted native profiles
+/// query routes, as (method, path) pairs, both ways.
+#[test]
+fn features_md_section_5_names_exactly_the_mounted_native_profiles_routes() {
+    let text = fs::read_to_string(workspace_root().join("docs/features.md"))
+        .expect("read docs/features.md");
+    let mut in_section = false;
+    let mut header_seen = false;
+    let mut documented = BTreeSet::new();
+    for line in text.lines() {
+        if line == "## 5. Query — profiles" {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if line.starts_with("## ") {
+            break;
+        }
+        if !line.starts_with("| ") {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            continue;
+        }
+        let cells = split_table_row(line);
+        let endpoint = cells
+            .get(2)
+            .unwrap_or_else(|| panic!("features.md §5 row without an Endpoint cell: {line:?}"));
+        documented.extend(features_endpoint_pairs(endpoint));
+    }
+    assert!(
+        in_section,
+        "docs/features.md has no `## 5. Query — profiles`"
+    );
+
+    let expected: BTreeSet<(Method, String)> = manifest_mounted_set()
+        .into_iter()
+        .filter(|(_, path)| {
+            path.starts_with("/api/profiles/v1/") && path != "/api/profiles/v1/ingest"
+        })
+        .collect();
+    let show = |set: Vec<&(Method, String)>| -> Vec<String> {
+        set.into_iter()
+            .map(|(m, p)| format!("{} {p}", m.as_str()))
+            .collect()
+    };
+    let missing = show(expected.difference(&documented).collect());
+    let extra = show(documented.difference(&expected).collect());
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "mounted, not in features.md §5: {missing:?}\nin features.md §5, not mounted: {extra:?}"
+    );
+}
+
 mod loki_alias_boundary_tests {
     use super::*;
 

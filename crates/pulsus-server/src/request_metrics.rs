@@ -51,6 +51,10 @@ const STATUS_CELLS: usize = 24;
 /// Every mounted route template, in byte order (binary-searched).
 /// Equal to the manifest's `Mounted` set: tests/route_inventory.rs check 4.
 pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
+    "/adhocprofiles.v1.AdHocProfileService/Diff",
+    "/adhocprofiles.v1.AdHocProfileService/Get",
+    "/adhocprofiles.v1.AdHocProfileService/List",
+    "/adhocprofiles.v1.AdHocProfileService/Upload",
     "/admin/",
     "/admin/admin.css",
     "/admin/api/v1/config",
@@ -77,6 +81,10 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/api/logs/v1/volume",
     "/api/metrics/query",
     "/api/metrics/query_range",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Diff",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Get",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/List",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
     "/api/profiles/v1/export",
     "/api/profiles/v1/ingest",
     "/api/profiles/v1/label-values",
@@ -654,7 +662,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 135);
+        assert_eq!(ROUTE_TEMPLATES.len(), 143);
         assert!(
             ROUTE_TEMPLATES
                 .iter()

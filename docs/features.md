@@ -22,14 +22,15 @@ M1 and M2 are deliberately **narrow proof milestones**: the project exists becau
 | OTLP logs | `POST /v1/logs` | protobuf | M1 |
 | OTLP metrics | `POST /v1/metrics` | protobuf (exponential histograms flatten to classic `_bucket`/`_sum`/`_count` series until native-histogram storage lands in M7). Names and labels are rewritten exactly as Prometheus v3.13.0's OTLP receiver rewrites them — unit/`_total`/`_ratio` suffixes, name and label-key escaping, `job`/`instance` synthesis and a `target_info` series — selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` at the reference's own default (issue #461) | M2 |
 | OTLP traces | `POST /v1/traces` | protobuf | M4 |
-| OTLP profiles | `POST /v1development/profiles` | protobuf (experimental OTLP signal) | M5 |
+| OTLP profiles | `POST /v1development/profiles` | protobuf; OTLP profiles development version 1, oldest supported collector v0.148.0 ([api.md §1.1](api.md)) | M5 |
+| OTLP over gRPC | the four OTLP `Export` services, for logs, metrics, traces and profiles, on the listener's port ([api.md §1.1](api.md)) | protobuf, `application/grpc` | M5 |
 | Prometheus remote write | `POST /api/v1/write` | snappy protobuf (`prompb.WriteRequest`) — supports the collector's `prometheusremotewrite` exporter | M2 |
 | Profile ingest (native) | `POST /api/profiles/v1/ingest` | pprof; folded stacks, lines, trie, tree, speedscope and JFR | M5 |
 | OTLP/JSON encoding | all OTLP endpoints | JSON per OTLP/HTTP spec | M6 |
 
 ### 1.2 Compatibility receivers (flag-gated, M6)
 
-`POST /loki/api/v1/push` (JSON/protobuf) · Zipkin `POST /tempo/spans`, `/api/v2/spans` · `POST /ingest` (pprof alias, ships M5) · InfluxDB line protocol `POST /influx/api/v2/write` · Datadog `POST /api/v2/logs`, `/api/v2/series` · Elastic `POST /_bulk`, `/{target}/_bulk`, doc endpoints · remote-write path aliases.
+`POST /loki/api/v1/push` (JSON/protobuf) · Zipkin `POST /tempo/spans`, `/api/v2/spans` · `POST /ingest` at its two compatibility paths, every format of `/api/profiles/v1/ingest` · profile push `POST /push.v1.PusherService/Push` (both M5, [api.md §8.2](api.md)) · InfluxDB line protocol `POST /influx/api/v2/write` · Datadog `POST /api/v2/logs`, `/api/v2/series` · Elastic `POST /_bulk`, `/{target}/_bulk`, doc endpoints · remote-write path aliases.
 
 ### 1.3 Cross-cutting ingest features (M1 onward)
 
@@ -153,17 +154,21 @@ and for the one performance cliff it introduces.
 
 | Feature | Endpoint | Milestone |
 |---------|----------|-----------|
-| Profile types, labels, label values, series | `GET /api/profiles/v1/{types,labels,label/{name}/values,series}` | M5 |
-| Merged flamegraph | `GET /api/profiles/v1/merge` | M5 |
-| Time series of profile values | `GET /api/profiles/v1/select_series` | M5 |
-| Merged pprof export | `GET /api/profiles/v1/export` | M5 |
-| Stats | `GET /api/profiles/v1/stats` | M5 |
+| Profile types, label names, label values, series | `GET /api/profiles/v1/types`, `GET\|POST /api/profiles/v1/{labels,series}`, `GET /api/profiles/v1/label/{name}/values`, `POST /api/profiles/v1/querier.v1.QuerierService/{ProfileTypes,LabelNames,LabelValues,Series}` | M5 |
+| Merged flame graph, also as tree, DOT or pprof | `GET /api/profiles/v1/merge`, `POST /api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces` | M5 |
+| Time series of profile totals, with profile exemplars | `GET /api/profiles/v1/select_series`, `POST /api/profiles/v1/querier.v1.QuerierService/SelectSeries` | M5 |
+| Diff of two selections | `POST /api/profiles/v1/querier.v1.QuerierService/Diff` | M5 |
+| Heatmap of profile and span totals, with exemplars | `POST /api/profiles/v1/querier.v1.QuerierService/SelectHeatmap` | M5 |
+| Merged pprof export | `GET /api/profiles/v1/export`, `POST /api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile` | M5 |
+| Profile stats | `GET /api/profiles/v1/stats`, `POST /api/profiles/v1/querier.v1.QuerierService/GetProfileStats` | M5 |
+| Query analysis, answered empty | `POST /api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery` | M5 |
 | Exploration app settings | `POST /api/profiles/v1/settings.v1.SettingsService/{Get,Set,Delete}` | M5 |
-| Render (flamebearer) | `GET /api/profiles/v1/render` | M5 |
+| Recording rules and source code links, answered `unimplemented` | `POST /api/profiles/v1/settings.v1.RecordingRulesService/{name}`, `POST /api/profiles/v1/vcs.v1.VCSService/{name}` | M5 |
+| Ad hoc profile uploads | `POST /api/profiles/v1/adhocprofiles.v1.AdHocProfileService/{Upload,Get,List,Diff}` | M5 |
+| Render: flame graph and timeline, or DOT with `format=dot` | `GET /api/profiles/v1/render` | M5 |
 | Diff render | `GET /api/profiles/v1/render-diff` | M5 |
 | Label values, the reference's form | `GET /api/profiles/v1/label-values` | M5 |
-| DOT export | `render?format=dot` — `maxNodes`, unit-aware labels, scaled fonts | M5 |
-| Compat query aliases (Connect-protocol querier surface + render paths) | flag-gated | M5 |
+| The same Connect methods, and `render`, `render-diff` and `label-values`, at their compatibility paths ([api.md §5](api.md)) | flag-gated (`PULSUS_COMPAT_ENDPOINTS`) | M5 |
 
 ## 6. Platform features
 
@@ -177,7 +182,7 @@ and for the one performance cliff it introduces.
 | Compatibility endpoint flag | `PULSUS_COMPAT_ENDPOINTS` (default off) | M1 |
 | Inbound TLS | native TLS termination on the listener | M7 |
 | Label cache | bounded active-series window, JOIN fallback | M2 |
-| Clustered ClickHouse | Replicated engines on every table but the rollup stages, which only their shard's builder writes and reads; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, `service_edges`, which the service graph reads only per shard, and the rollup stages, and none over the cluster-wide catalogue tables; the `log_landing` and `trace_landing` wrappers are keyed on the push's receive stamp, so a log or trace push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard | M3 (metrics), M4 (logs/traces validation) |
+| Clustered ClickHouse | Replicated engines on every table but the rollup stages, which only their shard's builder writes and reads; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, `service_edges`, which the service graph reads only per shard, and the rollup stages, and none over the cluster-wide catalogue tables; the `log_landing`, `trace_landing` and `profile_landing` wrappers are keyed on the push's receive stamp, so a log, trace or profiles push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard | M3 (metrics), M4 (logs/traces validation) |
 | Cross-cluster reads | distributed-suffix read targeting | M7 |
 | Recording rules (ruler) | LogQL + PromQL kinds, CRUD API, write-back | M7 |
 | Alerting rules | stored/validated from M7 API; evaluation + notification delivery | post-1.0 |

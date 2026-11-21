@@ -107,6 +107,8 @@ replaces one.
 | [51](#51-the-pprof-export-writes-a-period-nobody-pushed) | profiles reference | queries | C | A CPU profile pushed with a 10 ms period is exported stating a 1 s period. |
 | [52](#52-the-pprof-exports-cut-keeps-a-frame-below-its-threshold-and-drops-unsymbolised-stacks-addresses) | profiles reference | queries | C, D | An export with a node limit keeps a function the limit cut, and replaces every stack of unsymbolised addresses with `other`. |
 | [53](#53-selectmergestacktraces-answers-a-dot-request-with-a-flame-graph) | profiles reference | queries | B, C | Asking `SelectMergeStacktraces` for the DOT format answers the flame graph and the tree. |
+| [54](#54-an-uploaded-pprofs-frames-are-looked-up-by-position-not-by-id) | profiles reference | queries | C | An uploaded pprof whose ids are not their positions draws its stacks with the wrong frames. |
+| [55](#55-a-perf-scripts-last-event-is-dropped-when-the-file-does-not-end-in-a-blank-line) | profiles reference | queries | C | An uploaded perf script that does not end in a blank line loses its last event. |
 
 ---
 
@@ -2713,6 +2715,63 @@ gets a flame graph it did not ask for. And the router's own comment says the opp
 
 Ledger row `dot-format-answers-dot` (the profiles differential's ledger, issue #822). Pinned by case
 C53 of `crates/pulsus-server/tests/profileql_differential.rs`.
+
+---
+
+## 54. An uploaded pprof's frames are looked up by position, not by id
+
+**The profiles reference · queries · test C**
+
+### What the reference does
+
+An ad hoc upload's pprof is converted by `PprofToProfile`, which reads location `id` at index
+`id − 1` of the location table and function `id` at index `id − 1` of the function table
+(`pkg/og/structs/flamebearer/convert/convert.go:255-263`).
+
+### Why that is wrong rather than different
+
+The pprof format makes ids identifiers, not positions (`profile.proto`): a profile whose tables are
+listed in another order is a valid profile. The reference draws it with other frames than it holds
+(**C**): an upload of the stacks `main → a` and `main → b`, its locations listed id 2, 1, 3, is drawn
+as `a → main` and `a → b`. A location id past the table's end is refused, and a function id past it
+stops the request.
+
+### What PulsusDB does
+
+Each location and function is found by its id; an id no entry has is refused,
+`invalid location ID <id> in sample <i>` or `invalid function ID <id>` (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `adhoc-pprof-ids-by-id` (the profiles differential's ledger, issue #831). Pinned by case
+C77 of `crates/pulsus-server/tests/profileql_differential.rs`.
+
+---
+
+## 55. A perf script's last event is dropped when the file does not end in a blank line
+
+**The profiles reference · queries · test C**
+
+### What the reference does
+
+An ad hoc upload's perf script is read by `ScriptParser.ParseEvents`. `ParseEvent` reads an event's
+frames until an empty line; when the text ends first, it returns end of input from inside the
+event, and `ParseEvents` stops on end of input without keeping that event
+(`pkg/og/convert/perf/script.go:37-85`).
+
+### Why that is wrong rather than different
+
+Input is dropped without a word (**C**): a script whose last event is not followed by a blank line,
+which is how a file cut by hand or by a tool usually ends, loses that event's sample.
+
+### What PulsusDB does
+
+An event ends at the end of the text, and is kept (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `adhoc-perf-last-event-kept` (the profiles differential's ledger, issue #831). Pinned by
+case C78 of `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ---
 

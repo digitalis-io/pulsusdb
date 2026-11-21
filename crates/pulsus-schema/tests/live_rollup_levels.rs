@@ -48,6 +48,8 @@ static DB_WINDOW_UP: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_window_up");
 static DB_WAITS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_waits");
+static DB_PLAN: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_plan");
 static DB_MIDNIGHT: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_midnight");
 static DB_EXPIRY: pulsus_testkit::TestDb =
@@ -1469,6 +1471,51 @@ async fn a_level_waits_for_its_source() {
         union(runs.iter().map(|r| (r.t_last, r.t_end))),
         vec![(b, b + 2 * HOUR)],
         "the 7200 s run rows end where the 720 s ones do: {runs:?}"
+    );
+    drop_db(&client, db).await;
+}
+
+/// **Every level's plan analyses without a NULL window.** For each level,
+/// a view over the level statement's own `WITH` list and the `range` call
+/// its data part makes over `lo` and `hi`. Creating a view analyses its
+/// statement without running the nested scalars, as a refresh's check
+/// does, where the window `w0` is NULL; with no `if(work, …)` guard around
+/// it, a NULL `lo` or `hi` fails the creation.
+#[tokio::test]
+async fn every_level_plan_analyses_without_a_null_window() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_PLAN.name();
+    let ctx = part_a(db, 7);
+    fresh(&client, &ctx).await;
+    let statements = pulsus_schema::rendered_statements(&ctx);
+    let mut failed = Vec::new();
+    for r in &ctx.rollup_levels {
+        let head = format!("CREATE MATERIALIZED VIEW {db}.metric_samples_{r}s_mv");
+        let view = statements
+            .iter()
+            .find(|s| s.starts_with(&head))
+            .unwrap_or_else(|| panic!("the {r} s level's view"));
+        let body = &view[view.find("AS WITH ").expect("AS WITH") + 3..];
+        let w = &body[..body
+            .find("\nSELECT toUInt8(0) AS kind")
+            .expect("the data part")];
+        let probe = format!(
+            "CREATE VIEW {db}.plan_probe_{r} AS {w}\nSELECT range(toUInt64(intDiv(lo, 86400000)), \
+             toUInt64(intDiv(hi - 1, 86400000) + 1)) AS r"
+        );
+        match client
+            .execute(&probe, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+        {
+            Ok(_) => exec(&client, &format!("DROP VIEW {db}.plan_probe_{r}")).await,
+            Err(e) => failed.push(format!("{r} s: {e}")),
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "a level's plan failed analysis:\n{}",
+        failed.join("\n")
     );
     drop_db(&client, db).await;
 }

@@ -43,7 +43,7 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 
 `PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:434`). One bucket would give a `rate` window one point at the levels under 720 s.
 
-`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:498`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:3402`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:3600`) hold their refusals equal.
+`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:505`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:3458`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:3656`) hold their refusals equal.
 
 ### 1.3 The default, and what each set costs
 
@@ -214,7 +214,7 @@ Each level's view, as `schema/schema.sql:1315-1414` carries it. `--@level-first`
 --@level-next      (SELECT (b - {{level_ms}}, least(intDiv(c.2, {{level_ms}}) * {{level_ms}}, b + 9 * {{level_ms}}), c.2 >= b) FROM (
 --@level-next         SELECT arrayFirst(m -> greatest(intDiv(m.1 + {{level_ms}} - 1, {{level_ms}}) * {{level_ms}} + {{level_ms}}, (intDiv(w, {{level_ms}}) + 1) * {{level_ms}}) <= m.2, u) AS c,
 --@level-next                greatest(intDiv(c.1 + {{level_ms}} - 1, {{level_ms}}) * {{level_ms}} + {{level_ms}}, (intDiv(w, {{level_ms}}) + 1) * {{level_ms}}) AS b
---@level-next         FROM (SELECT any(w0) AS w,
+--@level-next         FROM (SELECT ifNull(any(w0), 0) AS w,
 --@level-next                      arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
 --@level-next                                arraySort(groupArray((t_last, t_end))), CAST([], 'Array(Tuple(Int64, Int64))')) AS u
 --@level-next               FROM (SELECT (SELECT max(t_end) FROM {{db}}.metric_samples_{{level}} WHERE org_id = '' AND fingerprint = 0 AND kind = 1) AS w0, t_last, t_end

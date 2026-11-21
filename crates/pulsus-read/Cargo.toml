@@ -75,10 +75,14 @@ tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
 tracing.workspace = true
 # Issue #828: the pprof export builds `google.v1.Profile`.
 pulsus-profiles-wire = { path = "../pulsus-profiles-wire" }
+# Issue #831: an ad hoc upload's id is a UUIDv7.
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 # Issue #828: the pprof tests encode and decode the built profile.
 prost.workspace = true
+# Issue #831: the ad hoc fixtures are gzipped pprof files.
+flate2.workspace = true
 http.workspace = true
 pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
 # Issue #320: the shared live-gate guard for the environment-gated

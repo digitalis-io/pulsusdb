@@ -51,16 +51,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 38 tables, 33 views, and
+/// The inventory, single-node: one database, 39 tables, 34 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 72, "statement count");
+    assert_eq!(stmts.len(), 74, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 38);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 39);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 34);
 
     let text = rendered(&single());
     assert!(
@@ -89,18 +89,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 25 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 26 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 97, "statement count");
+    assert_eq!(stmts.len(), 100, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        63,
-        "38 tables + 25 wrappers"
+        65,
+        "39 tables + 26 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 34);
 
     let text = rendered(&clustered());
     assert!(
@@ -109,20 +109,20 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        97,
+        100,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 27 tables take a per-shard replica set and 9 take the
-    // cluster-wide one, so 36 paths name `{replica}` and 27 name `{shard}`.
+    // literally. 28 tables take a per-shard replica set and 9 take the
+    // cluster-wide one, so 37 paths name `{replica}` and 28 name `{shard}`.
     // The four default rollup levels are four of the per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
-        27,
+        28,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 36, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 37, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         9,
@@ -184,7 +184,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 36, "every replicated table's path was checked");
+    assert_eq!(checked, 37, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -331,6 +331,9 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             || wrapper == "profile_landing_dist"
         {
             "landing"
+        } else if wrapper == "profile_adhoc_dist" {
+            // Issue #831: an upload's rows sit on one shard by its id.
+            "uploads"
         } else if name.starts_with("profile") {
             "profiles"
         } else if name.starts_with("metric") {
@@ -342,7 +345,11 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         };
         by_family.entry(family).or_default().insert(expr);
     }
-    assert_eq!(by_family.len(), 5, "five families have wrappers");
+    assert_eq!(by_family.len(), 6, "six families have wrappers");
+    assert!(
+        text.contains("'profile_adhoc', cityHash64(upload_id));"),
+        "profile_adhoc_dist shards by the upload's id, cityHash64(upload_id)"
+    );
     for (family, exprs) in &by_family {
         assert_eq!(
             exprs.len(),
@@ -404,7 +411,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 38);
+    assert_eq!(on_tables, 39);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -810,6 +817,43 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
             .unwrap_or_else(|| panic!("{target} is in the file"));
         assert_eq!(names, columns, "{mv} projects {target}'s columns in order");
     }
+    // Issue #831: one view copies an upload's two landing kinds into
+    // `profile_adhoc`, projecting its columns in order, and no other view
+    // writes that table.
+    let projection = pulsus_schema::mv_projection("profile_adhoc_mv", &ctx)
+        .expect("profile_adhoc_mv is in the file");
+    assert!(
+        projection.contains("FROM pulsus.profile_landing\n"),
+        "profile_adhoc_mv must read the profile landing table: {projection}"
+    );
+    assert!(
+        projection.ends_with("\nWHERE kind IN (5, 6)"),
+        "profile_adhoc_mv must read the landing rows of kinds 5 and 6: {projection}"
+    );
+    let select = projection
+        .strip_prefix("SELECT\n")
+        .and_then(|rest| rest.split_once("\nFROM "))
+        .map(|(cols, _)| cols)
+        .expect("profile_adhoc_mv: SELECT ... FROM");
+    let names: Vec<&str> = select
+        .lines()
+        .map(|l| {
+            l.trim_end_matches(',')
+                .rsplit_once(" AS ")
+                .unwrap_or_else(|| panic!("profile_adhoc_mv: a column without AS: {l}"))
+                .1
+        })
+        .collect();
+    assert_eq!(
+        names,
+        pulsus_schema::table_column_names("profile_adhoc").expect("profile_adhoc is in the file"),
+        "profile_adhoc_mv projects profile_adhoc's columns in order"
+    );
+    let writers = rendered_statements(&single())
+        .into_iter()
+        .filter(|s| s.contains(" TO pulsus.profile_adhoc\n"))
+        .count();
+    assert_eq!(writers, 1, "one view writes profile_adhoc");
     assert!(pulsus_schema::mv_projection("not_a_view", &ctx).is_none());
 
     let spans = pulsus_schema::table_column_names("spans").expect("spans is in the file");
@@ -1177,10 +1221,10 @@ fn the_landing_placement_passages_name_every_landing_table() {
 
 /// `docs/configuration.md`'s `PULSUS_DIST_SUFFIX` row, whole (issue #494
 /// part 1).
-const DIST_SUFFIX_ROW: &str = r##"| `PULSUS_DIST_SUFFIX` | `_dist` | suffix of the Distributed tables PulsusDB names: readers query through them, and on a cluster the writer inserts every log, metric and trace push into `log_landing`, `metric_landing` or `trace_landing` with it appended (set differently for cross-cluster read topologies, where the writing processes keep the suffix their own cluster's wrappers carry); the service graph reads the cluster and database that `spans` plus this suffix names |"##;
+const DIST_SUFFIX_ROW: &str = r##"| `PULSUS_DIST_SUFFIX` | `_dist` | suffix of the Distributed tables PulsusDB names: readers query through them, and on a cluster every log, metric, trace and profiles push, and every ad hoc profile upload, is inserted into `log_landing`, `metric_landing`, `trace_landing` or `profile_landing` with it appended (set differently for cross-cluster read topologies, where the writing processes keep the suffix their own cluster's wrappers carry); the service graph reads the cluster and database that `spans` plus this suffix names |"##;
 
 /// `docs/configuration.md`'s topology requirement, whole (issue #494 part 1).
-const TOPOLOGY_REQUIREMENT: &str = r##"**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, the three landing wrappers among them (`log_landing_dist`, `metric_landing_dist` and `trace_landing_dist` at the default suffix). An insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log or trace push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard; a push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A metrics push goes through `metric_landing`'s wrapper, keyed on each series' fingerprint — the key of every metrics table's wrapper — so all of a series' rows sit on one shard, and every resend of the push reaches the same shards whichever writer sends it. Each wrapper writes one live replica of a block for replication to copy to the rest. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. For reads, the server a request is sent to coordinates every statement of it, and that server's own replicas serve its shard, so every statement of one read request goes to one server."##;
+const TOPOLOGY_REQUIREMENT: &str = r##"**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, the four landing wrappers among them (`log_landing_dist`, `metric_landing_dist`, `trace_landing_dist` and `profile_landing_dist` at the default suffix). An insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log, trace or profiles push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard; a push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A metrics push goes through `metric_landing`'s wrapper, keyed on each series' fingerprint — the key of every metrics table's wrapper — so all of a series' rows sit on one shard, and every resend of the push reaches the same shards whichever writer sends it. Each wrapper writes one live replica of a block for replication to copy to the rest. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. For reads, the server a request is sent to coordinates every statement of it, and that server's own replicas serve its shard, so every statement of one read request goes to one server."##;
 
 /// `docs/api.md` §1.0's paragraph on a log push answered `500` after part of
 /// it was stored (issue #494 part 1).
@@ -1206,11 +1250,11 @@ A synchronous push is answered as the last column says; one sent with `X-Pulsus-
 **A metrics push has a second guard, in ClickHouse.** Its samples insert's `insert_deduplication_token` is derived from its tenant and the sample, histogram sample and exemplar rows it inserts, every column of them with the receive time set to zero, and never from `Idempotency-Key`. So the same content sent again, to any writer process, after `PULSUS_INGEST_DEDUP_WINDOW` or with `PULSUS_INGEST_DEDUP=false`, stores no sample, histogram sample, exemplar or series a second time while ClickHouse still remembers the token ([configuration.md](configuration.md), `PULSUS_METRICS_DEDUP_WINDOW`), and two pushes of identical parsed content store their samples, histogram samples, exemplars and series once; their descriptors may be stored twice, and `/api/v1/metadata` shows one. The staging table `metric_landing`, whose rows no query returns (its readers are the first rollup level's build, which removes the copies, and the label cache's registration feed, which keeps one entry per series), may hold a resend received in a later hour a second time until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. If a shard refuses its block of the samples insert, a synchronous push is answered `500` and one sent with `X-Pulsus-Async: 1` has already been answered `202` at admission, and either way the other shards may keep theirs; sending the same push again stores the refused part without storing the kept part twice, within the same limit. The descriptors insert carries a token minted for it. The writer sends a descriptor about once an hour and after it restarts; a metrics insert of that writer that ends without a commit empties the descriptors it holds, so a later push carrying one sends it again unless an insert that committed in between recorded it; so the stored table may hold a descriptor more than once until ClickHouse merges the copies; `/api/v1/metadata` reports each descriptor once, and a descriptor a client keeps sending never expires."##;
 
 /// `docs/api.md`'s `Idempotency-Key` row, its third cell (issue #494 part 1b).
-const IDEMPOTENCY_KEY_CELL: &str = r##"issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included"##;
+const IDEMPOTENCY_KEY_CELL: &str = r##"issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric, trace or profiles pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included"##;
 
 /// `docs/features.md`'s clustering row, its second cell (issue #494 part 1b;
 /// the rollup stages, issue #800).
-const CLUSTERING_CELL: &str = r##"Replicated engines on every table but the rollup stages, which only their shard's builder writes and reads; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, `service_edges`, which the service graph reads only per shard, and the rollup stages, and none over the cluster-wide catalogue tables; the `log_landing` and `trace_landing` wrappers are keyed on the push's receive stamp, so a log or trace push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard"##;
+const CLUSTERING_CELL: &str = r##"Replicated engines on every table but the rollup stages, which only their shard's builder writes and reads; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, `service_edges`, which the service graph reads only per shard, and the rollup stages, and none over the cluster-wide catalogue tables; the `log_landing`, `trace_landing` and `profile_landing` wrappers are keyed on the push's receive stamp, so a log, trace or profiles push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard"##;
 
 /// Every other edit of the user documents (issue #494 part 1b): the document,
 /// the text it replaced (`None` for an insertion), and the new text.
@@ -1242,7 +1286,7 @@ const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
     (
         "configuration.md",
         Some(r##"; `false` restores the doubling"##),
-        r##"; `false` restores the doubling for logs and traces, while a metrics push keeps the guard in ClickHouse that [api.md §1.0](api.md) describes"##,
+        r##"; `false` restores the doubling for logs, traces and profiles, while a metrics push keeps the guard in ClickHouse that [api.md §1.0](api.md) describes"##,
     ),
     (
         "configuration.md",
@@ -1273,7 +1317,7 @@ const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
     (
         "api.md",
         Some(r##"`PULSUS_INGEST_DEDUP=false` restores the old behaviour."##),
-        r##"`PULSUS_INGEST_DEDUP=false` turns this index off, which restores the old behaviour for logs and traces; a metrics push keeps the guard in ClickHouse described below."##,
+        r##"`PULSUS_INGEST_DEDUP=false` turns this index off, which restores the old behaviour for logs, traces and profiles; a metrics push keeps the guard in ClickHouse described below."##,
     ),
     (
         "api.md",
@@ -1615,7 +1659,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 }
             }
         }
-        assert_eq!(targets.len(), 33, "{variant:?}: thirty-three views");
+        assert_eq!(targets.len(), 34, "{variant:?}: thirty-four views");
         stage_views.sort();
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -2340,6 +2384,11 @@ fn the_profile_tables_lead_with_the_tenant_in_both_forms() {
             "(org_id, name)",
             "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.profile_settings', '{replica}', version)",
         ),
+        (
+            "profile_adhoc",
+            "(org_id, upload_id, row_kind, type_ordinal, stack_id)",
+            "ReplicatedMergeTree('/clickhouse/tables/{shard}/pulsus.profile_adhoc', '{replica}')",
+        ),
     ];
     let clustered = RenderCtx {
         cluster: Some("c1".to_string()),
@@ -2786,6 +2835,12 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
+    (
+        "profile_adhoc",
+        Some("TTL toDateTime(least(intDiv(uploaded_at, 1000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
     ("profile_settings", None, false, None),
     (
         "profile_stacks",
@@ -2890,6 +2945,7 @@ fn every_day_partition_is_a_utc_day() {
                 "PARTITION BY month",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Milli(uploaded_at), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')",
@@ -3813,21 +3869,23 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     // `profile_landing`'s ten upload columns a `DEFAULT`, with issue #889,
     // which puts the replaced-parts settings first in every table's
     // `SETTINGS`, with issue #828, which adds `mapping_flags` and `period`,
-    // and with issue #830, which adds `profile_settings`.
+    // with issue #830, which adds `profile_settings`, and with issue #831,
+    // which adds `profile_adhoc`, its view and its wrapper, and with the
+    // later-level plan's `ifNull(any(w0), 0)`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "03bdfd12781a2e90476308a29f7229dbae25b352833adffc2b31eedab222e37a",
+            "3d53ab5b4d37ad51276284b00074aa2daf12c3e8ae49ca7494df41ecacfd8eb4",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "23b31be30853976fc967c8bf62af921ed3bedffb5fa96ae394719ba1c9cde1d5",
+            "a04548ef48709949a80fc3cd9048290eeab78583883c87d450ddfd7a9d443094",
         ),
         (
             "clustered with a storage policy",
@@ -3837,7 +3895,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "e9e3e688be3e15010b0d5cf0cf1375c3495d04f9b48dc6ac8a4eea56fdfc5053",
+            "4cf1fea0eee48ecc5452bae5edd40567059a8cc1905025931cb15b3e212bc2e4",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -4095,8 +4153,8 @@ const TRACES_FAMILY: [&str; 5] = [
     "service_edges",
 ];
 const PROFILES_FAMILY: [&str; 2] = ["profile_samples", "profile_entries"];
-/// The twenty-one tables that never move (docs/configuration.md §7).
-const NEVER_MOVE: [&str; 21] = [
+/// The twenty-two tables that never move (docs/configuration.md §7).
+const NEVER_MOVE: [&str; 22] = [
     "log_landing",
     "log_streams",
     "log_streams_idx",
@@ -4108,6 +4166,7 @@ const NEVER_MOVE: [&str; 21] = [
     "metric_samples_60s_stage",
     "metric_samples_720s_stage",
     "metric_series",
+    "profile_adhoc",
     "profile_landing",
     "profile_locations",
     "profile_series",
@@ -4140,7 +4199,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 38, "{what}: thirty-eight tables");
+    assert_eq!(tables.len(), 39, "{what}: thirty-nine tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }
@@ -6607,7 +6666,7 @@ fn the_script_the_crate_and_the_parsers_hold_the_documented_boundaries() {
 // -- issue #494 part 2: the batching documents ------------------------------
 
 /// Plan B §7's new `docs/api.md` §1.0 paragraph, generated from the plan.
-const B_API_PARAGRAPH: &str = r##"**How a log or trace push is written.** A log or trace push's rows go in one insert into `log_landing` or `trace_landing`, which it shares with the other pushes of its signal that its writer gathers into the same **batch**: a batch takes queued pushes for up to `PULSUS_LANDING_BATCH_MS` after a worker takes its first push, which may itself have waited in the queue, and closes sooner when the next push would bring its rows to `PULSUS_LOG_LANDING_MAX_ROWS` or `PULSUS_TRACE_LANDING_MAX_ROWS`, its estimate above `PULSUS_BATCH_BYTES` or its inclusive UTC-date span above `100` days, at once when one of its pushes would otherwise reach its 120 s landing budget, and at shutdown ([configuration.md](configuration.md)). A push is first checked: a writer shutting down, or a suppression index or its waiters at their bound, answers `429`; a reused `Idempotency-Key` answers `400`, except for a log push some of whose streams fail their label checks, which the suppression index does not see; a push over its size ceiling or over `100` UTC dates answers `413`; each makes no insert. Otherwise:
+const B_API_PARAGRAPH: &str = r##"**How a log, trace or profiles push is written.** A log, trace or profiles push's rows go in one insert into `log_landing`, `trace_landing` or `profile_landing`, which it shares with the other pushes of its signal that its writer gathers into the same **batch**: a batch takes queued pushes for up to `PULSUS_LANDING_BATCH_MS` after a worker takes its first push, which may itself have waited in the queue, and closes sooner when the next push would bring its rows to `PULSUS_LOG_LANDING_MAX_ROWS`, `PULSUS_TRACE_LANDING_MAX_ROWS` or `PULSUS_PROFILE_LANDING_MAX_ROWS`, its estimate above `PULSUS_BATCH_BYTES` or its inclusive UTC-date span above `100` days, at once when one of its pushes would otherwise reach its 120 s landing budget, and at shutdown ([configuration.md](configuration.md)). A push is first checked: a writer shutting down, or a suppression index or its waiters at their bound, answers `429`; a reused `Idempotency-Key` answers `400`, except for a log push some of whose streams fail their label checks, which the suppression index does not see; a push over its size ceiling, or a log or trace push over `100` UTC dates, answers `413` over HTTP, except that a profiles push over its size ceiling answers `400` on the profile push route and on `/ingest`'s folded, lines, trie and tree forms (§1.3, §8.2); over gRPC either is answered `200` with gRPC status `3` (`INVALID_ARGUMENT`, §1.1); each makes no insert. Otherwise:
 
 | the push | inserts | answered by |
 |---|---|---|
@@ -6621,11 +6680,10 @@ const B_API_PARAGRAPH: &str = r##"**How a log or trace push is written.** A log 
 A synchronous push is answered once its batch's insert has settled, up to one window later than it would be alone; one sent with `X-Pulsus-Async: 1` is answered `202` once admitted, but for the partly failing log push above. Every row of a batch carries its first push's receive time, so on a cluster the batch is one block on one shard, and the writer's resend of it, under the batch's token, reaches the same shard. A batch takes its oldest push's 120 s landing deadline, so a push in a batch can end, sent or not, at an older push's deadline. With `PULSUS_LANDING_BATCH_MS=0` every push is its own batch. Metrics pushes are not batched."##;
 
 /// Plan B §7's new `docs/configuration.md` row.
-const B_CONF_ROW: &str = r##"| `PULSUS_LANDING_BATCH_MS` | `1000` | how long a landing worker keeps adding queued log or trace pushes to the insert it is forming. A batch closes at the first of: this long after its first push was taken; the next push would bring its rows to the signal's `PULSUS_*_LANDING_MAX_ROWS`, its estimate above `PULSUS_BATCH_BYTES`, or its inclusive UTC-date span above `100` days; at once when one of its pushes would otherwise reach its 120 s landing budget; shutdown. Every push of a batch shares its outcome ([api.md §1.0](api.md)). Metrics pushes are not batched. `0` sends every push as its own insert. Accepted range `0..=10000` ms |"##;
+const B_CONF_ROW: &str = r##"| `PULSUS_LANDING_BATCH_MS` | `1000` | how long a landing worker keeps adding queued log, trace or profiles pushes to the insert it is forming. A batch closes at the first of: this long after its first push was taken; the next push would bring its rows to the signal's `PULSUS_*_LANDING_MAX_ROWS`, its estimate above `PULSUS_BATCH_BYTES`, or its inclusive UTC-date span above `100` days; at once when one of its pushes would otherwise reach its 120 s landing budget; shutdown. Every push of a batch shares its outcome ([api.md §1.0](api.md)). Metrics pushes are not batched. `0` sends every push as its own insert. Accepted range `0..=10000` ms |"##;
 
 /// Plan B §7's new line in `docs/configuration.md`'s YAML schema.
-const B_YAML_LINE: &str =
-    r##"  landing_batch_ms: 1000         # log and trace batch window; 0 sends every push alone"##;
+const B_YAML_LINE: &str = r##"  landing_batch_ms: 1000         # log, trace and profiles batch window; 0 sends every push alone"##;
 
 /// Plan B §7's banner on the design documents.
 const B_BANNER: &str = r##"> **Stale on landing inserts.** Since the batching change (#494, part 2), a landing worker gathers
@@ -6641,7 +6699,7 @@ const B_EDITS: &[(&str, &str, &str)] = &[
     (
         "api.md",
         r##"`1` = enqueue and return `202`; `0` = confirm flush (default from config)"##,
-        r##"`1` = answer `202` once admitted: accepted, not stored — except a log push some of whose streams fail their label checks, which is answered `400` (§1.0). A log or trace push is then held in memory until its batch's insert settles — its wait in the queue, up to `PULSUS_LANDING_BATCH_MS` while its batch forms, then the insert and its resends, within 120 s of the admission of its batch's oldest push — and a process that ends without its drain loses it until that insert's first attempt is sent; a failure is reported to nobody. `0` = answer once the insert that answers the push has settled (§1.0) (default from config)"##,
+        r##"`1` = answer `202` once admitted: accepted, not stored — except a log push some of whose streams fail their label checks, which is answered `400` (§1.0). A log, trace or profiles push is then held in memory until its batch's insert settles — its wait in the queue, up to `PULSUS_LANDING_BATCH_MS` while its batch forms, then the insert and its resends, within 120 s of the admission of its batch's oldest push — and a process that ends without its drain loses it until that insert's first attempt is sent; a failure is reported to nobody. `0` = answer once the insert that answers the push has settled (§1.0) (default from config)"##,
     ),
     (
         "api.md",
@@ -6691,12 +6749,12 @@ const B_EDITS: &[(&str, &str, &str)] = &[
     (
         "configuration.md",
         r##""##,
-        r##"says how a metrics push is written). A batch of log or trace pushes closes before its summed estimate would exceed it ([api.md §1.0](api.md))."##,
+        r##"says how a metrics push is written). A batch of log, trace or profiles pushes closes before its summed estimate would exceed it ([api.md §1.0](api.md))."##,
     ),
     (
         "configuration.md",
         r##"every push is sealed and queued at admission, so nothing waits for an age trigger."##,
-        r##"a log or trace push waits in the queue until a worker takes it, and then while its batch forms, which `PULSUS_LANDING_BATCH_MS` bounds from the moment a worker takes the batch's first push."##,
+        r##"a log, trace or profiles push waits in the queue until a worker takes it, and then while its batch forms, which `PULSUS_LANDING_BATCH_MS` bounds from the moment a worker takes the batch's first push."##,
     ),
     (
         "configuration.md",
@@ -6893,6 +6951,6 @@ fn every_table_keeps_replaced_parts_sixty_seconds_and_flushes_what_it_merges_and
                 );
             }
         }
-        assert_eq!(tables, 38, "{what}: table count");
+        assert_eq!(tables, 39, "{what}: table count");
     }
 }

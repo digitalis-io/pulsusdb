@@ -1105,11 +1105,13 @@ docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:355-358	not_in
 docs/reference-defects-we-do-not-copy.md	pkg/model/timeseries/exemplar_builder.go:80-113	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/tree.go:345-366	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/og/convert/parser.go:42-67	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/convert/perf/script.go:37-85	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/og/convert/speedscope/parser.go:182	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/og/convert/speedscope/parser.go:227	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/og/convert/speedscope/units.go:45-54	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/og/storage/tree/serialize.go:41-43	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/og/storage/tree/tree.go:158-171	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/structs/flamebearer/convert/convert.go:255-263	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/ingester_querier.go:68	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/batch.go:9-38	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_this_repository

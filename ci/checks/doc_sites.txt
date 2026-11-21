@@ -71,7 +71,9 @@ rewrite docs/schemas.md:33-33
 # pushed period and a location row its mapping's flags.
 # Issue #830 adds #830, its own issue, where §5 says what `profile_settings`
 # holds and how it is read.
-rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18,#757,#399,#786,#828,#830
+# Issue #831 adds #831, its own issue, where §5 says what `profile_adhoc`
+# holds and the view that writes it.
+rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18,#757,#399,#786,#828,#830,#831
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5

@@ -943,3 +943,42 @@ async fn j4_string_table_values_are_resolved_on_json() {
     }
     assert_eq!(landings[0], landings[1]);
 }
+
+/// #833: `docs/api.md` §1.1 quotes the crate's header-less note and names
+/// the collector it names as the oldest supported one.
+#[test]
+fn the_api_reference_quotes_the_header_less_note_and_its_collector() {
+    let docs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/api.md"))
+        .expect("read docs/api.md");
+    let start = docs
+        .find("### 1.1 OTLP (primary)")
+        .expect("docs/api.md has §1.1");
+    let end = start
+        + docs[start..]
+            .find("### 1.2")
+            .expect("docs/api.md has §1.2 after §1.1");
+    let section = &docs[start..end];
+
+    let note = pulsus_write::protocols::otlp_prescan::PROFILES_HEADER_LESS_NOTE.trim();
+    assert!(
+        section.contains(&format!("`{note}`")),
+        "docs/api.md §1.1 does not quote the header-less note `{note}`"
+    );
+    let v = note
+        .split_once("Collector at ")
+        .and_then(|(_, rest)| rest.split_once(" or later"))
+        .map(|(v, _)| v)
+        .expect("the note names a collector release");
+    assert!(
+        section.contains(&format!(
+            "**The oldest supported OpenTelemetry Collector is {v}.**"
+        )),
+        "docs/api.md §1.1 does not name {v} as the oldest supported collector"
+    );
+    assert!(
+        section
+            .lines()
+            .any(|line| line.starts_with(&format!("  | {v} to "))),
+        "docs/api.md §1.1's sender table has no row starting at {v}"
+    );
+}

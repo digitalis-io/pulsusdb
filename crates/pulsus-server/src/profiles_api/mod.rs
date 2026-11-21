@@ -23,7 +23,10 @@
 //! `AnalyzeQuery` at the two Connect surfaces, one statement each and none
 //! for `AnalyzeQuery`; `settings.v1.RecordingRulesService/*` and
 //! `vcs.v1.VCSService/*` answer `unimplemented`.
+//! Issue #831: the ad hoc uploads, `adhocprofiles.v1.AdHocProfileService/
+//! {Upload,Get,List,Diff}`, at the two Connect surfaces, one statement each.
 
+mod adhoc;
 mod app;
 pub(crate) mod connect;
 mod diff;
@@ -105,6 +108,22 @@ pub(crate) fn router() -> Router<AppState> {
             post(app::recording_rules),
         )
         .route("/api/profiles/v1/vcs.v1.VCSService/{name}", post(app::vcs))
+        .route(
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
+            post(adhoc::upload),
+        )
+        .route(
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Get",
+            post(adhoc::get),
+        )
+        .route(
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/List",
+            post(adhoc::list),
+        )
+        .route(
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Diff",
+            post(adhoc::diff),
+        )
         .route("/api/profiles/v1/stats", get(app::stats_get))
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
@@ -187,6 +206,22 @@ pub(crate) fn compat_router() -> Router<AppState> {
             post(app::recording_rules),
         )
         .route("/vcs.v1.VCSService/{name}", post(app::vcs))
+        .route(
+            "/adhocprofiles.v1.AdHocProfileService/Upload",
+            post(adhoc::upload),
+        )
+        .route(
+            "/adhocprofiles.v1.AdHocProfileService/Get",
+            post(adhoc::get),
+        )
+        .route(
+            "/adhocprofiles.v1.AdHocProfileService/List",
+            post(adhoc::list),
+        )
+        .route(
+            "/adhocprofiles.v1.AdHocProfileService/Diff",
+            post(adhoc::diff),
+        )
         .route("/pyroscope/render", get(render::render_get))
         .route("/pyroscope/render-diff", get(render::render_diff_get))
         .route("/pyroscope/label-values", get(render::label_values_get))

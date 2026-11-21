@@ -24,11 +24,9 @@
 //! Every reference limit is a constant here, not a setting.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::ops::Range;
 use std::sync::Arc;
 
-use prost::Message;
 use pulsus_model::{LabelSet, raw_cityhash64, stream_fingerprint};
 use pulsus_profiles_wire::google_v1::{Function, Mapping, Profile};
 use xxhash_rust::xxh64::xxh64;
@@ -81,52 +79,10 @@ pub fn decode_pprof(bytes: &[u8], limit: u64) -> Result<Profile, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Why [`decode_pprof_sized`] refused a body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PprofDecodeError {
-    /// The decompressed body is over the limit.
-    TooLarge { limit: u64 },
-    /// Any other failure, with [`decode_pprof`]'s text.
-    Other(String),
-}
-
-impl std::fmt::Display for PprofDecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PprofDecodeError::TooLarge { limit } => write!(
-                f,
-                "decompressed size exceeds maximum allowed size of {limit} bytes"
-            ),
-            PprofDecodeError::Other(e) => f.write_str(e),
-        }
-    }
-}
-
-/// [`decode_pprof`], with the decompressed length beside the profile and the
-/// size refusal told apart from the others.
-pub fn decode_pprof_sized(bytes: &[u8], limit: u64) -> Result<(Profile, u64), PprofDecodeError> {
-    let decode = |b: &[u8]| {
-        Profile::decode(b)
-            .map(|p| (p, b.len() as u64))
-            .map_err(|e| PprofDecodeError::Other(e.to_string()))
-    };
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut buf = Vec::new();
-        flate2::read::MultiGzDecoder::new(bytes)
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut buf)
-            .map_err(|e| PprofDecodeError::Other(format!("copy to buffer: {e}")))?;
-        if buf.len() as u64 > limit {
-            return Err(PprofDecodeError::TooLarge { limit });
-        }
-        decode(&buf)
-    } else {
-        if bytes.len() as u64 > limit {
-            return Err(PprofDecodeError::TooLarge { limit });
-        }
-        decode(bytes)
-    }
-}
+/// Why [`decode_pprof_sized`] refused a body, and the decoder itself:
+/// issue #831 moved both to the wire crate, where the ad hoc uploads
+/// decode a pprof too.
+pub use pulsus_profiles_wire::google_v1::{PprofDecodeError, decode_sized as decode_pprof_sized};
 
 /// Turns a push's profiles into its rows. `now_ms` is the receive time: the
 /// ingestion window is measured from it, and a profile without a time takes

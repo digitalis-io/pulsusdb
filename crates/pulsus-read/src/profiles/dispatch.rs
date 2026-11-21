@@ -80,6 +80,23 @@ impl ProfileDispatch {
     }
 }
 
+impl ProfileDispatch {
+    /// Issue #831: inserts `rows` into `table` as one block with
+    /// `settings`. No SQL text, so no tenant check: the caller stamps every
+    /// row with its own tenant.
+    pub(super) async fn insert<R: ChRow>(
+        &self,
+        table: &str,
+        rows: &[R],
+        settings: &QuerySettings,
+    ) -> Result<(), ProfilesReadError> {
+        self.client
+            .insert_block_with(table, rows, settings)
+            .await
+            .map_err(map_read_error)
+    }
+}
+
 /// ClickHouse's `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`: S13-W's guard
 /// refused the write.
 const CODE_THROW_IF: i32 = 395;
