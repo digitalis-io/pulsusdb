@@ -1282,4 +1282,49 @@ mod tests {
         }
         assert_eq!(measured, expected);
     }
+
+    /// #833: a method a profiles route does not serve is `405` with an
+    /// empty body, on native and Connect paths alike (`docs/api.md`).
+    #[tokio::test]
+    async fn a_method_a_profiles_route_does_not_serve_is_405_with_an_empty_body() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            compat_endpoints: true,
+            ..Config::default()
+        };
+        let router = build_router(test_state(), &cfg).expect("router builds");
+        for (method, path) in [
+            (Method::POST, "/api/profiles/v1/types"),
+            (Method::DELETE, "/api/profiles/v1/merge"),
+            (
+                Method::GET,
+                "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+            ),
+            (
+                Method::GET,
+                "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
+            ),
+            (
+                Method::GET,
+                "/querier.v1.QuerierService/SelectMergeStacktraces",
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let res = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+            let body = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+            assert!(body.is_empty(), "{method} {path} answered a body: {body:?}");
+        }
+    }
 }
