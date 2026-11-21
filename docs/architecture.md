@@ -197,7 +197,7 @@ Decisions and their reasons:
 
 ### 3.4 Profiles
 
-One landing table, `profile_landing`, takes every row of a batch under a `kind` column, and five views copy each kind to its table ([schemas.md §5](schemas.md)). `profile_samples` holds one row per stack per profile, `profile_entries` one row per profile with its total, and `profile_series` one row per series per UTC day with its label set and a 24-bit hour mask; the three are keyed `(org_id, type_id, service, fingerprint, …)` and sit on the shard that took the batch. `profile_stacks` and `profile_locations` hold each stack's frames and each location, keyed `(org_id, <id>)`, in one replica set across the cluster, and so does `profile_settings`, the exploration app's settings, keyed `(org_id, name)`.
+One landing table, `profile_landing`, takes every row of a batch under a `kind` column, and five views copy each kind to its table, a sixth an ad hoc upload's two kinds to `profile_adhoc` ([schemas.md §5](schemas.md)). `profile_samples` holds one row per stack per profile, `profile_entries` one row per profile with its total, and `profile_series` one row per series per UTC day with its label set and a 24-bit hour mask; the three are keyed `(org_id, type_id, service, fingerprint, …)` and sit on the shard that took the batch. `profile_stacks` and `profile_locations` hold each stack's frames and each location, keyed `(org_id, <id>)`, in one replica set across the cluster, and so does `profile_settings`, the exploration app's settings, keyed `(org_id, name)`.
 
 ### 3.5 Rules
 

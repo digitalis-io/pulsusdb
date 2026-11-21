@@ -159,6 +159,7 @@ and for the one performance cliff it introduces.
 | Merged pprof export | `GET /api/profiles/v1/export` | M5 |
 | Stats | `GET /api/profiles/v1/stats` | M5 |
 | Exploration app settings | `POST /api/profiles/v1/settings.v1.SettingsService/{Get,Set,Delete}` | M5 |
+| Ad hoc profile uploads | `POST /api/profiles/v1/adhocprofiles.v1.AdHocProfileService/{Upload,Get,List,Diff}` | M5 |
 | Render (flamebearer) | `GET /api/profiles/v1/render` | M5 |
 | Diff render | `GET /api/profiles/v1/render-diff` | M5 |
 | Label values, the reference's form | `GET /api/profiles/v1/label-values` | M5 |

@@ -406,3 +406,21 @@ own error, as PulsusDB does.
 - **Reference:** `401` `{"code":"unauthenticated","message":"invalid token"}`.
 - **Why:** owner decision Q16 on #772.
 - **Case:** `C63` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `adhoc-pprof-ids-by-id`
+
+- **Route:** `adhocprofiles.v1.AdHocProfileService/Upload`, and `Get` of the upload.
+- **Request:** a pprof whose location ids are not their positions.
+- **PulsusDB:** the tree its ids describe: `main → a` 5, `main → b` 1.
+- **Reference:** the frames swapped: `a → main` 5, `a → b` 1.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 54.
+- **Case:** `C77` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `adhoc-perf-last-event-kept`
+
+- **Route:** `adhocprofiles.v1.AdHocProfileService/Upload`, and `Get` of the upload.
+- **Request:** a perf script without a final blank line.
+- **PulsusDB:** every event: `java → foo` 1, `java → bar` 1.
+- **Reference:** the last event dropped: `java → foo` 1.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 55.
+- **Case:** `C78` in `crates/pulsus-server/tests/profileql_differential.rs`.
