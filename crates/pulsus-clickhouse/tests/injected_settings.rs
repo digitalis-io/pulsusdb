@@ -91,6 +91,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "max_insert_block_size_bytes",
     "max_memory_usage",
     "max_parallel_replicas",
+    "max_partitions_per_insert_block",
     "max_query_size",
     "max_recursive_cte_evaluation_depth",
     "max_result_bytes",

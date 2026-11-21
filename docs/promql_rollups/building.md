@@ -43,7 +43,7 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 
 `PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:434`). One bucket would give a `rate` window one point at the levels under 720 s.
 
-`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:498`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:3402`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:3600`) hold their refusals equal.
+`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:505`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:3458`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:3656`) hold their refusals equal.
 
 ### 1.3 The default, and what each set costs
 

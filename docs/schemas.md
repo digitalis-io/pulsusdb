@@ -881,10 +881,10 @@ it, and reads and writes its markers under the empty tenant (`org_id = ''`), one
 | `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:1215-1219` |
 | `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:1141-1166` |
 | `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:1221-1238` |
-| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:1256-1260` |
-| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:928-940` |
-| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:976-983` |
-| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:985-994` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:1310-1314` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:959-971` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:1007-1014` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:1016-1025` |
 | `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:1091-1139` |
 
 So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
