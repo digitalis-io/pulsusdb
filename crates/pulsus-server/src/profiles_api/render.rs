@@ -8,8 +8,9 @@
 //! flamebearer with its timeline; `render-diff` is the `Diff` method's one
 //! statement as the `double` flamebearer; `label-values` is the profile
 //! types for `__name__`, else the named label's values over the last hour.
-//! In the order: the tenant, then the parameters, then the planner's own
-//! checks.
+//! Part B: `render` with `format=dot` is the merged profile's one statement
+//! (`pulsus_read::profiles::pprof`) drawn as a DOT graph. In the order: the
+//! tenant, then the parameters, then the planner's own checks.
 
 use std::collections::BTreeMap;
 
@@ -24,7 +25,9 @@ use pulsus_profiles_wire::querier_v1::{
 };
 use pulsus_profiles_wire::types_v1::LabelValuesRequest;
 use pulsus_read::profiles::ProfilesReadConfig;
+use pulsus_read::profiles::dot;
 use pulsus_read::profiles::flamegraph;
+use pulsus_read::profiles::pprof::PprofRequest;
 use pulsus_read::profiles::render::{self, RenderRequest};
 use pulsus_read::profiles::series;
 use pulsus_read::profiles::tree::TreeRequest;
@@ -118,7 +121,38 @@ pub(crate) async fn render_get(
         Err(e) => return e.into_response(),
     };
     let pairs = parse_pairs(raw.as_deref().unwrap_or(""));
+    if first(&pairs, "format") == Some("dot") {
+        return match dot_get(&state, &tenant, &pairs).await {
+            Ok(Some(text)) => {
+                ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+            }
+            Ok(None) => ([(header::CONTENT_TYPE, "text/plain")], "").into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
     answer(render_answer(&state, &tenant, &pairs).await)
+}
+
+/// Issue #829 part B: `format=dot`: the selection's merged profile as a DOT
+/// graph, cut to `source` function nodes and drawn with at most `dot`
+/// nodes (D2); `None` when it holds no sample (D4). `groupBy` and
+/// `aggregation` are not read (D5).
+async fn dot_get(
+    state: &AppState,
+    tenant: &Tenant,
+    pairs: &[(String, String)],
+) -> Result<Option<String>, ConnectError> {
+    let sel = selection(pairs, ["query", "from", "until"], now_ms())?;
+    let (dot_max, source) = dot::limits(Some(max_nodes(pairs)));
+    let req = PprofRequest {
+        profile_type: &sel.type_id,
+        label_selector: &sel.selector,
+        start_ms: sel.start_ms,
+        end_ms: sel.end_ms,
+        max_nodes: Some(source),
+        ..PprofRequest::default()
+    };
+    super::pprof::dot_text(state, tenant, req, dot_max).await
 }
 
 async fn render_answer(
@@ -134,12 +168,6 @@ async fn render_answer(
         .map(|(_, v)| v.clone())
         .collect();
     let average = first(pairs, "aggregation") == Some("avg");
-    if first(pairs, "format") == Some("dot") {
-        return Err(ConnectError::new(
-            Code::Unimplemented,
-            "format dot is not served yet",
-        ));
-    }
     let config = ProfilesReadConfig::from_config(&state.config);
     let req = RenderRequest {
         tree: TreeRequest {

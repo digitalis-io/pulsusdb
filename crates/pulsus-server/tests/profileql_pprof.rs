@@ -1,6 +1,8 @@
 //! Issue #828: `SelectMergeProfile`, `SelectMergeStacktraces` with
 //! `PROFILE_FORMAT_PPROF` and `GET /api/profiles/v1/export`, against the
-//! `pulsusdb` binary and a live ClickHouse.
+//! `pulsusdb` binary and a live ClickHouse. Issue #829 part B (EP9–EP12):
+//! the same profile as a DOT graph, `render?format=dot` and
+//! `SelectMergeStacktraces` with `PROFILE_FORMAT_DOT`.
 //!
 //! Fixture P (plan §8.1) is pushed through `/api/profiles/v1/ingest` under
 //! `t1` and, at 100× the values, under `t2`; an OTLP profile is pushed
@@ -452,7 +454,7 @@ fn ep8_expected(time_nanos: i64) -> Nf {
 }
 
 // ---------------------------------------------------------------------
-// EP1–EP8
+// EP1–EP12
 // ---------------------------------------------------------------------
 
 fn native(method: &str) -> String {
@@ -698,6 +700,119 @@ async fn the_merged_profile_answers_as_pprof_in_one_statement() {
         "EP8"
     );
     counted.push(("EP8", res.query_id("EP8"), 1));
+
+    // Issue #829 part B, EP9: `render?format=dot`, the merged profile as a
+    // DOT graph, in one statement.
+    let time = chrono::DateTime::from_timestamp_millis(end)
+        .expect("a time")
+        .format("%b %-d, %Y at %-I:%M%P")
+        .to_string();
+    let dot_query = |from: i64, until: i64| {
+        format!(
+            "/api/profiles/v1/render?query={query}&from={from}&until={until}&format=dot&max-nodes=100"
+        )
+    };
+    let res = call(
+        PORT,
+        "GET",
+        &dot_query(start, end),
+        &[("X-Scope-OrgID", "t1")],
+        &[],
+    );
+    assert_eq!(res.status, 200, "EP9: {}", res.text());
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/plain; charset=utf-8"),
+        "EP9"
+    );
+    let ep9 = res.text();
+    let want_ep9 =
+        include_str!("../../pulsus-read/src/profiles/dot/testdata/a6.dot").replace("TIME", &time);
+    assert!(
+        ep9 == want_ep9,
+        "EP9:\n--- got ---\n{ep9}--- want ---\n{want_ep9}"
+    );
+    counted.push(("EP9", res.query_id("EP9"), 1));
+
+    // EP10: the tenant's own samples.
+    let res = call(
+        PORT,
+        "GET",
+        &dot_query(start, end),
+        &[("X-Scope-OrgID", "t2")],
+        &[],
+    );
+    assert_eq!(res.status, 200, "EP10: {}", res.text());
+    let ep10 = res.text();
+    let n1 = ep10
+        .lines()
+        .find(|l| l.starts_with("N1 ["))
+        .unwrap_or_else(|| panic!("EP10: no N1 line: {ep10}"));
+    assert!(
+        n1.contains(r#"tooltip="main main.go:10 (20s)""#),
+        "EP10: {n1}"
+    );
+    assert!(
+        ep10.contains("Showing nodes accounting for 27s, 100% of 27s total"),
+        "EP10: {ep10}"
+    );
+    counted.push(("EP10", res.query_id("EP10"), 1));
+
+    // EP11: `SelectMergeStacktraces` with `PROFILE_FORMAT_DOT`, JSON: `dot`
+    // alone, EP9's text.
+    let dot_body = |from: i64, until: i64| {
+        json!({
+            "profileTypeID": CPU,
+            "labelSelector": SVC,
+            "start": from,
+            "end": until,
+            "format": "PROFILE_FORMAT_DOT",
+            "maxNodes": 100,
+        })
+        .to_string()
+    };
+    let json_call = |body: String| {
+        call(
+            PORT,
+            "POST",
+            &native("SelectMergeStacktraces"),
+            &[
+                ("Content-Type", "application/json"),
+                ("X-Scope-OrgID", "t1"),
+            ],
+            body.as_bytes(),
+        )
+    };
+    let res = json_call(dot_body(start, end));
+    assert_eq!(res.status, 200, "EP11: {}", res.text());
+    let v = res.json("EP11");
+    let keys: Vec<&String> = v.as_object().expect("EP11: an object").keys().collect();
+    assert_eq!(keys, ["dot"], "EP11: {v}");
+    assert!(v["dot"] == ep9.as_str(), "EP11: {v}");
+    counted.push(("EP11", res.query_id("EP11"), 1));
+
+    // EP12: a window ending before the lookback floor: no text, and no
+    // statement.
+    let (old_start, old_end) = (now - 9 * DAY_MS, now - 8 * DAY_MS);
+    let res = call(
+        PORT,
+        "GET",
+        &dot_query(old_start, old_end),
+        &[("X-Scope-OrgID", "t1")],
+        &[],
+    );
+    assert_eq!(res.status, 200, "EP12 render: {}", res.text());
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/plain"),
+        "EP12 render"
+    );
+    assert!(res.body.is_empty(), "EP12 render: {:?}", res.text());
+    counted.push(("EP12 render", res.query_id("EP12 render"), 0));
+    let res = json_call(dot_body(old_start, old_end));
+    assert_eq!(res.status, 200, "EP12 Connect: {}", res.text());
+    assert_eq!(res.json("EP12 Connect"), json!({}), "EP12 Connect");
+    counted.push(("EP12 Connect", res.query_id("EP12 Connect"), 0));
 
     let ids: Vec<String> = counted.iter().map(|(_, id, _)| id.clone()).collect();
     let sent = statements(&client, &ids).await;

@@ -333,7 +333,9 @@ own error, as PulsusDB does.
 ### `pprof-cut-keeps-max-nodes-exactly`
 
 - **Route:** `SelectMergeProfile`, `SelectMergeStacktraces` with
-  `PROFILE_FORMAT_PPROF`, `GET /api/profiles/v1/export`.
+  `PROFILE_FORMAT_PPROF`, `GET /api/profiles/v1/export`; and the profile
+  `render?format=dot` and `SelectMergeStacktraces` with `PROFILE_FORMAT_DOT`
+  draw.
 - **Request:** a `max_nodes` above 0; for example 3 on the fixture, or the
   16,384 the exploration app sends with every export.
 - **PulsusDB:** each stack is cut at its first kept function from the leaf: a
@@ -344,7 +346,17 @@ own error, as PulsusDB does.
   into `other`.
 - **Why:** owner, 2026-11-19, "Cut exactly";
   `docs/reference-defects-we-do-not-copy.md` entry 52.
-- **Case:** `C44` and `C45` in `crates/pulsus-server/tests/profileql_differential.rs`.
+- **Case:** `C44`, `C45` and `C52` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `dot-format-answers-dot`
+
+- **Route:** `SelectMergeStacktraces`.
+- **Request:** `format` `PROFILE_FORMAT_DOT`.
+- **PulsusDB:** `dot` alone, the merged profile's DOT text.
+- **Reference:** the flame graph and the tree, the router rewriting the
+  format (`pkg/frontend/readpath/query_service_handler.go:93-116`).
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 53.
+- **Case:** `C53` in `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ### `stats-bounds-are-hours`
 

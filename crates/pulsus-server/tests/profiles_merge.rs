@@ -602,21 +602,6 @@ async fn the_merged_flame_graph_answers_in_one_statement() {
     assert_eq!(got, json!({"flamegraph": empty()}), "M7");
     counted.push(("M7".to_string(), id, 0));
 
-    // M8: a format not served yet.
-    let id = refused(
-        &connect(
-            a,
-            native_path(),
-            "t1",
-            &body(json!({"format": "PROFILE_FORMAT_DOT"})),
-        ),
-        501,
-        "unimplemented",
-        "profile format PROFILE_FORMAT_DOT is not served yet",
-        "M8",
-    );
-    counted.push(("M8".to_string(), id, 0));
-
     // M9: the tenant's own samples.
     let (got, id) = answer(&connect(a, native_path(), "t2", &body(json!({}))), "M9");
     assert_eq!(with_tree(&got, "M9"), row1(100), "M9");

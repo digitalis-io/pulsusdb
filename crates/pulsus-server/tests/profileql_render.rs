@@ -622,15 +622,6 @@ async fn the_render_routes_answer_in_one_statement() {
     );
     counted.push(("L10", id, 1));
 
-    // L11: `format=dot` is not served yet.
-    let id = refused(
-        &get(a, render, "t1", &with(w(&query), "format", "dot")),
-        501,
-        "unimplemented",
-        "L11",
-    );
-    counted.push(("L11", id, 0));
-
     // L12: the compat path answers L1's body; with the compat flag unset
     // the native routes answer and the compat path is not mounted.
     let (got, id) = answer(&get(a, "/pyroscope/render", "t1", &w(&query)), "L12 compat");

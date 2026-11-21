@@ -106,6 +106,7 @@ replaces one.
 | [50](#50-a-render-timeline-from-before-a-tenants-first-profile-leaves-the-windows-grid) | profiles reference | queries | A | A render window that starts before a tenant's first profile puts that profile's sample one step earlier than the same window does once older data exists. |
 | [51](#51-the-pprof-export-writes-a-period-nobody-pushed) | profiles reference | queries | C | A CPU profile pushed with a 10 ms period is exported stating a 1 s period. |
 | [52](#52-the-pprof-exports-cut-keeps-a-frame-below-its-threshold-and-drops-unsymbolised-stacks-addresses) | profiles reference | queries | C, D | An export with a node limit keeps a function the limit cut, and replaces every stack of unsymbolised addresses with `other`. |
+| [53](#53-selectmergestacktraces-answers-a-dot-request-with-a-flame-graph) | profiles reference | queries | B, C | Asking `SelectMergeStacktraces` for the DOT format answers the flame graph and the tree. |
 
 ---
 
@@ -2677,7 +2678,41 @@ a stack with no function is kept as it is (`docs/api.md` §5). Owner decision, 2
 
 Ledger row `pprof-cut-keeps-max-nodes-exactly` (the profiles differential's ledger, issue #822). Pinned
 by `p2_cut_three`, `p3_cut_16384` and `p11_inlined_lines_count_as_frames` in
-`crates/pulsus-read/src/profiles/pprof.rs`.
+`crates/pulsus-read/src/profiles/pprof.rs`, and in the DOT format by case C52 of
+`crates/pulsus-server/tests/profileql_differential.rs`.
+
+---
+
+## 53. `SelectMergeStacktraces` answers a DOT request with a flame graph
+
+**The profiles reference · queries · tests B, C**
+
+### What the reference does
+
+The query frontend has its own handler for `PROFILE_FORMAT_DOT`: it reads the merged profile and
+answers its DOT text in `dot` (`pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:26-28`,
+`:57-98`). The served read path never reaches it. Its router sets every `SelectMergeStacktraces`
+request's format to `PROFILE_FORMAT_TREE` before the query, and, the format having changed, answers
+the flame graph built from the tree, with the tree beside it
+(`pkg/frontend/readpath/query_service_handler.go:93-116`). A DOT request is answered byte for byte as a
+request with no format.
+
+### Why that is wrong rather than different
+
+The one input that names the answer is dropped without a word (**C**): a client asking for a DOT graph
+gets a flame graph it did not ask for. And the router's own comment says the opposite of what it does
+(**B**): "We always query data in the tree format and return it in the format requested by the client"
+(`pkg/frontend/readpath/query_service_handler.go:93-94`).
+
+### What PulsusDB does
+
+`PROFILE_FORMAT_DOT` answers `dot` alone, the text `render?format=dot` writes for the same selection
+(`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `dot-format-answers-dot` (the profiles differential's ledger, issue #822). Pinned by case
+C53 of `crates/pulsus-server/tests/profileql_differential.rs`.
 
 ---
 
