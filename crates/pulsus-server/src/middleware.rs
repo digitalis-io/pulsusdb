@@ -585,8 +585,8 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823, #824, #827, #825, #828, #829, #830): the
-    /// twenty-eight Connect paths and the four unimplemented services'
+    /// C6 (issue #821, #823, #824, #827, #825, #828, #829, #830, #831):
+    /// the thirty-six Connect paths and the four unimplemented services'
     /// methods answer a deadline as a Connect error, the fourteen `GET`
     /// paths (`{name}` as `env`) as the reference's HTTP handlers do; the
     /// profiles ingest path keeps the bare `408`.
@@ -625,6 +625,14 @@ mod tests {
             "/api/profiles/v1/settings.v1.RecordingRulesService/UpsertRecordingRule",
             "/vcs.v1.VCSService/GithubApp",
             "/api/profiles/v1/vcs.v1.VCSService/GetFile",
+            "/adhocprofiles.v1.AdHocProfileService/Upload",
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
+            "/adhocprofiles.v1.AdHocProfileService/Get",
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Get",
+            "/adhocprofiles.v1.AdHocProfileService/List",
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/List",
+            "/adhocprofiles.v1.AdHocProfileService/Diff",
+            "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Diff",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }

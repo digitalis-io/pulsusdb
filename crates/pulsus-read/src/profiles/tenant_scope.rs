@@ -98,4 +98,24 @@ WHERE org_id = 't1' AND day BETWEEN '2026-11-15' AND '2026-11-15'
         );
         assert_eq!(check(&sql, &t1(), &tables("_dist")), Ok(()));
     }
+
+    /// T3 (issue #831): `profile_adhoc` and its wrapper are scoped.
+    #[test]
+    fn t3_the_adhoc_table_is_scoped() {
+        let tables = tables("_dist");
+        for sql in [
+            "SELECT 1 FROM profile_adhoc WHERE row_kind = 1",
+            "SELECT 1 FROM profile_adhoc_dist WHERE row_kind = 1",
+        ] {
+            assert!(check(sql, &t1(), &tables).is_err(), "accepted: {sql}");
+        }
+        assert_eq!(
+            check(
+                "SELECT 1 FROM profile_adhoc_dist WHERE org_id = 't1' AND row_kind = 1",
+                &t1(),
+                &tables
+            ),
+            Ok(())
+        );
+    }
 }

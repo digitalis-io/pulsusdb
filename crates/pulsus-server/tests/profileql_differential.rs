@@ -11,7 +11,9 @@
 //! decoded (rule R4). Issue #829 part B adds the DOT format (C50–C54).
 //! Issue #830 adds the exploration app's settings, the profile stats, the
 //! query analysis and the two services not served (C55–C63); a settings
-//! case runs its steps in order under a tenant of its own.
+//! case runs its steps in order under a tenant of its own. Issue #831 adds
+//! the ad hoc uploads (C64–C78), each case its steps in order under a
+//! tenant of its own, an upload's id resolved to each server's own.
 //!
 //! A difference that is not a row of
 //! `docs/benchmarks/profileql-differential-ledger.md` fails the run. A
@@ -33,6 +35,8 @@
 mod live_db;
 #[path = "../../pulsus-read/tests/profileql_pprof_nf/mod.rs"]
 mod nf;
+#[path = "../../pulsus-read/tests/profileql_adhoc_fixtures/mod.rs"]
+mod fx;
 
 use live_db::ScopedDb;
 
@@ -232,6 +236,90 @@ enum StepExpect {
 /// Issue #830: one settings step: the call, its JSON body, its check.
 type Step = (Call, &'static str, StepExpect);
 
+/// Issue #831: an ad hoc call. `upload` is the index of an earlier
+/// `Upload` step of the case, resolved to each server's own id.
+#[derive(Debug, Clone, Copy)]
+enum AdhocCall {
+    Upload {
+        name: &'static str,
+        file: fn() -> Vec<u8>,
+        max_nodes: Option<i64>,
+    },
+    Get {
+        upload: usize,
+        profile_type: Option<&'static str>,
+        max_nodes: Option<i64>,
+    },
+    Diff {
+        left: usize,
+        right: usize,
+        profile_type: Option<&'static str>,
+        max_nodes: Option<i64>,
+    },
+    List,
+    /// `Get` of an upload under `<case>-other-<run>`.
+    GetIn { upload: usize },
+    /// `Get` of this id.
+    GetId(&'static str),
+}
+
+/// Issue #831: how an ad hoc step's two answers are checked.
+#[derive(Debug, Clone, Copy)]
+enum AdhocExpect {
+    /// The JSON parity, `id` and `uploadedAt` removed at every depth.
+    Same,
+    /// On each server, `404` naming that server's id of this upload.
+    NotFound(usize),
+    /// Each server's flame graph names and levels as given; fails when
+    /// the two agree.
+    Ledger {
+        row: &'static str,
+        ours: AdhocGraph,
+        theirs: AdhocGraph,
+    },
+}
+
+/// Issue #831: a flame graph's names and levels.
+type AdhocGraph = (&'static [&'static str], &'static [&'static [i64]]);
+
+/// Issue #831: one ad hoc step.
+type AdhocStep = (AdhocCall, AdhocExpect);
+
+fn file_c() -> Vec<u8> {
+    fx::F_C.to_vec()
+}
+fn file_x() -> Vec<u8> {
+    fx::F_X.to_vec()
+}
+fn file_x2() -> Vec<u8> {
+    fx::F_X2.to_vec()
+}
+fn file_j() -> Vec<u8> {
+    fx::F_J.to_vec()
+}
+fn file_s() -> Vec<u8> {
+    fx::F_S.to_vec()
+}
+fn file_u_collapsed() -> Vec<u8> {
+    fx::F_U_COLLAPSED.to_vec()
+}
+fn file_u_perf() -> Vec<u8> {
+    fx::F_U_PERF.to_vec()
+}
+fn file_se() -> Vec<u8> {
+    fx::F_SE.to_vec()
+}
+/// A file whose base64 is 4,194,308 bytes, above the 4,194,304 limit.
+fn file_over() -> Vec<u8> {
+    vec![0; 3_145_729]
+}
+fn file_one_byte() -> Vec<u8> {
+    b"m".to_vec()
+}
+fn file_bad_value() -> Vec<u8> {
+    b"main;a x".to_vec()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Window {
     /// `now − 1 h` to `now + 1 h`, the datasource's own default.
@@ -339,6 +427,8 @@ enum Method {
     Analyze,
     /// Issue #830: this path, a method of a service not served.
     Unimplemented(&'static str),
+    /// Issue #831: these ad hoc calls, in order.
+    Adhoc(&'static [AdhocStep]),
 }
 
 impl Method {
@@ -366,6 +456,7 @@ impl Method {
             Method::Stats => "GetProfileStats",
             Method::Analyze => "AnalyzeQuery",
             Method::Unimplemented(path) => path,
+            Method::Adhoc(_) => "adhoc",
         }
     }
 
@@ -1807,6 +1898,652 @@ static CASES: &[Case] = &[
             },
         },
     },
+    Case {
+        id: "C64",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "p.pb.gz",
+                    file: fx::f_p,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("cpu"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("samples"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("alloc"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: Some(2),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C65",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "p.pb.gz",
+                    file: fx::f_p,
+                    max_nodes: Some(2),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("cpu"),
+                    max_nodes: Some(3),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("cpu"),
+                    max_nodes: Some(4),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("cpu"),
+                    max_nodes: Some(16),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C66",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "dup",
+                    file: fx::f_d,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("cpu"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C67",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "c 1.txt",
+                    file: file_c,
+                    max_nodes: Some(2),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: Some(1),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: Some(2),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C68",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "x.txt",
+                    file: file_x,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "x.txt",
+                    file: file_x2,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: Some(1),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 1,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 1,
+                    profile_type: None,
+                    max_nodes: Some(2),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C69",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "a.json",
+                    file: file_j,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("b"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("a.json"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: Some(1),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: Some(1),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C70",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "perf.txt",
+                    file: file_s,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "perf",
+                    file: file_s,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 1,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: Some(1),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: Some(1),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C71",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "c.txt",
+                    file: file_u_collapsed,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "c.collapsed",
+                    file: file_u_collapsed,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "u.txt",
+                    file: file_u_perf,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 1,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 2,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C72",
+        client: "exploration app, ad hoc view",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "ba",
+                    file: fx::f_ba,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C73",
+        client: "exploration app, ad hoc diff",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "p.pb.gz",
+                    file: fx::f_p,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "z",
+                    file: fx::f_z,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "dup",
+                    file: fx::f_d,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "c 1.txt",
+                    file: file_c,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 1,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 1,
+                    profile_type: None,
+                    max_nodes: Some(2),
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 2,
+                    profile_type: Some("samples"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Diff {
+                    left: 0,
+                    right: 3,
+                    profile_type: None,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C74",
+        client: "reference API",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "c 1.txt",
+                    file: file_c,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "x.txt",
+                    file: file_x,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (AdhocCall::List, AdhocExpect::Same),
+            (AdhocCall::GetIn { upload: 0 }, AdhocExpect::NotFound(0)),
+            (AdhocCall::List, AdhocExpect::Same),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C75",
+        client: "reference API",
+        request: own(Method::Adhoc(&[
+            (AdhocCall::GetId("a/b"), AdhocExpect::Same),
+            (AdhocCall::GetId("zz"), AdhocExpect::Same),
+            (
+                AdhocCall::Upload {
+                    name: "big.txt",
+                    file: file_over,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "x",
+                    file: file_one_byte,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "x.txt",
+                    file: file_bad_value,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Upload {
+                    name: "c.txt",
+                    file: file_c,
+                    max_nodes: Some(-1),
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C76",
+        client: "reference API",
+        request: own(Method::Adhoc(&[
+            (
+                AdhocCall::Upload {
+                    name: "empty",
+                    file: fx::f_e,
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+            (
+                AdhocCall::Get {
+                    upload: 0,
+                    profile_type: Some("samples"),
+                    max_nodes: None,
+                },
+                AdhocExpect::Same,
+            ),
+        ])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C77",
+        client: "reference API",
+        request: own(Method::Adhoc(&[(
+            AdhocCall::Upload {
+                name: "ids",
+                file: fx::f_ids,
+                max_nodes: None,
+            },
+            AdhocExpect::Ledger {
+                row: "adhoc-pprof-ids-by-id",
+                ours: (
+                    &["total", "main", "b", "a"],
+                    &[&[0, 6, 0, 0], &[0, 6, 0, 1], &[0, 5, 5, 3, 0, 1, 1, 2]],
+                ),
+                theirs: (
+                    &["total", "a", "main", "b"],
+                    &[&[0, 6, 0, 0], &[0, 6, 0, 1], &[0, 1, 1, 3, 0, 5, 5, 2]],
+                ),
+            },
+        )])),
+        expect: Expect::Steps,
+    },
+    Case {
+        id: "C78",
+        client: "reference API",
+        request: own(Method::Adhoc(&[(
+            AdhocCall::Upload {
+                name: "p.txt",
+                file: file_se,
+                max_nodes: None,
+            },
+            AdhocExpect::Ledger {
+                row: "adhoc-perf-last-event-kept",
+                ours: (
+                    &["total", "java", "foo", "bar"],
+                    &[&[0, 2, 0, 0], &[0, 2, 0, 1], &[0, 1, 1, 3, 0, 1, 1, 2]],
+                ),
+                theirs: (
+                    &["total", "java", "foo"],
+                    &[&[0, 1, 0, 0], &[0, 1, 0, 1], &[0, 1, 1, 2]],
+                ),
+            },
+        )])),
+        expect: Expect::Steps,
+    },
 ];
 
 // ---------------------------------------------------------------------
@@ -1881,6 +2618,14 @@ fn the_ledger_and_the_cases_name_each_other() {
     let mut problems: Vec<String> = Vec::new();
 
     for case in CASES {
+        for row in adhoc_ledger_rows(case) {
+            if !headings.contains(row) {
+                problems.push(format!(
+                    "case {} names ledger row `{row}`, not a heading",
+                    case.id
+                ));
+            }
+        }
         if let Expect::Ledger { row, .. }
         | Expect::LedgerPprof { row, .. }
         | Expect::LedgerFixture { row, .. }
@@ -1910,6 +2655,7 @@ fn the_ledger_and_the_cases_name_each_other() {
                     | Expect::LedgerTimeline { row, .. },
                 ..
             }) if row == id => {}
+            Some(case) if adhoc_ledger_rows(case).contains(&id.as_str()) => {}
             Some(_) => problems.push(format!(
                 "ledger row `{id}` names case {case_id}, which is not pinned to that row"
             )),
@@ -1937,6 +2683,20 @@ fn the_ledger_and_the_cases_name_each_other() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Issue #831: the ledger rows an ad hoc case's steps are pinned to.
+fn adhoc_ledger_rows(case: &Case) -> Vec<&'static str> {
+    match case.request.method {
+        Method::Adhoc(steps) => steps
+            .iter()
+            .filter_map(|(_, expect)| match expect {
+                AdhocExpect::Ledger { row, .. } => Some(*row),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -4093,7 +4853,14 @@ fn request_body(method: &Method, encoding: Encoding, win: Windows) -> Vec<u8> {
             _,
         ) => Vec::new(),
         // Issue #830: built by `send`, or by its steps.
-        (Method::Settings(_) | Method::Stats | Method::Analyze | Method::Unimplemented(_), _) => {
+        (
+            Method::Settings(_)
+            | Method::Stats
+            | Method::Analyze
+            | Method::Unimplemented(_)
+            | Method::Adhoc(_),
+            _,
+        ) => {
             panic!("{} has no body here", method.name())
         }
         (
@@ -4391,6 +5158,7 @@ fn send(server: &Server, request: &Request, tenant: Option<&str>, win: Windows) 
         .to_string()
         .into_bytes(),
         Method::Settings(_) => panic!("a settings case sends its steps"),
+        Method::Adhoc(_) => panic!("an ad hoc case sends its steps"),
         _ => request_body(&request.method, request.encoding, win),
     };
     let (content_type, accept) = match (request.encoding, request.utf8) {
@@ -4426,6 +5194,202 @@ fn send_step(server: &Server, tenant: &str, step: &Step) -> Res {
             ("X-Scope-OrgID", tenant),
         ],
         step.1.as_bytes(),
+    )
+}
+
+/// Issue #831: an ad hoc call's path and JSON body, `ids` each earlier
+/// upload's id on this server.
+fn adhoc_request(call: &AdhocCall, ids: &[Option<String>]) -> (&'static str, Value) {
+    let id = |i: usize| ids.get(i).cloned().flatten().unwrap_or_default();
+    let opt = |v: &mut Value, ty: Option<&str>, m: Option<i64>| {
+        if let Some(t) = ty {
+            v["profileType"] = json!(t);
+        }
+        if let Some(m) = m {
+            v["maxNodes"] = json!(m);
+        }
+    };
+    match *call {
+        AdhocCall::Upload {
+            name,
+            file,
+            max_nodes,
+        } => {
+            let mut v = json!({"name": name, "profile": fx::b64(&file())});
+            opt(&mut v, None, max_nodes);
+            ("Upload", v)
+        }
+        AdhocCall::Get {
+            upload,
+            profile_type,
+            max_nodes,
+        } => {
+            let mut v = json!({"id": id(upload)});
+            opt(&mut v, profile_type, max_nodes);
+            ("Get", v)
+        }
+        AdhocCall::Diff {
+            left,
+            right,
+            profile_type,
+            max_nodes,
+        } => {
+            let mut v = json!({"leftId": id(left), "rightId": id(right)});
+            opt(&mut v, profile_type, max_nodes);
+            ("Diff", v)
+        }
+        AdhocCall::List => ("List", json!({})),
+        AdhocCall::GetIn { upload } => ("Get", json!({"id": id(upload)})),
+        AdhocCall::GetId(s) => ("Get", json!({"id": s})),
+    }
+}
+
+/// Issue #831: `v` with every `id` and `uploadedAt` removed, at every
+/// depth.
+fn without_ids(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            m.remove("id");
+            m.remove("uploadedAt");
+            m.values_mut().for_each(without_ids);
+        }
+        Value::Array(a) => a.iter_mut().for_each(without_ids),
+        _ => {}
+    }
+}
+
+/// Issue #831: an ad hoc answer's flame graph names and levels.
+fn adhoc_graph(res: &Res) -> Option<(Vec<String>, Vec<Vec<i64>>)> {
+    let v = json_value(&res.body)?;
+    let fb: Value = serde_json::from_str(v["flamebearerProfile"].as_str()?).ok()?;
+    let names = serde_json::from_value(fb["flamebearer"]["names"].clone()).ok()?;
+    let levels = serde_json::from_value(fb["flamebearer"]["levels"].clone()).ok()?;
+    Some((names, levels))
+}
+
+/// Issue #831: one ad hoc case, its steps in order on each server.
+fn run_adhoc(
+    case: &Case,
+    steps: &[AdhocStep],
+    tenant: &str,
+    other: &str,
+    ours: &Server,
+    reference: &Server,
+    mismatches: &mut Mismatches,
+) {
+    let mut ids: [Vec<Option<String>>; 2] = [Vec::new(), Vec::new()];
+    for (i, (call, expect)) in steps.iter().enumerate() {
+        let what = format!(
+            "{} ({}, step {} {call:?}) under {tenant}",
+            case.id,
+            case.client,
+            i + 1
+        );
+        let as_tenant = if matches!(call, AdhocCall::GetIn { .. }) {
+            other
+        } else {
+            tenant
+        };
+        let mut answers: Vec<Res> = Vec::new();
+        for (k, server) in [ours, reference].into_iter().enumerate() {
+            let (method, body) = adhoc_request(call, &ids[k]);
+            let res = call_json(
+                server,
+                &format!("/adhocprofiles.v1.AdHocProfileService/{method}"),
+                as_tenant,
+                &body,
+            );
+            let id = (matches!(call, AdhocCall::Upload { .. }) && res.status == 200)
+                .then(|| json_value(&res.body))
+                .flatten()
+                .and_then(|v| v["id"].as_str().map(str::to_string));
+            ids[k].push(id);
+            answers.push(res);
+        }
+        let (a, b) = (&answers[0], &answers[1]);
+        match expect {
+            AdhocExpect::Same => {
+                let why = if a.status != b.status {
+                    Some("status differs")
+                } else if a.content_type != b.content_type {
+                    Some("Content-Type differs")
+                } else {
+                    match (json_value(&a.body), json_value(&b.body)) {
+                        (Some(mut x), Some(mut y)) => {
+                            without_ids(&mut x);
+                            without_ids(&mut y);
+                            (x != y).then_some("JSON bodies differ, ids and times aside")
+                        }
+                        _ => (a.body != b.body).then_some("bodies differ"),
+                    }
+                };
+                if let Some(why) = why {
+                    mismatches.both(&what, why, a, b, "adhoc", Encoding::Json);
+                }
+            }
+            AdhocExpect::NotFound(upload) => {
+                for (k, (res, server)) in [(a, ours), (b, reference)].into_iter().enumerate() {
+                    let id = ids[k].get(*upload).cloned().flatten().unwrap_or_default();
+                    let want = json!({"code": "not_found", "message": format!("profile {id} not found")});
+                    if res.status != 404 || json_value(&res.body) != Some(want.clone()) {
+                        mismatches.one(
+                            &what,
+                            &format!(
+                                "{}: want 404 {want}, got {} {}",
+                                server.name,
+                                res.status,
+                                String::from_utf8_lossy(&res.body)
+                            ),
+                        );
+                    }
+                }
+            }
+            AdhocExpect::Ledger { row, ours: po, theirs: pt } => {
+                let pinned = |res: &Res, pin: &AdhocGraph| {
+                    let want = (
+                        pin.0.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                        pin.1.iter().map(|l| l.to_vec()).collect::<Vec<_>>(),
+                    );
+                    res.status == 200 && adhoc_graph(res) == Some(want)
+                };
+                if !pinned(a, po) || !pinned(b, pt) {
+                    mismatches.both(
+                        &what,
+                        &format!("ledger row `{row}`: an answer is not its pin"),
+                        a,
+                        b,
+                        "adhoc",
+                        Encoding::Json,
+                    );
+                } else if adhoc_graph(a) == adhoc_graph(b) {
+                    mismatches.both(
+                        &what,
+                        &format!(
+                            "ledger row `{row}`: the two agree, so the reference changed and \
+                             the row is retired"
+                        ),
+                        a,
+                        b,
+                        "adhoc",
+                        Encoding::Json,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Issue #831: a JSON Connect call of `path` as `tenant`.
+fn call_json(server: &Server, path: &str, tenant: &str, body: &Value) -> Res {
+    call(
+        server,
+        "POST",
+        path,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Scope-OrgID", tenant),
+        ],
+        body.to_string().as_bytes(),
     )
 }
 
@@ -5102,10 +6066,16 @@ async fn profileql_matches_the_reference() {
     eprintln!("the fixture settled in {} s", settling.elapsed().as_secs());
     drop(filler);
 
-    // §4: C0–C63.
+    // §4: C0–C78.
     let mut types: BTreeMap<(&str, bool), Vec<String>> = BTreeMap::new();
     for case in CASES {
         let own = format!("{}-{run}", case.id.to_ascii_lowercase());
+        // Issue #831: an ad hoc case's steps, in order, on each server.
+        if let Method::Adhoc(steps) = case.request.method {
+            let other = format!("{}-other-{run}", case.id.to_ascii_lowercase());
+            run_adhoc(case, steps, &own, &other, &ours, &reference, &mut mismatches);
+            continue;
+        }
         // Issue #830: a settings case's steps, in order, on each server.
         if let Method::Settings(steps) = case.request.method {
             let case_start = chrono::Utc::now().timestamp_millis();

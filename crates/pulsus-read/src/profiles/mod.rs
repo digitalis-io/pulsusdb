@@ -9,8 +9,10 @@
 //! #828: the merged profile as pprof (`pprof`). Issue #829: the render
 //! route's one statement and its timeline (`render`); part B, the merged
 //! profile as a DOT graph (`dot`). Issue #830: the exploration app's
-//! settings and profile stats (`app`).
+//! settings and profile stats (`app`). Issue #831: ad hoc profile uploads
+//! (`adhoc`).
 
+pub mod adhoc;
 pub mod app;
 pub mod catalogue;
 pub mod diff;

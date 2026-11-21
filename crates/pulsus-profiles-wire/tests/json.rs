@@ -9,8 +9,13 @@
 //! W11 (issue #826): an exemplar. W12 (issue #828): the pprof `Profile`'s
 //! JSON, and `SelectMergeProfile`'s request as the exploration app sends it.
 //! W14 (issue #830): the settings, stats and query analysis messages.
+//! W15 (issue #831): the ad hoc upload messages.
 
 use pulsus_profiles_wire::google_v1::Profile;
+use pulsus_profiles_wire::profileql_adhoc_v1::{
+    AdHocProfilesDiffRequest, AdHocProfilesGetRequest, AdHocProfilesGetResponse,
+    AdHocProfilesListResponse, AdHocProfilesProfileMetadata, AdHocProfilesUploadRequest,
+};
 use pulsus_profiles_wire::querier_v1::{
     AnalyzeQueryRequest, AnalyzeQueryResponse, DiffRequest, DiffResponse, FlameGraph,
     FlameGraphDiff, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse, QueryScope,
@@ -635,4 +640,83 @@ fn w14_the_settings_stats_and_analysis_json() {
     let q: AnalyzeQueryRequest =
         serde_json::from_str(r#"{"start":"1","end":2,"query":"{}"}"#).expect("decode");
     assert_eq!((q.start, q.end, q.query.as_str()), (1, 2, "{}"));
+}
+
+/// **W15** (issue #831): the ad hoc requests read each multi-word field by
+/// its JSON name or its proto name, `maxNodes` as a number or a string; the
+/// answers write their JSON names, `uploadedAt` as a string, and an empty
+/// list as `{}`.
+#[test]
+fn w15_the_adhoc_json() {
+    for text in [
+        r#"{"id":"u","profileType":"cpu","maxNodes":3}"#,
+        r#"{"id":"u","profile_type":"cpu","max_nodes":"3"}"#,
+    ] {
+        let g: AdHocProfilesGetRequest = serde_json::from_str(text).expect("decode");
+        assert_eq!(
+            g,
+            AdHocProfilesGetRequest {
+                id: "u".to_string(),
+                profile_type: Some("cpu".to_string()),
+                max_nodes: Some(3),
+            },
+            "{text}"
+        );
+    }
+    let g: AdHocProfilesGetRequest = serde_json::from_str(r#"{"id":"u"}"#).expect("decode");
+    assert_eq!((g.profile_type, g.max_nodes), (None, None));
+    for text in [
+        r#"{"name":"c 1.txt","profile":"YQ==","maxNodes":2}"#,
+        r#"{"name":"c 1.txt","profile":"YQ==","max_nodes":"2"}"#,
+    ] {
+        let u: AdHocProfilesUploadRequest = serde_json::from_str(text).expect("decode");
+        assert_eq!(
+            (u.name.as_str(), u.profile.as_str(), u.max_nodes),
+            ("c 1.txt", "YQ==", Some(2)),
+            "{text}"
+        );
+    }
+    for text in [
+        r#"{"leftId":"l","rightId":"r","profileType":"cpu","maxNodes":"4"}"#,
+        r#"{"left_id":"l","right_id":"r","profile_type":"cpu","max_nodes":4}"#,
+    ] {
+        let d: AdHocProfilesDiffRequest = serde_json::from_str(text).expect("decode");
+        assert_eq!(
+            d,
+            AdHocProfilesDiffRequest {
+                left_id: "l".to_string(),
+                right_id: "r".to_string(),
+                profile_type: Some("cpu".to_string()),
+                max_nodes: Some(4),
+            },
+            "{text}"
+        );
+    }
+    let r = AdHocProfilesGetResponse {
+        id: "u".to_string(),
+        name: "c_1.txt".to_string(),
+        uploaded_at: 1_795_000_000_000,
+        profile_type: "c_1.txt".to_string(),
+        profile_types: vec!["c_1.txt".to_string()],
+        flamebearer_profile: "{}".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_string(&r).expect("encode"),
+        r#"{"id":"u","name":"c_1.txt","uploadedAt":"1795000000000","profileType":"c_1.txt","profileTypes":["c_1.txt"],"flamebearerProfile":"{}"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&AdHocProfilesListResponse::default()).expect("encode"),
+        "{}"
+    );
+    assert_eq!(
+        serde_json::to_string(&AdHocProfilesListResponse {
+            profiles: vec![AdHocProfilesProfileMetadata {
+                id: "u".to_string(),
+                name: "c.txt".to_string(),
+                uploaded_at: 7,
+            }],
+        })
+        .expect("encode"),
+        r#"{"profiles":[{"id":"u","name":"c.txt","uploadedAt":"7"}]}"#
+    );
 }

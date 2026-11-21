@@ -16,13 +16,16 @@
 //! form. Issue #829: `flamebearer`, the render routes' JSON answer. Issue
 //! #830: `settings_v1`, the exploration app's settings
 //! (`proto/settings/v1/setting.proto`, kept verbatim), and the stats and
-//! query analysis messages of `types_v1` and `querier_v1`.
+//! query analysis messages of `types_v1` and `querier_v1`. Issue #831:
+//! `profileql_adhoc_v1`, the ad hoc uploads
+//! (`proto/profileql_adhoc/v1/profileql_adhoc.proto`, kept verbatim).
 
 pub mod connect;
 pub mod flamebearer;
 pub mod google_v1;
 pub mod int64;
 mod json;
+pub mod profileql_adhoc_v1;
 pub mod push_v1;
 pub mod querier_v1;
 pub mod settings_v1;

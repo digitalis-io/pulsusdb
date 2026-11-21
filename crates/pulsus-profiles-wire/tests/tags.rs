@@ -20,6 +20,10 @@
 //! `AnalyzeQuery`'s against `proto/types/v1/types.proto` and
 //! `proto/querier/v1/querier.proto`.
 //!
+//! W14 (issue #831): the ad hoc upload messages against
+//! `proto/profileql_adhoc/v1/profileql_adhoc.proto`, each field's number
+//! read from the file.
+//!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
 //! `proto/push/v1/push.proto`.
@@ -28,6 +32,11 @@ use prost::Message;
 use prost::encoding;
 use pulsus_profiles_wire::google_v1::{
     Function, Label, Line, Location, Mapping, Profile, Sample, ValueType,
+};
+use pulsus_profiles_wire::profileql_adhoc_v1::{
+    AdHocProfilesDiffRequest, AdHocProfilesDiffResponse, AdHocProfilesGetRequest,
+    AdHocProfilesGetResponse, AdHocProfilesListRequest, AdHocProfilesListResponse,
+    AdHocProfilesProfileMetadata, AdHocProfilesUploadRequest,
 };
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
@@ -1108,4 +1117,171 @@ fn every_settings_stats_and_analysis_field_encodes_under_the_proto_tag() {
     nested(1, &scope_bytes(&sc), &mut b);
     nested(2, &impact_bytes(&im), &mut b);
     check("AnalyzeQueryResponse", &a, b);
+}
+
+/// Issue #831: each field number of `message` in the vendored ad hoc
+/// `.proto`, by field name.
+fn adhoc_proto_tags(message: &str) -> Vec<(String, u32)> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/proto/profileql_adhoc/v1/profileql_adhoc.proto"
+    );
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("the vendored ad hoc .proto at {path}: {e}"));
+    let head = format!("message {message} {{");
+    let start = text
+        .find(&head)
+        .unwrap_or_else(|| panic!("no message {message} in {path}"));
+    let body = &text[start + head.len()..];
+    let body = &body[..body.find('}').expect("the message ends")];
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && l.contains('='))
+        .map(|l| {
+            let (left, right) = l.split_once('=').expect("a field line");
+            let name = left.split_whitespace().last().expect("a field name");
+            let n = right.trim().trim_end_matches(';').trim();
+            (name.to_string(), n.parse().expect("a field number"))
+        })
+        .collect()
+}
+
+/// **W14** (issue #831): every ad hoc message, every field set, encodes
+/// under the number the vendored `.proto` gives that field.
+#[test]
+fn every_adhoc_field_encodes_under_the_proto_tag() {
+    let tag = |message: &str, field: &str| -> u32 {
+        adhoc_proto_tags(message)
+            .into_iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, t)| t)
+            .unwrap_or_else(|| panic!("{message}.{field} is not in the .proto"))
+    };
+    let fields = |message: &str| -> Vec<String> {
+        adhoc_proto_tags(message).into_iter().map(|(n, _)| n).collect()
+    };
+
+    let m = "AdHocProfilesUploadRequest";
+    assert_eq!(fields(m), ["name", "profile", "max_nodes"], "{m}");
+    let u = AdHocProfilesUploadRequest {
+        name: "c.txt".to_string(),
+        profile: "YSAxCg==".to_string(),
+        max_nodes: Some(7),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(tag(m, "name"), &u.name, &mut b);
+    encoding::string::encode(tag(m, "profile"), &u.profile, &mut b);
+    encoding::int64::encode(tag(m, "max_nodes"), &7, &mut b);
+    check(m, &u, b);
+
+    let m = "AdHocProfilesGetRequest";
+    assert_eq!(fields(m), ["id", "profile_type", "max_nodes"], "{m}");
+    let g = AdHocProfilesGetRequest {
+        id: "u".to_string(),
+        profile_type: Some("cpu".to_string()),
+        max_nodes: Some(3),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(tag(m, "id"), &g.id, &mut b);
+    encoding::string::encode(tag(m, "profile_type"), &"cpu".to_string(), &mut b);
+    encoding::int64::encode(tag(m, "max_nodes"), &3, &mut b);
+    check(m, &g, b);
+
+    let m = "AdHocProfilesGetResponse";
+    assert_eq!(
+        fields(m),
+        [
+            "id",
+            "name",
+            "uploaded_at",
+            "profile_type",
+            "profile_types",
+            "flamebearer_profile"
+        ],
+        "{m}"
+    );
+    let r = AdHocProfilesGetResponse {
+        id: "u".to_string(),
+        name: "c.txt".to_string(),
+        uploaded_at: 1_795_000_000_000,
+        profile_type: "cpu".to_string(),
+        profile_types: strings(&["cpu", "samples"]),
+        flamebearer_profile: "{}".to_string(),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(tag(m, "id"), &r.id, &mut b);
+    encoding::string::encode(tag(m, "name"), &r.name, &mut b);
+    encoding::int64::encode(tag(m, "uploaded_at"), &r.uploaded_at, &mut b);
+    encoding::string::encode(tag(m, "profile_type"), &r.profile_type, &mut b);
+    encoding::string::encode_repeated(tag(m, "profile_types"), &r.profile_types, &mut b);
+    encoding::string::encode(
+        tag(m, "flamebearer_profile"),
+        &r.flamebearer_profile,
+        &mut b,
+    );
+    check(m, &r, b);
+
+    let m = "AdHocProfilesListRequest";
+    assert!(fields(m).is_empty(), "{m}");
+    check(m, &AdHocProfilesListRequest {}, Vec::new());
+
+    let m = "AdHocProfilesProfileMetadata";
+    assert_eq!(fields(m), ["id", "name", "uploaded_at"], "{m}");
+    let p = AdHocProfilesProfileMetadata {
+        id: "u".to_string(),
+        name: "c.txt".to_string(),
+        uploaded_at: 5,
+    };
+    let mut pb = Vec::new();
+    encoding::string::encode(tag(m, "id"), &p.id, &mut pb);
+    encoding::string::encode(tag(m, "name"), &p.name, &mut pb);
+    encoding::int64::encode(tag(m, "uploaded_at"), &p.uploaded_at, &mut pb);
+    check(m, &p, pb.clone());
+
+    let m = "AdHocProfilesListResponse";
+    assert_eq!(fields(m), ["profiles"], "{m}");
+    let mut b = Vec::new();
+    nested(tag(m, "profiles"), &pb, &mut b);
+    nested(tag(m, "profiles"), &pb, &mut b);
+    check(
+        m,
+        &AdHocProfilesListResponse {
+            profiles: vec![p.clone(), p],
+        },
+        b,
+    );
+
+    let m = "AdHocProfilesDiffRequest";
+    assert_eq!(
+        fields(m),
+        ["left_id", "right_id", "profile_type", "max_nodes"],
+        "{m}"
+    );
+    let d = AdHocProfilesDiffRequest {
+        left_id: "l".to_string(),
+        right_id: "r".to_string(),
+        profile_type: Some("cpu".to_string()),
+        max_nodes: Some(2),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(tag(m, "left_id"), &d.left_id, &mut b);
+    encoding::string::encode(tag(m, "right_id"), &d.right_id, &mut b);
+    encoding::string::encode(tag(m, "profile_type"), &"cpu".to_string(), &mut b);
+    encoding::int64::encode(tag(m, "max_nodes"), &2, &mut b);
+    check(m, &d, b);
+
+    let m = "AdHocProfilesDiffResponse";
+    assert_eq!(fields(m), ["profile_types", "flamebearer_profile"], "{m}");
+    let r = AdHocProfilesDiffResponse {
+        profile_types: strings(&["cpu"]),
+        flamebearer_profile: "{}".to_string(),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(tag(m, "profile_types"), &r.profile_types, &mut b);
+    encoding::string::encode(
+        tag(m, "flamebearer_profile"),
+        &r.flamebearer_profile,
+        &mut b,
+    );
+    check(m, &r, b);
 }

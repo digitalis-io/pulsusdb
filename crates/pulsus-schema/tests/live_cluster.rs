@@ -726,7 +726,7 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
     ctx.profile_dedup_window = 5_000;
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
 
-    const WRITE_PATH_TABLES: [&str; 21] = [
+    const WRITE_PATH_TABLES: [&str; 22] = [
         "log_landing",
         "log_samples",
         "log_streams",
@@ -748,6 +748,7 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
         "profile_series",
         "profile_stacks",
         "profile_locations",
+        "profile_adhoc",
     ];
 
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {

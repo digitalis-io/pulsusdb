@@ -201,6 +201,8 @@ fn config() -> ProfilesReadConfig {
         series_table: "profile_series".to_string(),
         samples_table: "profile_samples".to_string(),
         entries_table: "profile_entries".to_string(),
+        landing_table: "profile_landing".to_string(),
+        adhoc_table: "profile_adhoc".to_string(),
         dist_suffix: String::new(),
         limits: WindowLimits::default(),
         scan_budget_rows: 50_000_000,

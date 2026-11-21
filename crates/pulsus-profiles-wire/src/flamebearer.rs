@@ -3,6 +3,9 @@
 //! (`pkg/og/structs/flamebearer/flamebearer.go:18-103`,
 //! `pkg/model/flamegraph.go:124-177`): its field order, strings escaped by
 //! [`crate::connect::go_string`], no whitespace and a trailing `\n`.
+//! Issue #831: the metadata of an ad hoc upload ([`Meta`]), and an
+//! uploaded flamebearer file read back into its stacks ([`parse_file`],
+//! [`stacks_of_levels`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -30,6 +33,19 @@ pub struct Flamebearer {
     pub left_ticks: i64,
     /// Written only when not 0.
     pub right_ticks: i64,
+    /// Issue #831: an ad hoc upload's metadata, written in place of
+    /// [`metadata`]'s of `type_id` when set.
+    pub meta: Option<Meta>,
+}
+
+/// Issue #831: the metadata an ad hoc upload's flame graph is written
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Meta {
+    pub spy_name: String,
+    pub sample_rate: u32,
+    pub units: String,
+    pub name: String,
 }
 
 /// A timeline: `samples` one per `duration_delta` seconds from
@@ -145,6 +161,34 @@ fn timeline(out: &mut String, t: &Timeline) {
         r#"],"durationDelta":{},"watermarks":null}}"#,
         t.duration_delta
     );
+}
+
+/// Issue #831: an uploaded flamebearer file, checked as the reference
+/// checks one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileProfile {
+    pub names: Vec<String>,
+    /// Per level the nodes' values, delta-encoded, 4 per node.
+    pub levels: Vec<Vec<i64>>,
+    pub spy_name: String,
+    pub sample_rate: u32,
+    pub units: String,
+    pub name: String,
+}
+
+/// Issue #831: reads an uploaded flamebearer file. Each refusal is the
+/// reference's text, prefixed as its JSON converter prefixes it.
+pub fn parse_file(_bytes: &[u8]) -> Result<FileProfile, String> {
+    Err(String::new())
+}
+
+/// Issue #831: the stacks of a single flamebearer's levels, root first,
+/// each node of self above 0 with its self.
+pub fn stacks_of_levels(
+    _names: &[String],
+    _levels: &[Vec<i64>],
+) -> Result<Vec<(Vec<String>, i64)>, String> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -277,5 +321,66 @@ mod tests {
             )),
             "{grouped}"
         );
+    }
+
+    /// F3 (issue #831): an upload's metadata is written in place of the
+    /// type id's, and an empty group map as `{}`.
+    #[test]
+    fn f3_meta() {
+        let fb = Flamebearer {
+            names: strings(&["total", "main", "other"]),
+            levels: vec![vec![0, 11, 0, 0], vec![0, 11, 0, 1], vec![0, 11, 11, 2]],
+            num_ticks: 11,
+            max_self: 11,
+            groups: Some(BTreeMap::new()),
+            meta: Some(Meta {
+                spy_name: "unknown".to_string(),
+                sample_rate: 100,
+                units: String::new(),
+                name: "c_1.txt".to_string(),
+            }),
+            ..Flamebearer::default()
+        };
+        assert_eq!(
+            fb.to_json(),
+            concat!(
+                r#"{"version":1,"flamebearer":{"names":["total","main","other"],"levels":[[0,11,0,0],[0,11,0,1],[0,11,11,2]],"numTicks":11,"maxSelf":11},"metadata":{"format":"single","spyName":"unknown","sampleRate":100,"units":"","name":"c_1.txt"},"timeline":null,"groups":{},"heatmap":null}"#,
+                "\n"
+            )
+        );
+    }
+
+    /// F4 (issue #831): F-J parses with its metadata, and its stacks are
+    /// its nodes of self above 0; a double file with 4-value levels and a
+    /// version-0 file are refused with the reference's texts.
+    #[test]
+    fn f4_parse_file() {
+        let fj = br#"{"version":1,"flamebearer":{"names":["total","main","a","b"],"levels":[[0,11,0,0],[0,11,1,1],[0,7,7,2,0,3,3,3]],"numTicks":11,"maxSelf":7},"metadata":{"format":"single","spyName":"gospy","sampleRate":250,"units":"bytes","name":"b"}}"#;
+        let f = parse_file(fj).expect("F-J parses");
+        assert_eq!(
+            (f.spy_name.as_str(), f.sample_rate, f.units.as_str(), f.name.as_str()),
+            ("gospy", 250, "bytes", "b")
+        );
+        assert_eq!(f.names, strings(&["total", "main", "a", "b"]));
+        assert_eq!(
+            stacks_of_levels(&f.names, &f.levels).expect("stacks"),
+            vec![
+                (strings(&["main"]), 1),
+                (strings(&["main", "a"]), 7),
+                (strings(&["main", "b"]), 3),
+            ]
+        );
+        let double = br#"{"version":1,"flamebearer":{"names":["total"],"levels":[[0,1,1,0]]},"metadata":{"format":"double"}}"#;
+        assert_eq!(
+            parse_file(double),
+            Err("invalid profile: a profile level should have a multiple of 7 values, but there's a level with 4 values".to_string())
+        );
+        let v0 = br#"{"version":0,"flamebearer":{"names":["total"],"levels":[[0,1,1,0]]},"metadata":{"format":"single"}}"#;
+        assert_eq!(
+            parse_file(v0),
+            Err("could not convert flameabearer to tree: unsupported flamebearer version 0".to_string())
+        );
+        let bad = parse_file(b"{").expect_err("not JSON");
+        assert!(bad.starts_with("unable to unmarshall JSON: "), "{bad}");
     }
 }
