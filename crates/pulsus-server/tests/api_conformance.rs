@@ -835,6 +835,10 @@ fn undocumented_method(spec: &RouteSpec) -> &'static str {
     "DELETE"
 }
 
+/// Issue #830: the tenant the stats routes are asked for, which no cell
+/// pushes to.
+const STATS_TENANT: &str = "conformance-stats";
+
 /// Builds the "valid" request for `spec`'s success-status assertion:
 /// `GET` with `base_query` as the query string, `POST` with `base_query`
 /// as an `application/x-www-form-urlencoded` body — `Surface::Ingest`
@@ -846,6 +850,14 @@ fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
         "ingest routes build their own bodies"
     );
     let mut req = manifest::Req::new(method.as_str(), resolve_path(spec.path));
+    // Issue #830: the stats answer every profile the tenant holds, and the
+    // ingest cells of the same spawn push profiles as the empty tenant, so
+    // the stats are asked for a tenant nothing pushes to: on it the answer
+    // is exactly `{}`.
+    if spec.path.ends_with("/GetProfileStats") || spec.path == "/api/profiles/v1/stats" {
+        req.headers
+            .push(("x-scope-orgid", STATS_TENANT.to_string()));
+    }
     if spec.surface == Surface::ProfilesConnect {
         // Issue #821: a Connect call's request is a JSON body.
         req.content_type = Some("application/json");

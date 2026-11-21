@@ -866,7 +866,7 @@ the replica path in the last column.
   (`schema/schema.sql:408-410`; `docs/configuration.md` §3).
 - `trace_landing` sets `async_insert = 0` (`schema/schema.sql:510`).
 - Clustered, `spans`, `traces` and `error_spans` have a `_dist` wrapper sharded on `cityHash64(trace_id)`
-  (`schema/schema.sql:724-726`, `:728-730`, `:1192-1194`); no other trace table has one (§7).
+  (`schema/schema.sql:738-740`, `:742-744`, `:1206-1208`); no other trace table has one (§7).
 
 - Every table's first column is `org_id`, the tenant (issue #738), and the first column of its sorting key; the
   `_dist` wrappers are `AS` their table and carry it.
@@ -878,13 +878,13 @@ it, and reads and writes its markers under the empty tenant (`org_id = ''`), one
 | view | target | reads | filter | statement |
 |---|---|---|---|---|
 | `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:728-760` |
-| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:956-960` |
+| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:970-974` |
 | `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:852-877` |
-| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:953-970` |
-| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:964-968` |
-| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:738-750` |
-| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:957-964` |
-| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:951-960` |
+| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:967-984` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:978-982` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:752-764` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:971-978` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:965-974` |
 | `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:1077-1125` |
 
 So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
