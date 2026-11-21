@@ -3,14 +3,16 @@
 
 use crate::traces::tenant_scope::TenantTerm;
 
-/// The profile tables this part's schema holds (#813). P18 and P19 append theirs.
-pub const PROFILE_TABLES: [&str; 6] = [
+/// The profile tables this part's schema holds (#813), and #830's
+/// `profile_settings`, which has no wrapper. P19 appends its own.
+pub const PROFILE_TABLES: [&str; 7] = [
     "profile_landing",
     "profile_samples",
     "profile_entries",
     "profile_series",
     "profile_stacks",
     "profile_locations",
+    "profile_settings",
 ];
 
 /// Tables that carry a `<dist_suffix>` wrapper (`schema/schema.sql`).
@@ -21,7 +23,7 @@ const WRAPPED: [&str; 4] = [
     "profile_series",
 ];
 
-/// The names `check` scopes: the six, and the four wrappers under
+/// The names `check` scopes: the seven, and the four wrappers under
 /// `dist_suffix` when it is not empty.
 pub fn tables(dist_suffix: &str) -> Vec<String> {
     let mut out: Vec<String> = PROFILE_TABLES.iter().map(|t| t.to_string()).collect();

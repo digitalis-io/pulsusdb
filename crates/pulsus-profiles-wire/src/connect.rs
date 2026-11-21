@@ -14,7 +14,7 @@ pub enum Code {
     Internal,
     Unknown,
     DeadlineExceeded,
-    /// Issue #830: stub (tests first).
+    /// Issue #830: a settings write older than the stored one.
     AlreadyExists,
 }
 
@@ -29,7 +29,7 @@ impl Code {
             Code::Internal => "internal",
             Code::Unknown => "unknown",
             Code::DeadlineExceeded => "deadline_exceeded",
-            Code::AlreadyExists => "unknown",
+            Code::AlreadyExists => "already_exists",
         }
     }
 
@@ -40,7 +40,8 @@ impl Code {
             Code::ResourceExhausted => 429,
             Code::Unimplemented => 501,
             Code::Unavailable => 503,
-            Code::Internal | Code::Unknown | Code::AlreadyExists => 500,
+            Code::Internal | Code::Unknown => 500,
+            Code::AlreadyExists => 409,
             Code::DeadlineExceeded => 504,
         }
     }

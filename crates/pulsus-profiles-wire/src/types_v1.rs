@@ -399,10 +399,29 @@ pub struct GetProfileStatsRequest {}
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GetProfileStatsResponse {
-    #[prost(bool, tag = "101")]
+    #[prost(bool, tag = "1")]
+    #[serde(
+        rename = "dataIngested",
+        alias = "data_ingested",
+        skip_serializing_if = "is_false"
+    )]
     pub data_ingested: bool,
-    #[prost(int64, tag = "102")]
+    #[prost(int64, tag = "2")]
+    #[serde(
+        rename = "oldestProfileTime",
+        alias = "oldest_profile_time",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub oldest_profile_time: i64,
-    #[prost(int64, tag = "103")]
+    #[prost(int64, tag = "3")]
+    #[serde(
+        rename = "newestProfileTime",
+        alias = "newest_profile_time",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub newest_profile_time: i64,
 }

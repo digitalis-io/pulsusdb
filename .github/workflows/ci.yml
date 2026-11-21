@@ -1712,6 +1712,14 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test profileql_pprof_cluster
 
+      # Issue #830: the app's settings on the cluster-wide settings table,
+      # written and read on two servers, and the stats over the series
+      # wrapper.
+      - name: Profile settings and stats on the cluster (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test profileql_settings_cluster
+
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
       # proving the pool selects both nodes and fails over off a dead port,

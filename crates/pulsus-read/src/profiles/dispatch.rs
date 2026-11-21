@@ -63,11 +63,38 @@ impl ProfileDispatch {
         }
         Ok(out)
     }
+
+    /// Issue #830: executes one settings write, S13-W, after the same three
+    /// steps as [`Self::rows`]. One attempt, never retried.
+    pub(super) async fn write(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+    ) -> Result<Written, ProfilesReadError> {
+        let sql = escape_query_placeholders(sql);
+        crate::querytext::ensure_query_text_fits(&sql)
+            .map_err(|_| ProfilesReadError::TooBroad("query_too_broad: query text".to_string()))?;
+        super::tenant_scope::check(&sql, &self.term, &self.tables)
+            .map_err(ProfilesReadError::Internal)?;
+        written(self.client.insert_select(&sql, settings).await)
+    }
 }
 
-/// Issue #830: a settings write's outcome. Stub (tests first).
+/// ClickHouse's `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`: S13-W's guard
+/// refused the write.
+const CODE_THROW_IF: i32 = 395;
+
+/// Issue #830: a settings write's outcome: the guard's error is a refusal,
+/// any other error keeps its class.
 pub(super) fn written(result: Result<(), ChError>) -> Result<Written, ProfilesReadError> {
-    result.map(|()| Written::Stored).map_err(map_read_error)
+    match result {
+        Ok(()) => Ok(Written::Stored),
+        Err(ChError::Server {
+            code: CODE_THROW_IF,
+            ..
+        }) => Ok(Written::Refused),
+        Err(e) => Err(map_read_error(e)),
+    }
 }
 
 #[cfg(test)]

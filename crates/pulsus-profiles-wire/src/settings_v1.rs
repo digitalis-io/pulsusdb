@@ -1,4 +1,4 @@
-//! Stub (tests first): `settings.v1`, the messages of `proto/settings/v1/setting.proto` (issue
+//! `settings.v1`, the messages of `proto/settings/v1/setting.proto` (issue
 //! #830): the exploration app's per-tenant settings, with the JSON mapping
 //! of [`crate::types_v1`].
 
@@ -9,11 +9,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Setting {
-    #[prost(string, tag = "101")]
+    #[prost(string, tag = "1")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[prost(string, tag = "102")]
+    #[prost(string, tag = "2")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub value: String,
-    #[prost(int64, tag = "103")]
+    #[prost(int64, tag = "3")]
+    #[serde(
+        rename = "modifiedAt",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub modified_at: i64,
 }
 
@@ -26,7 +34,8 @@ pub struct GetSettingsRequest {}
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GetSettingsResponse {
-    #[prost(message, repeated, tag = "101")]
+    #[prost(message, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<Setting>,
 }
 
@@ -34,7 +43,8 @@ pub struct GetSettingsResponse {
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SetSettingsRequest {
-    #[prost(message, optional, tag = "101")]
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub setting: Option<Setting>,
 }
 
@@ -42,7 +52,8 @@ pub struct SetSettingsRequest {
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SetSettingsResponse {
-    #[prost(message, optional, tag = "101")]
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub setting: Option<Setting>,
 }
 
@@ -50,7 +61,8 @@ pub struct SetSettingsResponse {
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeleteSettingsRequest {
-    #[prost(string, tag = "101")]
+    #[prost(string, tag = "1")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
 }
 

@@ -1,4 +1,4 @@
-//! Stub (tests first). Issue #830: the exploration app's settings and its profile stats — the
+//! Issue #830: the exploration app's settings and its profile stats — the
 //! three statements (plan §3) and their rows. Settings `Get` is S13-R, a
 //! `Set` or a `Delete` is S13-W, one `INSERT … SELECT` whose guard refuses
 //! a write older than the stored one with ClickHouse's `throwIf`, and the
@@ -12,6 +12,8 @@ use pulsus_clickhouse::Row;
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
 
+use crate::logql::escape::ch_string;
+use crate::metrics::TenantSql;
 use crate::traces::tenant_scope::TenantTerm;
 
 /// The settings table (`schema/schema.sql`).
@@ -29,7 +31,7 @@ pub struct SettingRow {
 }
 
 /// S11''s one row.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Row, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct StatsRow {
     pub ingested: bool,
     pub oldest_ms: i64,
@@ -48,8 +50,15 @@ pub enum Written {
 /// S13-R: the tenant's settings, each its newest value, tombstones left
 /// out, in name order.
 pub fn settings_get_sql(tenant: &Tenant) -> String {
-    let _ = tenant;
-    String::new()
+    let term = TenantTerm::of(tenant);
+    format!(
+        "SELECT name, argMax(value, version) AS value, max(modified_at) AS modified_at
+FROM {SETTINGS_TABLE}
+WHERE {term}
+GROUP BY name
+HAVING argMax(deleted, version) = 0
+ORDER BY name"
+    )
 }
 
 /// S13-W: one row of `name` at `modified_at`, a tombstone when `deleted`,
@@ -61,16 +70,33 @@ pub fn settings_write_sql(
     modified_at: i64,
     deleted: bool,
 ) -> String {
-    let _ = (tenant, name, value, modified_at, deleted);
-    String::new()
+    let term = TenantTerm::of(tenant);
+    let org = tenant.sql_literal();
+    let name = ch_string(name);
+    let value = ch_string(value);
+    let flag = u8::from(deleted);
+    let message = ch_string(NEWER_WRITTEN);
+    format!(
+        "INSERT INTO {SETTINGS_TABLE} (org_id, name, value, modified_at, deleted, version)
+SELECT {org}, {name}, {value}, toInt64({modified_at}), toUInt8({flag}),
+       bitShiftLeft(toUInt128(toInt64({modified_at})), 64) + cityHash64({value}, toUInt8({flag}))
+WHERE throwIf((SELECT max(modified_at) FROM {SETTINGS_TABLE} WHERE {term} AND name = {name}) > {modified_at},
+              {message}) = 0"
+    )
 }
 
 /// S11': whether the tenant holds a series, the start of the UTC hour of
 /// its oldest profile and the last millisecond of the hour of its newest,
 /// read from `series_table`.
 pub fn stats_sql(tenant: &Tenant, series_table: &str) -> String {
-    let _ = (tenant, series_table);
-    String::new()
+    let term = TenantTerm::of(tenant);
+    format!(
+        "SELECT count() > 0 AS ingested,
+       if(ingested, toInt64(min(toUInt32(day) * 24 + arrayMin(bitPositionsToArray(hours)))) * 3600000, 0) AS oldest_ms,
+       if(ingested, (toInt64(max(toUInt32(day) * 24 + arrayMax(bitPositionsToArray(hours)))) + 1) * 3600000 - 1, 0) AS newest_ms
+FROM {series_table}
+WHERE {term}"
+    )
 }
 
 #[cfg(test)]

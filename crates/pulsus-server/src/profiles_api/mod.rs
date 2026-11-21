@@ -18,7 +18,13 @@
 //! `/label-values`, and their compat paths `/pyroscope/render`,
 //! `/pyroscope/render-diff` and `/pyroscope/label-values`, each in one
 //! statement; `SelectMergeStacktraces` with `PROFILE_FORMAT_TREE`.
+//! Issue #830: the exploration app's `settings.v1.SettingsService/{Get,Set,
+//! Delete}`, `GetProfileStats` (and `GET /api/profiles/v1/stats`) and
+//! `AnalyzeQuery` at the two Connect surfaces, one statement each and none
+//! for `AnalyzeQuery`; `settings.v1.RecordingRulesService/*` and
+//! `vcs.v1.VCSService/*` answer `unimplemented`.
 
+mod app;
 pub(crate) mod connect;
 mod diff;
 mod engine;
@@ -74,6 +80,32 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
             post(pprof::select_merge_profile),
         )
+        .route(
+            "/api/profiles/v1/settings.v1.SettingsService/Get",
+            post(app::settings_get),
+        )
+        .route(
+            "/api/profiles/v1/settings.v1.SettingsService/Set",
+            post(app::settings_set),
+        )
+        .route(
+            "/api/profiles/v1/settings.v1.SettingsService/Delete",
+            post(app::settings_delete),
+        )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
+            post(app::profile_stats),
+        )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery",
+            post(app::analyze_query),
+        )
+        .route(
+            "/api/profiles/v1/settings.v1.RecordingRulesService/{name}",
+            post(app::recording_rules),
+        )
+        .route("/api/profiles/v1/vcs.v1.VCSService/{name}", post(app::vcs))
+        .route("/api/profiles/v1/stats", get(app::stats_get))
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
             "/api/profiles/v1/labels",
@@ -136,6 +168,25 @@ pub(crate) fn compat_router() -> Router<AppState> {
             "/querier.v1.QuerierService/SelectMergeProfile",
             post(pprof::select_merge_profile),
         )
+        .route("/settings.v1.SettingsService/Get", post(app::settings_get))
+        .route("/settings.v1.SettingsService/Set", post(app::settings_set))
+        .route(
+            "/settings.v1.SettingsService/Delete",
+            post(app::settings_delete),
+        )
+        .route(
+            "/querier.v1.QuerierService/GetProfileStats",
+            post(app::profile_stats),
+        )
+        .route(
+            "/querier.v1.QuerierService/AnalyzeQuery",
+            post(app::analyze_query),
+        )
+        .route(
+            "/settings.v1.RecordingRulesService/{name}",
+            post(app::recording_rules),
+        )
+        .route("/vcs.v1.VCSService/{name}", post(app::vcs))
         .route("/pyroscope/render", get(render::render_get))
         .route("/pyroscope/render-diff", get(render::render_diff_get))
         .route("/pyroscope/label-values", get(render::label_values_get))

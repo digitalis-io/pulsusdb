@@ -298,25 +298,33 @@ impl ProfilesEngine {
         self.dispatch.rows(sql, &settings).await
     }
 
-    /// Issue #830: stub (tests first).
+    /// Issue #830: sends S13-R (`super::app`) and returns the tenant's
+    /// settings.
     pub async fn read_settings_rows(
         &self,
         sql: &str,
     ) -> Result<Vec<SettingRow>, ProfilesReadError> {
-        let _ = sql;
-        Ok(Vec::new())
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 
-    /// Issue #830: stub (tests first).
+    /// Issue #830: sends S11' (`super::app`) and returns its one row.
     pub async fn read_stats(&self, sql: &str) -> Result<StatsRow, ProfilesReadError> {
-        let _ = sql;
-        Ok(StatsRow::default())
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        let rows: Vec<StatsRow> = self.dispatch.rows(sql, &settings).await?;
+        rows.into_iter().next().ok_or_else(|| {
+            ProfilesReadError::Internal("the stats statement answered no row".to_string())
+        })
     }
 
-    /// Issue #830: stub (tests first).
+    /// Issue #830: sends S13-W (`super::app`) with the insert settings and
+    /// the request id; `Refused` when a newer write is stored.
     pub async fn write_setting(&self, sql: &str) -> Result<Written, ProfilesReadError> {
-        let _ = sql;
-        Ok(Written::Stored)
+        let mut settings = QuerySettings::new();
+        if let Some(comment) = self.log_comment.as_deref() {
+            settings = settings.set("log_comment", comment);
+        }
+        self.dispatch.write(sql, &settings).await
     }
 }
 

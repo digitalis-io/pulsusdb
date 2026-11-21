@@ -27,7 +27,7 @@
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
 -- than derived, so a wrong one is a per-table error. Twenty-three tables, and
--- one per rollup level, take `/clickhouse/tables/{shard}/` and eight take
+-- one per rollup level, take `/clickhouse/tables/{shard}/` and nine take
 -- `/clickhouse/tables/all/` (docs/architecture.md §3). `tests/schema_file.rs`
 -- holds the relation.
 --
@@ -692,6 +692,20 @@ ORDER BY (org_id, location_id)
 TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 --@cluster SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_settings{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    name String,
+    value String CODEC(ZSTD(1)),
+    modified_at Int64,
+    deleted UInt8,
+    version UInt128
+)
+--@single  ENGINE = ReplacingMergeTree(version)
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.profile_settings', '{replica}', version)
+ORDER BY (org_id, name)
+SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, index_granularity = 8192{{storage_policy_local}};
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.log_landing
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_landing', cityHash64(received_ms));
