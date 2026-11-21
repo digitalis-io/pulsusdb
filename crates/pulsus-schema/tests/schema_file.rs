@@ -3870,21 +3870,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     // which puts the replaced-parts settings first in every table's
     // `SETTINGS`, with issue #828, which adds `mapping_flags` and `period`,
     // with issue #830, which adds `profile_settings`, and with issue #831,
-    // which adds `profile_adhoc`, its view and its wrapper.
+    // which adds `profile_adhoc`, its view and its wrapper, and with the
+    // later-level plan's `ifNull(any(w0), 0)`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "628194d721df7c9a3d048f092a046298298ffc51098cc64b40b39bd13e9151a6",
+            "3d53ab5b4d37ad51276284b00074aa2daf12c3e8ae49ca7494df41ecacfd8eb4",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "bd270376d112f4b85287b96d80f84230de1b09f2e764da695f75bcf36046074d",
+            "a04548ef48709949a80fc3cd9048290eeab78583883c87d450ddfd7a9d443094",
         ),
         (
             "clustered with a storage policy",
@@ -3894,7 +3895,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "5fdc49ebe80bc108539060fc61b504b546ecb5222c704c6de91a7923a15c36d6",
+            "4cf1fea0eee48ecc5452bae5edd40567059a8cc1905025931cb15b3e212bc2e4",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

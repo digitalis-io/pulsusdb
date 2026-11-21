@@ -1400,7 +1400,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-next      (SELECT (b - {{level_ms}}, least(intDiv(c.2, {{level_ms}}) * {{level_ms}}, b + 9 * {{level_ms}}), c.2 >= b) FROM (
 --@level-next         SELECT arrayFirst(m -> greatest(intDiv(m.1 + {{level_ms}} - 1, {{level_ms}}) * {{level_ms}} + {{level_ms}}, (intDiv(w, {{level_ms}}) + 1) * {{level_ms}}) <= m.2, u) AS c,
 --@level-next                greatest(intDiv(c.1 + {{level_ms}} - 1, {{level_ms}}) * {{level_ms}} + {{level_ms}}, (intDiv(w, {{level_ms}}) + 1) * {{level_ms}}) AS b
---@level-next         FROM (SELECT any(w0) AS w,
+--@level-next         FROM (SELECT ifNull(any(w0), 0) AS w,
 --@level-next                      arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
 --@level-next                                arraySort(groupArray((t_last, t_end))), CAST([], 'Array(Tuple(Int64, Int64))')) AS u
 --@level-next               FROM (SELECT (SELECT max(t_end) FROM {{db}}.metric_samples_{{level}} WHERE org_id = '' AND fingerprint = 0 AND kind = 1) AS w0, t_last, t_end
