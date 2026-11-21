@@ -211,6 +211,56 @@ fn unclassified(sql: &str) -> Option<(&'static str, usize)> {
     None
 }
 
+/// Issue #830: the byte of the first `org_id` in `toks` that is not the
+/// column itself. The word `org_id` or the quoted `` `org_id` `` (exact
+/// case: identifiers are case-sensitive) is the column when (a) it follows
+/// a `.`, a path component or a qualified column, neither of which names an
+/// alias; (b) it is followed by `=` and does not follow `AS`, the tenant
+/// term and the marker; or (c) it lies in the parenthesised column list
+/// directly after `INSERT INTO <name>`. Any other names an alias that
+/// would shadow the column in a `WHERE`.
+fn redefined_org_id(sql: &str, toks: &[Token]) -> Option<usize> {
+    let text = |t: &Token| &sql[t.start..t.end];
+    let word = |t: &Token, w: &str| t.kind == Tok::Word && text(t).eq_ignore_ascii_case(w);
+    // The token ranges of every `INSERT INTO <name> (…)` column list.
+    let mut lists: Vec<(usize, usize)> = Vec::new();
+    for i in 0..toks.len() {
+        if !(word(&toks[i], "INSERT") && toks.get(i + 1).is_some_and(|t| word(t, "INTO"))) {
+            continue;
+        }
+        let mut k = i + 2;
+        while toks
+            .get(k)
+            .is_some_and(|t| matches!(t.kind, Tok::Word | Tok::Quoted | Tok::Dot))
+        {
+            k += 1;
+        }
+        if k == i + 2 || toks.get(k).is_none_or(|t| t.kind != Tok::Open) {
+            continue;
+        }
+        let depth = toks[k].depth;
+        let close = (k + 1..toks.len())
+            .find(|&j| toks[j].kind == Tok::Close && toks[j].depth == depth)
+            .unwrap_or(toks.len());
+        lists.push((k, close));
+    }
+    toks.iter().enumerate().find_map(|(i, t)| {
+        let named = (t.kind == Tok::Word && text(t) == "org_id")
+            || (t.kind == Tok::Quoted && text(t) == "`org_id`");
+        if !named {
+            return None;
+        }
+        let prev = i.checked_sub(1).map(|j| &toks[j]);
+        let after_dot = prev.is_some_and(|p| p.kind == Tok::Dot);
+        let compared = toks
+            .get(i + 1)
+            .is_some_and(|n| n.kind == Tok::Other && text(n) == "=")
+            && !prev.is_some_and(|p| word(p, "AS"));
+        let listed = lists.iter().any(|&(open, close)| open < i && i < close);
+        (!(after_dot || compared || listed)).then_some(t.start)
+    })
+}
+
 /// Whether `sql` reads every trace table under `term` (issue #738).
 ///
 /// Every table source is inspected: what follows `FROM`, every `JOIN`
@@ -221,9 +271,13 @@ fn unclassified(sql: &str) -> Option<(&'static str, usize)> {
 /// * A trace table after `FROM` — a name whose last dot-separated part is
 ///   one of `tables` — must have, at that `FROM`'s depth, a first `WHERE`
 ///   (before the depth closes or a `UNION`, `GROUP BY`, `ORDER BY`,
-///   `LIMIT`, `HAVING` or `SETTINGS` at that depth) beginning `<term> AND`
-///   (or, on `service_edges`, [`MARKER_TERM`]), with no `OR` at that depth
+///   `LIMIT`, `HAVING` or `SETTINGS` at that depth) beginning `<term> AND`,
+///   or that is `<term>` alone before the end of its clause (issue #830),
+///   or, on `service_edges`, [`MARKER_TERM`]; with no `OR` at that depth
 ///   inside it.
+/// * No `org_id` but the column itself appears anywhere
+///   ([`redefined_org_id`]): an alias named `org_id` would shadow the column
+///   in a `WHERE` and read every tenant's rows (issue #830).
 /// * A trace table as a join target, a comma-joined source or an `IN` set
 ///   is refused: it must be a subquery whose own `WHERE` carries the term.
 /// * A table function is refused unless it reads nothing a request stores
@@ -249,6 +303,9 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
     let word = |t: &Token, w: &str| t.kind == Tok::Word && text(t).eq_ignore_ascii_case(w);
     let refuse =
         |what: &str, at: usize| Err(format!("statement not tenant-scoped: {what} at byte {at}"));
+    if let Some(at) = redefined_org_id(sql, &toks) {
+        return refuse("org_id redefined", at);
+    }
     // The clause at `depth` ends at `toks[k]`.
     let ends = |k: usize, depth: usize| -> bool {
         let t = &toks[k];
@@ -462,6 +519,13 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             return refused();
         };
         let body = sql[toks[w].end..].trim_start();
+        // Issue #830: the term alone, at the end of its clause.
+        let term_end = sql.len() - body.len() + term.as_str().len();
+        let alone = body.starts_with(term.as_str())
+            && toks
+                .iter()
+                .position(|t| t.start >= term_end)
+                .is_none_or(|k| ends(k, depth));
         let leads = |lead: &str| {
             body.strip_prefix(lead)
                 .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_whitespace()))
@@ -470,7 +534,7 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             && body
                 .strip_prefix(MARKER_TERM)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\n', ')']));
-        let scoped = leads(&format!("{term} AND")) || marker;
+        let scoped = leads(&format!("{term} AND")) || alone || marker;
         if !scoped {
             return refused();
         }

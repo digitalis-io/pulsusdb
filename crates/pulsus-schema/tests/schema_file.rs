@@ -184,7 +184,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 35, "every replicated table's path was checked");
+    assert_eq!(checked, 36, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -1000,8 +1000,8 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        12,
-        "the label values, `service_edges`, eight cluster-wide ones and the two \
+        13,
+        "the label values, `service_edges`, nine cluster-wide ones and the two \
          rollup stages: {no_wrapper:?}"
     );
     let all = tables();
@@ -1408,6 +1408,7 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
         10 => "ten",
         11 => "eleven",
         12 => "twelve",
+        13 => "thirteen",
         n => panic!("spell {n} out here before the count can be cited"),
     };
     let cites = |name: &str, line: &str, before: &str, after: &str| {
@@ -3811,21 +3812,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     // their four wrappers and five views, with issue #814, which gives
     // `profile_landing`'s ten upload columns a `DEFAULT`, with issue #889,
     // which puts the replaced-parts settings first in every table's
-    // `SETTINGS`, and with issue #828, which adds `mapping_flags` and `period`.
+    // `SETTINGS`, with issue #828, which adds `mapping_flags` and `period`,
+    // and with issue #830, which adds `profile_settings`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "e4f3f491dd045193a26507530cb0cf1ac9b94e83d8b7ce605ca1af1483b28f95",
+            "03bdfd12781a2e90476308a29f7229dbae25b352833adffc2b31eedab222e37a",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "180ede665ed9dfaac56bbc059cc2af7db4c4f737cad725e7d154ba93ceaa95e0",
+            "23b31be30853976fc967c8bf62af921ed3bedffb5fa96ae394719ba1c9cde1d5",
         ),
         (
             "clustered with a storage policy",
@@ -3835,7 +3837,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "6553e418fe685ba036829f378af24bbcf41643016108d4b03dc9e9b36825fa7e",
+            "e9e3e688be3e15010b0d5cf0cf1375c3495d04f9b48dc6ac8a4eea56fdfc5053",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
