@@ -66,7 +66,7 @@ pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 /// `Diff`'s two, #825 `SelectHeatmap`'s two, #828 `SelectMergeProfile`'s
 /// two, #830 the settings service's six, `GetProfileStats`' and
 /// `AnalyzeQuery`'s two each, and the two unimplemented services' four
-/// `{name}` templates, one segment). They
+/// `{name}` templates, one segment, #831 the ad hoc service's eight). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -103,6 +103,14 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/settings.v1.RecordingRulesService/{name}",
     "/vcs.v1.VCSService/{name}",
     "/api/profiles/v1/vcs.v1.VCSService/{name}",
+    "/adhocprofiles.v1.AdHocProfileService/Upload",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Upload",
+    "/adhocprofiles.v1.AdHocProfileService/Get",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Get",
+    "/adhocprofiles.v1.AdHocProfileService/List",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/List",
+    "/adhocprofiles.v1.AdHocProfileService/Diff",
+    "/api/profiles/v1/adhocprofiles.v1.AdHocProfileService/Diff",
 ];
 
 /// Issue #816: the four OTLP gRPC export paths. They answer a deadline

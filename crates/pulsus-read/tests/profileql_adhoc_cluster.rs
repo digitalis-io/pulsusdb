@@ -19,9 +19,7 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_model::Tenant;
 use pulsus_read::profiles::adhoc::convert::{convert, detect};
-use pulsus_read::profiles::adhoc::{
-    AdhocRow, UploadRow, list_sql, mint_id, select, trees_sql,
-};
+use pulsus_read::profiles::adhoc::{AdhocRow, UploadRow, list_sql, mint_id, select, trees_sql};
 use pulsus_read::profiles::selector::WindowLimits;
 use pulsus_read::profiles::{ProfilesEngine, ProfilesReadConfig};
 use pulsus_schema::RenderCtx;
@@ -116,7 +114,6 @@ fn config() -> ProfilesReadConfig {
     }
 }
 
-
 async fn store(engine: &ProfilesEngine, name: &str, file: &[u8], at: i64, ctx: &str) -> String {
     let format = detect(name, file).unwrap_or_else(|e| panic!("{ctx}: {e}"));
     let converted = convert(format, name, file).unwrap_or_else(|e| panic!("{ctx}: {e:?}"));
@@ -128,7 +125,12 @@ async fn store(engine: &ProfilesEngine, name: &str, file: &[u8], at: i64, ctx: &
     id
 }
 
-async fn trees(engine: &ProfilesEngine, ids: &[&str], name: Option<&str>, ctx: &str) -> Vec<AdhocRow> {
+async fn trees(
+    engine: &ProfilesEngine,
+    ids: &[&str],
+    name: Option<&str>,
+    ctx: &str,
+) -> Vec<AdhocRow> {
     let sql = trees_sql(&tenant("t1"), &config(), ids, name);
     engine
         .read_adhoc(&sql)
@@ -235,15 +237,11 @@ async fn an_upload_is_read_and_listed_on_every_server() {
 
     // K3: two uploads in one read, each with one selected type.
     let rows = trees(&a, &[&c, &x], None, "K3 read").await;
-    for (id, leaves) in [(&c, 2), (&x, 3)] {
+    for (id, nodes) in [(&c, 3), (&x, 4)] {
         let s = select(&rows, id);
         assert_eq!(s.types.len(), 1, "K3 {id} types");
         assert_eq!(s.selected.map(|t| t.type_ordinal), Some(0), "K3 {id}");
-        assert_eq!(
-            s.tree.iter().filter(|r| r.self_value > 0).count(),
-            leaves,
-            "K3 {id} leaves"
-        );
+        assert_eq!(s.tree.len(), nodes, "K3 {id} nodes");
     }
 
     // K4: F-BIG, above the server's default block, lands whole in one
@@ -258,7 +256,8 @@ async fn an_upload_is_read_and_listed_on_every_server() {
     eprintln!("K4: shard 1 {s1:?}, shard 1's second replica {s1b:?}, shard 2 {s2:?}");
     let whole = (1, fx::F_BIG_ROWS);
     assert!(
-        (s1 == whole && s1b == whole && s2 == (0, 0)) || (s1 == (0, 0) && s1b == (0, 0) && s2 == whole),
+        (s1 == whole && s1b == whole && s2 == (0, 0))
+            || (s1 == (0, 0) && s1b == (0, 0) && s2 == whole),
         "K4: parts and rows per node: {s1:?} {s1b:?} {s2:?}"
     );
 
@@ -290,14 +289,21 @@ async fn an_upload_is_read_and_listed_on_every_server() {
     assert!(refusal.is_err(), "K5: the two-day upload was accepted");
     sync(&all).await;
     for node in all {
-        assert_eq!(local(node, refused).await, (0, 0), "K5: a row of the refused upload");
+        assert_eq!(
+            local(node, refused).await,
+            (0, 0),
+            "K5: a row of the refused upload"
+        );
     }
     for (e, ctx) in [(&a, "K5 A"), (&b, "K5 B")] {
         assert!(
             !listed(e, ctx).await.iter().any(|u| u.id == refused),
             "{ctx}: listed"
         );
-        assert!(trees(e, &[refused], None, ctx).await.is_empty(), "{ctx}: read");
+        assert!(
+            trees(e, &[refused], None, ctx).await.is_empty(),
+            "{ctx}: read"
+        );
     }
 
     exec(

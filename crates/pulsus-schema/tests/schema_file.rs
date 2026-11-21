@@ -346,10 +346,9 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         by_family.entry(family).or_default().insert(expr);
     }
     assert_eq!(by_family.len(), 6, "six families have wrappers");
-    assert_eq!(
-        by_family["uploads"],
-        std::collections::BTreeSet::from(["cityHash64(upload_id)".to_string()]),
-        "profile_adhoc_dist shards by the upload's id"
+    assert!(
+        text.contains("'profile_adhoc', cityHash64(upload_id));"),
+        "profile_adhoc_dist shards by the upload's id, cityHash64(upload_id)"
     );
     for (family, exprs) in &by_family {
         assert_eq!(
@@ -2946,6 +2945,7 @@ fn every_day_partition_is_a_utc_day() {
                 "PARTITION BY month",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Milli(uploaded_at), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')",
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')",
@@ -3869,21 +3869,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     // `profile_landing`'s ten upload columns a `DEFAULT`, with issue #889,
     // which puts the replaced-parts settings first in every table's
     // `SETTINGS`, with issue #828, which adds `mapping_flags` and `period`,
-    // and with issue #830, which adds `profile_settings`.
+    // with issue #830, which adds `profile_settings`, and with issue #831,
+    // which adds `profile_adhoc`, its view and its wrapper.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "03bdfd12781a2e90476308a29f7229dbae25b352833adffc2b31eedab222e37a",
+            "628194d721df7c9a3d048f092a046298298ffc51098cc64b40b39bd13e9151a6",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "23b31be30853976fc967c8bf62af921ed3bedffb5fa96ae394719ba1c9cde1d5",
+            "bd270376d112f4b85287b96d80f84230de1b09f2e764da695f75bcf36046074d",
         ),
         (
             "clustered with a storage policy",
@@ -3893,7 +3894,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "e9e3e688be3e15010b0d5cf0cf1375c3495d04f9b48dc6ac8a4eea56fdfc5053",
+            "5fdc49ebe80bc108539060fc61b504b546ecb5222c704c6de91a7923a15c36d6",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

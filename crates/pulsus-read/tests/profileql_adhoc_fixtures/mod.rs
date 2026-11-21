@@ -78,11 +78,7 @@ pub fn pprof(
         }
     }
     for (stack, values) in samples {
-        let ids = stack
-            .iter()
-            .rev()
-            .map(|f| frame_ids[*f])
-            .collect();
+        let ids = stack.iter().rev().map(|f| frame_ids[*f]).collect();
         p.sample.push(Sample {
             location_id: ids,
             value: values.to_vec(),
@@ -190,8 +186,7 @@ pub fn f_big() -> Vec<u8> {
     let frames: Vec<String> = (0..60_000).map(|i| format!("f{i}")).collect();
     let stacks: Vec<[&str; 1]> = frames.iter().map(|f| [f.as_str()]).collect();
     let values = [1i64; 20];
-    let samples: Vec<(&[&str], &[i64])> =
-        stacks.iter().map(|s| (&s[..], &values[..])).collect();
+    let samples: Vec<(&[&str], &[i64])> = stacks.iter().map(|s| (&s[..], &values[..])).collect();
     gz(&pprof(&types, Some(("t0", "count")), &samples))
 }
 

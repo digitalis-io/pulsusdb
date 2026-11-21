@@ -858,7 +858,9 @@ fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
     // `Upload` cells store under the empty tenant.
     if spec.path.ends_with("/GetProfileStats")
         || spec.path == "/api/profiles/v1/stats"
-        || spec.path.ends_with("/adhocprofiles.v1.AdHocProfileService/List")
+        || spec
+            .path
+            .ends_with("/adhocprofiles.v1.AdHocProfileService/List")
     {
         req.headers
             .push(("x-scope-orgid", STATS_TENANT.to_string()));
@@ -1016,13 +1018,18 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // Issue #831: an upload answers its id, time and flame graph;
             // the zero id is not found by `Get` or `Diff`; `List` of a tenant
             // with no upload is `{}`.
-            if spec.path.ends_with("/adhocprofiles.v1.AdHocProfileService/Upload") {
+            if spec
+                .path
+                .ends_with("/adhocprofiles.v1.AdHocProfileService/Upload")
+            {
                 let mut got: serde_json::Value = serde_json::from_slice(&res.body)
                     .unwrap_or_else(|e| panic!("{ctx}: the upload answer is not JSON: {e}"));
                 let id = got["id"].as_str().unwrap_or_default().to_string();
                 assert_eq!(id.len(), 36, "{ctx}: the upload's id: {got}");
                 assert!(
-                    got["uploadedAt"].as_str().is_some_and(|t| t.parse::<i64>().is_ok()),
+                    got["uploadedAt"]
+                        .as_str()
+                        .is_some_and(|t| t.parse::<i64>().is_ok()),
                     "{ctx}: uploadedAt: {got}"
                 );
                 let fields = got.as_object_mut().expect("an object");
@@ -1041,9 +1048,15 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 return;
             }
             let zero = "00000000-0000-0000-0000-000000000000";
-            let expected = if spec.path.ends_with("/adhocprofiles.v1.AdHocProfileService/Get") {
+            let expected = if spec
+                .path
+                .ends_with("/adhocprofiles.v1.AdHocProfileService/Get")
+            {
                 format!(r#"{{"code":"not_found","message":"profile {zero} not found"}}"#)
-            } else if spec.path.ends_with("/adhocprofiles.v1.AdHocProfileService/Diff") {
+            } else if spec
+                .path
+                .ends_with("/adhocprofiles.v1.AdHocProfileService/Diff")
+            {
                 format!(r#"{{"code":"not_found","message":"left profile {zero} not found"}}"#)
             } else if spec.path.ends_with("/SelectMergeStacktraces") {
                 format!(r#"{{"flamegraph":{EMPTY_FLAME_GRAPH}}}"#)

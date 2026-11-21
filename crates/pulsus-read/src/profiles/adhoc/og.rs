@@ -7,12 +7,136 @@
 //! `m`-th largest total, root included, is cut into its parent's `other`.
 //! Pure: no I/O.
 
-use crate::profiles::flamegraph::FlameGraph;
+use std::collections::HashMap;
+
+use crate::profiles::flamegraph::{FlameGraph, kth};
 use crate::profiles::tree::TreeRow;
 
-/// The flame graph of `rows` with `m` nodes.
-pub fn flame_graph(_rows: &[TreeRow], _m: i64) -> FlameGraph {
-    FlameGraph::default()
+/// The name of a node that holds cut siblings' totals.
+const OTHER: &str = "other";
+
+/// One node of the reference's tree.
+struct Node {
+    name: String,
+    total: i64,
+    self_value: i64,
+    children: Vec<usize>,
+}
+
+/// The flame graph of `rows` with `m` nodes: the reference's
+/// `FlamebearerStruct` (`pkg/og/storage/tree/flamebearer.go:26-130`).
+pub fn flame_graph(rows: &[TreeRow], m: i64) -> FlameGraph {
+    // The tree: node 0 is the root, `""`, of the roots' total.
+    let mut nodes: Vec<Node> = vec![Node {
+        name: String::new(),
+        total: 0,
+        self_value: 0,
+        children: Vec::new(),
+    }];
+    let mut at: HashMap<u128, usize> = HashMap::with_capacity(rows.len() + 1);
+    at.insert(0, 0);
+    for r in rows {
+        at.insert(r.node, nodes.len());
+        nodes.push(Node {
+            name: r.name.clone(),
+            total: r.total,
+            self_value: r.self_value,
+            children: Vec::new(),
+        });
+    }
+    for (i, r) in rows.iter().enumerate() {
+        let parent = at.get(&r.parent).copied().unwrap_or(0);
+        nodes[parent].children.push(i + 1);
+    }
+    nodes[0].total = nodes[0].children.iter().map(|&c| nodes[c].total).sum();
+    for i in 0..nodes.len() {
+        let mut children = std::mem::take(&mut nodes[i].children);
+        children.sort_by(|a, b| nodes[*a].name.as_bytes().cmp(nodes[*b].name.as_bytes()));
+        nodes[i].children = children;
+    }
+
+    // `minValue`: the `m`-th largest total, root included; 0 with fewer.
+    let min = if m < 1 {
+        0
+    } else {
+        kth(nodes.iter().map(|n| n.total), m)
+    };
+
+    enum Item {
+        Node(usize),
+        Other(i64),
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut cache: HashMap<String, i64> = HashMap::new();
+    let mut levels: Vec<Vec<i64>> = Vec::new();
+    let mut max_self: i64 = 0;
+    // Last pushed first; each node prepended to its level, so a level
+    // reads left to right.
+    let mut stack: Vec<(Item, i64, usize)> = vec![(Item::Node(0), 0, 0)];
+    while let Some((item, mut x, level)) = stack.pop() {
+        let (name, total, self_value, children): (&str, i64, i64, &[usize]) = match &item {
+            Item::Node(i) => {
+                let n = &nodes[*i];
+                (n.name.as_str(), n.total, n.self_value, &n.children)
+            }
+            Item::Other(v) => (OTHER, *v, *v, &[]),
+        };
+        if total < min && name != OTHER {
+            continue;
+        }
+        let index = match cache.get(name) {
+            Some(&i) => i,
+            None => {
+                let i = names.len() as i64;
+                let key = if i == 0 { "total" } else { name };
+                cache.insert(key.to_string(), i);
+                names.push(key.to_string());
+                i
+            }
+        };
+        if level == levels.len() {
+            levels.push(Vec::new());
+        }
+        max_self = max_self.max(self_value);
+        levels[level].push(index);
+        levels[level].push(self_value);
+        levels[level].push(total);
+        levels[level].push(x);
+        x += self_value;
+        let mut other: i64 = 0;
+        for &c in children {
+            let child = &nodes[c];
+            if child.name == OTHER {
+                other += child.total;
+                continue;
+            }
+            if child.total >= min {
+                stack.push((Item::Node(c), x, level + 1));
+                x += child.total;
+            } else {
+                other += child.total;
+            }
+        }
+        if other != 0 {
+            stack.push((Item::Other(other), x, level + 1));
+        }
+    }
+    // Each level was built back to front, four values a node reversed:
+    // reversed whole it reads left to right as `x, total, self, name`.
+    for l in &mut levels {
+        l.reverse();
+        let mut prev: i64 = 0;
+        for i in (0..l.len()).step_by(4) {
+            l[i] -= prev;
+            prev += l[i] + l[i + 1];
+        }
+    }
+    FlameGraph {
+        names,
+        levels,
+        total: nodes[0].total,
+        max_self,
+    }
 }
 
 #[cfg(test)]

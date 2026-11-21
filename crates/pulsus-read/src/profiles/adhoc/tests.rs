@@ -45,7 +45,7 @@ fn type_row(c: &Converted, k: usize) -> AdhocRow {
     AdhocRow {
         part: 1,
         type_ordinal: k as u16,
-        selected: 1,
+        selected: Some(1),
         format: c.format.as_str().to_string(),
         display_name: t.display_name.clone(),
         spy_name: t.spy_name.clone(),
@@ -76,7 +76,11 @@ fn u6_pprof_render() {
     assert_eq!(cpu.names, strings(&["total", "main", "b", "a", "1f2e"]));
     assert_eq!(
         cpu.levels,
-        levels(&[&[0, 12, 0, 0], &[0, 12, 0, 1], &[0, 2, 2, 4, 0, 10, 10, 3, 0, 0, 0, 2]])
+        levels(&[
+            &[0, 12, 0, 0],
+            &[0, 12, 0, 1],
+            &[0, 2, 2, 4, 0, 10, 10, 3, 0, 0, 0, 2]
+        ])
     );
     assert_eq!((cpu.num_ticks, cpu.max_self), (12, 10));
     let text = answer_text(&cpu);
@@ -87,7 +91,11 @@ fn u6_pprof_render() {
     let samples = rendered(&p, 1, 8192);
     assert_eq!(
         samples.levels,
-        levels(&[&[0, 5, 0, 0], &[0, 5, 0, 1], &[0, 0, 0, 4, 0, 1, 1, 3, 0, 4, 4, 2]])
+        levels(&[
+            &[0, 5, 0, 0],
+            &[0, 5, 0, 1],
+            &[0, 0, 0, 4, 0, 1, 1, 3, 0, 4, 4, 2]
+        ])
     );
     assert_eq!(samples.max_self, 4);
     let text = answer_text(&samples);
@@ -187,7 +195,8 @@ WHERE org_id = 't1' AND upload_id IN ('01900000-0000-7000-8000-000000000001') AN
 const SEL_L: &str = "(SELECT type_ordinal FROM profile_adhoc WHERE org_id = 't1' AND upload_id = '01900000-0000-7000-8000-000000000001' AND row_kind = 1 ORDER BY display_name = 'cpu' DESC, if(display_name = 'cpu', -toInt32(type_ordinal), toInt32(type_ordinal)) LIMIT 1)";
 const SEL_R: &str = "(SELECT type_ordinal FROM profile_adhoc WHERE org_id = 't1' AND upload_id = '01900000-0000-7000-8000-000000000002' AND row_kind = 1 ORDER BY display_name = 'cpu' DESC, if(display_name = 'cpu', -toInt32(type_ordinal), toInt32(type_ordinal)) LIMIT 1)";
 
-const LIST: &str = "SELECT toString(upload_id) AS id, any(upload_name) AS name, any(uploaded_at) AS uploaded_at
+const LIST: &str =
+    "SELECT toString(upload_id) AS id, any(upload_name) AS name, any(uploaded_at) AS uploaded_at
 FROM profile_adhoc
 WHERE org_id = 't1' AND row_kind = 1
 GROUP BY upload_id
@@ -253,9 +262,17 @@ fn u9_rows() {
     assert_eq!(
         types
             .iter()
-            .map(|r| (r.type_ordinal, r.display_name.as_str(), r.upload_name.as_str(), r.upload_format.as_str()))
+            .map(|r| (
+                r.type_ordinal,
+                r.display_name.as_str(),
+                r.upload_name.as_str(),
+                r.upload_format.as_str()
+            ))
             .collect::<Vec<_>>(),
-        [(0, "cpu", "p.pb.gz", "pprof"), (1, "samples", "p.pb.gz", "pprof")]
+        [
+            (0, "cpu", "p.pb.gz", "pprof"),
+            (1, "samples", "p.pb.gz", "pprof")
+        ]
     );
     let tree = tree_rows(&p.types[0].stacks);
     let got: Vec<(&str, i64, i64)> = tree

@@ -153,8 +153,7 @@ fn pprof_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Que
 /// insert's pins for one block of `rows` rows under `token` (the upload's
 /// id), and the request id as `log_comment`.
 fn upload_settings(token: &str, rows: u64, log_comment: Option<&str>) -> QuerySettings {
-    let _ = (token, rows);
-    let mut s = QuerySettings::new();
+    let mut s = QuerySettings::landing_insert(token, rows);
     if let Some(comment) = log_comment {
         s = s.set("log_comment", comment);
     }

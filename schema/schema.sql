@@ -26,7 +26,7 @@
 -- `default` policy.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Twenty-three tables, and
+-- than derived, so a wrong one is a per-table error. Twenty-four tables, and
 -- one per rollup level, take `/clickhouse/tables/{shard}/` and nine take
 -- `/clickhouse/tables/all/` (docs/architecture.md §3). `tests/schema_file.rs`
 -- holds the relation.
@@ -707,6 +707,32 @@ CREATE TABLE IF NOT EXISTS {{db}}.profile_settings{{on_cluster}}
 ORDER BY (org_id, name)
 SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, index_granularity = 8192{{storage_policy_local}};
 
+CREATE TABLE IF NOT EXISTS {{db}}.profile_adhoc{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    upload_id UUID CODEC(ZSTD(1)),
+    row_kind UInt8 CODEC(ZSTD(1)),
+    type_ordinal UInt16 CODEC(ZSTD(1)),
+    stack_id UInt128 CODEC(ZSTD(1)),
+    value Int64 CODEC(T64, ZSTD(1)),
+    node_ids Array(UInt128) CODEC(ZSTD(1)),
+    names Array(LowCardinality(String)) CODEC(ZSTD(1)),
+    upload_name String CODEC(ZSTD(1)),
+    uploaded_at Int64 CODEC(ZSTD(1)),
+    format LowCardinality(String),
+    display_name String CODEC(ZSTD(1)),
+    spy_name String CODEC(ZSTD(1)),
+    sample_rate UInt32 CODEC(ZSTD(1)),
+    units LowCardinality(String)
+)
+--@single  ENGINE = MergeTree
+--@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.profile_adhoc', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Milli(uploaded_at), 'UTC')
+ORDER BY (org_id, upload_id, row_kind, type_ordinal, stack_id)
+TTL toDateTime(least(intDiv(uploaded_at, 1000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1, min_compressed_bytes_to_fsync_after_fetch = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.log_landing
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_landing', cityHash64(received_ms));
 
@@ -768,6 +794,11 @@ SETTINGS old_parts_lifetime = 60, min_compressed_bytes_to_fsync_after_merge = 1,
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.profile_series{{dist_suffix}}{{on_cluster}} AS {{db}}.profile_series
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'profile_series', cityHash64(fingerprint));
+
+-- Issue #831: reads only. Every row of one upload carries one
+-- `received_ms`, so the landing wrapper puts the whole upload on one shard.
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.profile_adhoc{{dist_suffix}}{{on_cluster}} AS {{db}}.profile_adhoc
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'profile_adhoc', cityHash64(upload_id));
 
 CREATE MATERIALIZED VIEW {{db}}.log_metrics_{{log_rollup_suffix}}_mv{{on_cluster}} TO {{db}}.log_metrics_{{log_rollup_suffix}}
 AS SELECT
@@ -1066,6 +1097,29 @@ AS SELECT
     line_numbers AS line_numbers
 FROM {{db}}.profile_landing
 WHERE kind = 4;
+
+-- Issue #831: an upload's type, sample and stack rows, kinds 5 and 6, in
+-- one table written by one view, so an upload is stored whole or not at
+-- all.
+CREATE MATERIALIZED VIEW {{db}}.profile_adhoc_mv{{on_cluster}} TO {{db}}.profile_adhoc
+AS SELECT
+    org_id AS org_id,
+    upload_id AS upload_id,
+    if(kind = 6, 2, is_type) AS row_kind,
+    type_ordinal AS type_ordinal,
+    stack_id AS stack_id,
+    value AS value,
+    node_ids AS node_ids,
+    names AS names,
+    upload_name AS upload_name,
+    uploaded_at AS uploaded_at,
+    upload_format AS format,
+    display_name AS display_name,
+    spy_name AS spy_name,
+    sample_rate AS sample_rate,
+    units AS units
+FROM {{db}}.profile_landing
+WHERE kind IN (5, 6);
 
 CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
 (

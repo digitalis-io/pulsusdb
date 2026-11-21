@@ -93,13 +93,26 @@ impl Flamebearer {
             join(&mut out, level);
             out.push(']');
         }
-        let (units, sample_rate, name) = metadata(&self.type_id);
+        let (spy_name, units, sample_rate, name) = match &self.meta {
+            Some(m) => (
+                m.spy_name.as_str(),
+                m.units.as_str(),
+                m.sample_rate,
+                m.name.as_str(),
+            ),
+            None => {
+                let (units, sample_rate, name) = metadata(&self.type_id);
+                ("", units, sample_rate, name)
+            }
+        };
         let format = if self.double { "double" } else { "single" };
         let _ = write!(
             out,
-            r#"],"numTicks":{},"maxSelf":{}}},"metadata":{{"format":"{format}","spyName":"","sampleRate":{sample_rate},"units":"#,
+            r#"],"numTicks":{},"maxSelf":{}}},"metadata":{{"format":"{format}","spyName":"#,
             self.num_ticks, self.max_self
         );
+        quoted(&mut out, spy_name);
+        let _ = write!(out, r#","sampleRate":{sample_rate},"units":"#);
         quoted(&mut out, units);
         out.push_str(r#","name":"#);
         quoted(&mut out, name);
@@ -176,19 +189,164 @@ pub struct FileProfile {
     pub name: String,
 }
 
-/// Issue #831: reads an uploaded flamebearer file. Each refusal is the
-/// reference's text, prefixed as its JSON converter prefixes it.
-pub fn parse_file(_bytes: &[u8]) -> Result<FileProfile, String> {
-    Err(String::new())
+// Ported from the reference at tag v2.4.3: pkg/og/structs/flamebearer/flamebearer.go, under the GNU Affero General Public License v3.0, the licence of this repository.
+// Changed for PulsusDB, issue #831: ported from Go to Rust; an index out of range refused instead of a panic.
+
+/// An uploaded file as the reference's `FlamebearerProfile` reads it;
+/// unknown fields are ignored.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct FileJson {
+    version: u64,
+    flamebearer: FileFlamebearer,
+    metadata: FileMetadata,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct FileFlamebearer {
+    names: Vec<String>,
+    levels: Vec<Vec<i64>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct FileMetadata {
+    format: String,
+    spy_name: String,
+    sample_rate: u32,
+    units: String,
+    name: String,
+}
+
+/// Issue #831: reads an uploaded flamebearer file: the reference's
+/// `Validate` (`flamebearer.go:212-260`), then `ProfileToTree`'s checks
+/// (`:262-269`). Each refusal is the reference's text, prefixed as its JSON
+/// converter prefixes it.
+pub fn parse_file(bytes: &[u8]) -> Result<FileProfile, String> {
+    let f: FileJson =
+        serde_json::from_slice(bytes).map_err(|e| format!("unable to unmarshall JSON: {e}"))?;
+    validate(&f).map_err(|e| format!("invalid profile: {e}"))?;
+    let tree_error = |e: String| format!("could not convert flameabearer to tree: {e}");
+    if f.metadata.format != "single" {
+        return Err(tree_error(format!(
+            "unsupported flamebearer format {}",
+            f.metadata.format
+        )));
+    }
+    if f.version != 1 {
+        return Err(tree_error(format!(
+            "unsupported flamebearer version {}",
+            f.version
+        )));
+    }
+    Ok(FileProfile {
+        names: f.flamebearer.names,
+        levels: f.flamebearer.levels,
+        spy_name: f.metadata.spy_name,
+        sample_rate: f.metadata.sample_rate,
+        units: f.metadata.units,
+        name: f.metadata.name,
+    })
+}
+
+/// The reference's `FlamebearerProfile.Validate`, its texts included.
+fn validate(f: &FileJson) -> Result<(), String> {
+    if f.version > 1 {
+        return Err(format!("unsupported version {}", f.version));
+    }
+    let format = f.metadata.format.as_str();
+    let modulus = match format {
+        "single" => 4,
+        "double" => 7,
+        other => return Err(format!("unsupported format {other}")),
+    };
+    let fb = &f.flamebearer;
+    if fb.names.is_empty() {
+        return Err("a profile must have at least one symbol name".to_string());
+    }
+    if fb.levels.is_empty() {
+        return Err("a profile must have at least one profiling level".to_string());
+    }
+    for l in &fb.levels {
+        if l.len() % modulus != 0 {
+            return Err(format!(
+                "a profile level should have a multiple of {modulus} values, but there's a level with {} values",
+                l.len()
+            ));
+        }
+        for &i in l.iter().skip(modulus - 1).step_by(modulus) {
+            if i >= fb.names.len() as i64 {
+                return Err(format!(
+                    "invalid name index {i}, it should be smaller than {}",
+                    fb.levels.len()
+                ));
+            }
+            if i < 0 {
+                return Err(format!(
+                    "invalid name index {i}, it should be a non-negative value"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Issue #831: the stacks of a single flamebearer's levels, root first,
-/// each node of self above 0 with its self.
+/// each node of self above 0 with its self: the reference's
+/// `flamebearerV1ToTree` (`deltaDecoding`, then `buildStack` per node,
+/// `flamebearer.go:271-312`), level 0, the root, skipped.
 pub fn stacks_of_levels(
-    _names: &[String],
-    _levels: &[Vec<i64>],
+    names: &[String],
+    levels: &[Vec<i64>],
 ) -> Result<Vec<(Vec<String>, i64)>, String> {
-    Ok(Vec::new())
+    let out_of_range = || "a level's node is out of range".to_string();
+    let mut decoded: Vec<Vec<i64>> = levels.to_vec();
+    for l in &mut decoded {
+        let mut prev = 0i64;
+        for i in (0..l.len()).step_by(4) {
+            let (x, total) = (l[i], *l.get(i + 1).ok_or_else(out_of_range)?);
+            l[i] = x + prev;
+            prev += x + total;
+        }
+    }
+    let name = |i: i64| -> Result<String, String> {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| names.get(i))
+            .cloned()
+            .ok_or_else(out_of_range)
+    };
+    let mut out = Vec::new();
+    for (level, l) in decoded.iter().enumerate().skip(1) {
+        for j in (0..l.len()).step_by(4) {
+            let self_value = *l.get(j + 2).ok_or_else(out_of_range)?;
+            if self_value <= 0 {
+                continue;
+            }
+            let mut stack = vec![String::new(); level];
+            stack[level - 1] = name(*l.get(j + 3).ok_or_else(out_of_range)?)?;
+            let mut x = l[j];
+            for i in (1..level).rev() {
+                let above = &decoded[i];
+                // The last node of level `i` starting at or before `x`.
+                let (mut lo, mut hi) = (0, above.len() / 4);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if above[mid * 4] > x {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                let k = lo.checked_sub(1).ok_or_else(out_of_range)?;
+                stack[i - 1] = name(above[k * 4 + 3])?;
+                x = above[k * 4];
+            }
+            out.push((stack, self_value));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -358,7 +516,12 @@ mod tests {
         let fj = br#"{"version":1,"flamebearer":{"names":["total","main","a","b"],"levels":[[0,11,0,0],[0,11,1,1],[0,7,7,2,0,3,3,3]],"numTicks":11,"maxSelf":7},"metadata":{"format":"single","spyName":"gospy","sampleRate":250,"units":"bytes","name":"b"}}"#;
         let f = parse_file(fj).expect("F-J parses");
         assert_eq!(
-            (f.spy_name.as_str(), f.sample_rate, f.units.as_str(), f.name.as_str()),
+            (
+                f.spy_name.as_str(),
+                f.sample_rate,
+                f.units.as_str(),
+                f.name.as_str()
+            ),
             ("gospy", 250, "bytes", "b")
         );
         assert_eq!(f.names, strings(&["total", "main", "a", "b"]));
@@ -378,7 +541,10 @@ mod tests {
         let v0 = br#"{"version":0,"flamebearer":{"names":["total"],"levels":[[0,1,1,0]]},"metadata":{"format":"single"}}"#;
         assert_eq!(
             parse_file(v0),
-            Err("could not convert flameabearer to tree: unsupported flamebearer version 0".to_string())
+            Err(
+                "could not convert flameabearer to tree: unsupported flamebearer version 0"
+                    .to_string()
+            )
         );
         let bad = parse_file(b"{").expect_err("not JSON");
         assert!(bad.starts_with("unable to unmarshall JSON: "), "{bad}");

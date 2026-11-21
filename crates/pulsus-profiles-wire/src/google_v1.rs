@@ -5,6 +5,9 @@
 //! number as a string, a field at its default omitted; read by its JSON or
 //! its proto name.
 
+use std::io::Read as _;
+
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 
 const fn is_false(v: &bool) -> bool {
@@ -379,4 +382,54 @@ pub struct Function {
         skip_serializing_if = "crate::int64::is_zero"
     )]
     pub start_line: i64,
+}
+
+/// Why [`decode_sized`] refused a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PprofDecodeError {
+    /// The decompressed body is over the limit.
+    TooLarge { limit: u64 },
+    /// Any other failure, with the decoder's text.
+    Other(String),
+}
+
+impl std::fmt::Display for PprofDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PprofDecodeError::TooLarge { limit } => write!(
+                f,
+                "decompressed size exceeds maximum allowed size of {limit} bytes"
+            ),
+            PprofDecodeError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Decodes one pprof body: gzipped when it starts `1f 8b`, else the raw
+/// message, with the decompressed length beside the profile. Output over
+/// `limit` bytes is refused apart from the other failures
+/// (`pkg/pprof/pprof.go:96-129`). Issue #831: moved here from the push
+/// path, which keeps it as `decode_pprof_sized`.
+pub fn decode_sized(bytes: &[u8], limit: u64) -> Result<(Profile, u64), PprofDecodeError> {
+    let decode = |b: &[u8]| {
+        Profile::decode(b)
+            .map(|p| (p, b.len() as u64))
+            .map_err(|e| PprofDecodeError::Other(e.to_string()))
+    };
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut buf = Vec::new();
+        flate2::read::MultiGzDecoder::new(bytes)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| PprofDecodeError::Other(format!("copy to buffer: {e}")))?;
+        if buf.len() as u64 > limit {
+            return Err(PprofDecodeError::TooLarge { limit });
+        }
+        decode(&buf)
+    } else {
+        if bytes.len() as u64 > limit {
+            return Err(PprofDecodeError::TooLarge { limit });
+        }
+        decode(bytes)
+    }
 }

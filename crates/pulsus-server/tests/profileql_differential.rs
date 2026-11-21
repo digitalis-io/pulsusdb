@@ -31,12 +31,12 @@
 //!   cargo test -p pulsus-server --test profileql_differential
 //! ```
 
+#[path = "../../pulsus-read/tests/profileql_adhoc_fixtures/mod.rs"]
+mod fx;
 #[path = "support/live_db.rs"]
 mod live_db;
 #[path = "../../pulsus-read/tests/profileql_pprof_nf/mod.rs"]
 mod nf;
-#[path = "../../pulsus-read/tests/profileql_adhoc_fixtures/mod.rs"]
-mod fx;
 
 use live_db::ScopedDb;
 
@@ -258,7 +258,9 @@ enum AdhocCall {
     },
     List,
     /// `Get` of an upload under `<case>-other-<run>`.
-    GetIn { upload: usize },
+    GetIn {
+        upload: usize,
+    },
     /// `Get` of this id.
     GetId(&'static str),
 }
@@ -5330,7 +5332,8 @@ fn run_adhoc(
             AdhocExpect::NotFound(upload) => {
                 for (k, (res, server)) in [(a, ours), (b, reference)].into_iter().enumerate() {
                     let id = ids[k].get(*upload).cloned().flatten().unwrap_or_default();
-                    let want = json!({"code": "not_found", "message": format!("profile {id} not found")});
+                    let want =
+                        json!({"code": "not_found", "message": format!("profile {id} not found")});
                     if res.status != 404 || json_value(&res.body) != Some(want.clone()) {
                         mismatches.one(
                             &what,
@@ -5344,7 +5347,11 @@ fn run_adhoc(
                     }
                 }
             }
-            AdhocExpect::Ledger { row, ours: po, theirs: pt } => {
+            AdhocExpect::Ledger {
+                row,
+                ours: po,
+                theirs: pt,
+            } => {
                 let pinned = |res: &Res, pin: &AdhocGraph| {
                     let want = (
                         pin.0.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
@@ -6073,7 +6080,15 @@ async fn profileql_matches_the_reference() {
         // Issue #831: an ad hoc case's steps, in order, on each server.
         if let Method::Adhoc(steps) = case.request.method {
             let other = format!("{}-other-{run}", case.id.to_ascii_lowercase());
-            run_adhoc(case, steps, &own, &other, &ours, &reference, &mut mismatches);
+            run_adhoc(
+                case,
+                steps,
+                &own,
+                &other,
+                &ours,
+                &reference,
+                &mut mismatches,
+            );
             continue;
         }
         // Issue #830: a settings case's steps, in order, on each server.

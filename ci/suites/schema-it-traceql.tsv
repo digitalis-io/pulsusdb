@@ -129,6 +129,9 @@ profileql_render	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=1912
 # Issue #830: the exploration app's settings, profile stats and query
 # analysis against the spawned binary, statements counted per request.
 profileql_app	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_app
+# Issue #831: the ad hoc profile uploads against the spawned binary,
+# statements counted per request and each upload's parts counted.
+profileql_adhoc	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_adhoc
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

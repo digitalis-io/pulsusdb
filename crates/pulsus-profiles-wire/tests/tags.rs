@@ -1158,7 +1158,10 @@ fn every_adhoc_field_encodes_under_the_proto_tag() {
             .unwrap_or_else(|| panic!("{message}.{field} is not in the .proto"))
     };
     let fields = |message: &str| -> Vec<String> {
-        adhoc_proto_tags(message).into_iter().map(|(n, _)| n).collect()
+        adhoc_proto_tags(message)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
     };
 
     let m = "AdHocProfilesUploadRequest";

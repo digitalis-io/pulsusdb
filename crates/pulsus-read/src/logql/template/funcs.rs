@@ -1584,7 +1584,7 @@ fn query_escape(s: &[u8]) -> Vec<u8> {
 /// `base64.StdEncoding.DecodeString` — Go skips `\r`/`\n` and reports
 /// `illegal base64 data at input byte %d` with the offset in the
 /// ORIGINAL input.
-fn b64_decode_go(s: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn b64_decode_go(s: &[u8]) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

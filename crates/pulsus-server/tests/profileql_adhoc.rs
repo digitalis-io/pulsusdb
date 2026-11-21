@@ -12,10 +12,10 @@
 //!   cargo test -p pulsus-server --test profileql_adhoc
 //! ```
 
-#[path = "support/live_db.rs"]
-mod live_db;
 #[path = "../../pulsus-read/tests/profileql_adhoc_fixtures/mod.rs"]
 mod fx;
+#[path = "support/live_db.rs"]
+mod live_db;
 
 use live_db::ScopedDb;
 
@@ -242,7 +242,6 @@ async fn statements(client: &ChClient, ids: &[String]) -> BTreeMap<String, u64> 
     out
 }
 
-
 /// The statements `system.query_log` holds for `id` of each kind.
 async fn kinds(client: &ChClient, id: &str) -> Vec<String> {
     let sql = format!(
@@ -367,9 +366,11 @@ fn upload_body(name: &str, file: &[u8], max_nodes: Option<i64>) -> Value {
 
 /// The flamebearer of an answer, parsed.
 fn graph(answer: &Value, ctx: &str) -> Value {
-    serde_json::from_str(answer["flamebearerProfile"].as_str().unwrap_or_else(|| {
-        panic!("{ctx}: no flamebearerProfile in {answer}")
-    }))
+    serde_json::from_str(
+        answer["flamebearerProfile"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{ctx}: no flamebearerProfile in {answer}")),
+    )
     .unwrap_or_else(|e| panic!("{ctx}: flamebearerProfile is not JSON: {e}"))
 }
 
@@ -385,29 +386,66 @@ impl Run {
     }
 
     /// Uploads `file` as `name`; the answer and the upload's id.
-    fn upload(&mut self, tenant: &str, name: &str, file: &[u8], max_nodes: Option<i64>, ctx: &str) -> (Value, String) {
-        let res = post(self.port, &format!("{ADHOC}/Upload"), tenant, &upload_body(name, file, max_nodes));
+    fn upload(
+        &mut self,
+        tenant: &str,
+        name: &str,
+        file: &[u8],
+        max_nodes: Option<i64>,
+        ctx: &str,
+    ) -> (Value, String) {
+        let res = post(
+            self.port,
+            &format!("{ADHOC}/Upload"),
+            tenant,
+            &upload_body(name, file, max_nodes),
+        );
         let (got, rid) = ok_json(&res, ctx);
         self.count(ctx, rid, 1);
-        let id = got["id"].as_str().unwrap_or_else(|| panic!("{ctx}: no id in {got}")).to_string();
+        let id = got["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{ctx}: no id in {got}"))
+            .to_string();
         self.uploads.push((ctx.to_string(), id.clone()));
         (got, id)
     }
 
     fn get(&mut self, tenant: &str, body: Value, ctx: &str) -> Value {
-        let (got, rid) = ok_json(&post(self.port, &format!("{ADHOC}/Get"), tenant, &body), ctx);
+        let (got, rid) = ok_json(
+            &post(self.port, &format!("{ADHOC}/Get"), tenant, &body),
+            ctx,
+        );
         self.count(ctx, rid, 1);
         got
     }
 
     fn diff(&mut self, tenant: &str, body: Value, ctx: &str) -> Value {
-        let (got, rid) = ok_json(&post(self.port, &format!("{ADHOC}/Diff"), tenant, &body), ctx);
+        let (got, rid) = ok_json(
+            &post(self.port, &format!("{ADHOC}/Diff"), tenant, &body),
+            ctx,
+        );
         self.count(ctx, rid, 1);
         got
     }
 
-    fn refused(&mut self, path: &str, tenant: &str, body: Value, status: u16, want: &str, n: u64, ctx: &str) {
-        let rid = refused(&post(self.port, &format!("{ADHOC}/{path}"), tenant, &body), status, want, ctx);
+    /// A refused call: its status, body and statement count.
+    #[allow(clippy::too_many_arguments)]
+    fn refused(
+        &mut self,
+        path: &str,
+        tenant: &str,
+        body: Value,
+        status: u16,
+        want: &str,
+        n: u64,
+        ctx: &str,
+    ) {
+        let rid = refused(
+            &post(self.port, &format!("{ADHOC}/{path}"), tenant, &body),
+            status,
+            want,
+            ctx,
+        );
         self.count(ctx, rid, n);
     }
 }
@@ -473,7 +511,10 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
         "t1",
         json!({"name": "a.txt", "profile": big}),
         400,
-        &error("invalid_argument", "profile payload size exceeds limit of 4.2 MB"),
+        &error(
+            "invalid_argument",
+            "profile payload size exceeds limit of 4.2 MB",
+        ),
         0,
         "L2 text",
     );
@@ -502,14 +543,26 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
     let got = r.diff("t1", json!({"leftId": x, "rightId": x}), "L3 diff x");
     assert_eq!(got["profileTypes"], json!(["x.txt"]), "L3 diff x");
     let g = graph(&got, "L3 diff x");
-    assert_eq!(g["flamebearer"]["names"], json!(["total", "main", "y", "other"]), "L3");
+    assert_eq!(
+        g["flamebearer"]["names"],
+        json!(["total", "main", "y", "other"]),
+        "L3"
+    );
     assert_eq!(
         g["flamebearer"]["levels"],
-        json!([[0, 8, 0, 0, 8, 0, 0], [0, 8, 0, 0, 8, 0, 1], [0, 5, 5, 0, 5, 5, 3, 0, 3, 3, 0, 3, 3, 2]]),
+        json!([
+            [0, 8, 0, 0, 8, 0, 0],
+            [0, 8, 0, 0, 8, 0, 1],
+            [0, 5, 5, 0, 5, 5, 3, 0, 3, 3, 0, 3, 3, 2]
+        ]),
         "L3"
     );
     assert_eq!(g["flamebearer"]["numTicks"], 16, "L3");
-    assert_eq!((g["leftTicks"].clone(), g["rightTicks"].clone()), (json!(8), json!(8)), "L3");
+    assert_eq!(
+        (g["leftTicks"].clone(), g["rightTicks"].clone()),
+        (json!(8), json!(8)),
+        "L3"
+    );
     assert_eq!(g["metadata"]["format"], "double", "L3");
     assert_eq!(g["metadata"]["spyName"], "", "L3");
     assert_eq!(g["groups"], Value::Null, "L3");
@@ -534,7 +587,10 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
         1,
         "L4 diff",
     );
-    let (got, rid) = ok_json(&post(port_a, &format!("{ADHOC}/List"), "t2", &json!({})), "L4 list");
+    let (got, rid) = ok_json(
+        &post(port_a, &format!("{ADHOC}/List"), "t2", &json!({})),
+        "L4 list",
+    );
     assert_eq!(got, json!({}), "L4 list");
     r.count("L4 list", rid, 1);
 
@@ -556,18 +612,32 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
         "L6 get d"
     );
     let got = r.get("t1", json!({"id": j}), "L6 get j");
-    assert_eq!((got["profileType"].clone(), got["profileTypes"].clone()), (json!("b"), json!(["b"])), "L6 j");
+    assert_eq!(
+        (got["profileType"].clone(), got["profileTypes"].clone()),
+        (json!("b"), json!(["b"])),
+        "L6 j"
+    );
     let (_, ba) = r.upload("t1", "ba", &fx::f_ba(), None, "L6 upload ba");
     let got = r.get("t1", json!({"id": ba}), "L6 get ba");
     assert_eq!(got["profileType"], "samples", "L6 ba");
     assert_eq!(got["profileTypes"], json!(["samples", "cpu"]), "L6 ba");
     assert_eq!(
         got["flamebearerProfile"],
-        fb(&["total", "main", "a"], "[0,3,0,0],[0,3,0,1],[0,3,3,2]", 3, 3, META_SAMPLES, "null"),
+        fb(
+            &["total", "main", "a"],
+            "[0,3,0,0],[0,3,0,1],[0,3,3,2]",
+            3,
+            3,
+            META_SAMPLES,
+            "null"
+        ),
         "L6 get ba"
     );
     let (_, e) = r.upload("t6", "empty", &fx::f_e(), None, "L6 upload e");
-    let (got, rid) = ok_json(&post(port_a, &format!("{ADHOC}/List"), "t6", &json!({})), "L6 list");
+    let (got, rid) = ok_json(
+        &post(port_a, &format!("{ADHOC}/List"), "t6", &json!({})),
+        "L6 list",
+    );
     r.count("L6 list", rid, 1);
     assert_eq!(got["profiles"][0]["id"], e.as_str(), "L6 list: {got}");
     assert_eq!(got["profiles"][0]["name"], "empty", "L6 list");
@@ -587,7 +657,11 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
     ] {
         let ctx = format!("L8 {name}");
         let (up, id) = r.upload("t1", name, &file, Some(m), &format!("{ctx} upload"));
-        let got = r.get("t1", json!({"id": id, "maxNodes": m}), &format!("{ctx} get"));
+        let got = r.get(
+            "t1",
+            json!({"id": id, "maxNodes": m}),
+            &format!("{ctx} get"),
+        );
         assert_eq!(got["flamebearerProfile"], up["flamebearerProfile"], "{ctx}");
         assert_eq!(got["profileTypes"], up["profileTypes"], "{ctx}");
     }
@@ -598,7 +672,10 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
         "t1",
         json!({"id": "a/b"}),
         400,
-        &error("invalid_argument", "id 'a/b' is invalid: can only contain [a-zA-Z0-9_-.]"),
+        &error(
+            "invalid_argument",
+            "id 'a/b' is invalid: can only contain [a-zA-Z0-9_-.]",
+        ),
         0,
         "L9 get a/b",
     );
@@ -659,25 +736,59 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
 
     // L12: an upload above the server's default block size lands in one
     // part: F-BIG, every value 1, read at 65,536 nodes.
-    let (_, big) = r.upload("t1", "big", &fx::f_big(), Some(fx::F_BIG_MAX_NODES), "L12 upload");
-    assert_eq!(parts_of(&client, &big).await, (1, fx::F_BIG_ROWS), "L12 parts");
-    let got = r.get("t1", json!({"id": big, "maxNodes": fx::F_BIG_MAX_NODES}), "L12 get");
+    let (_, big) = r.upload(
+        "t1",
+        "big",
+        &fx::f_big(),
+        Some(fx::F_BIG_MAX_NODES),
+        "L12 upload",
+    );
+    assert_eq!(
+        parts_of(&client, &big).await,
+        (1, fx::F_BIG_ROWS),
+        "L12 parts"
+    );
+    let got = r.get(
+        "t1",
+        json!({"id": big, "maxNodes": fx::F_BIG_MAX_NODES}),
+        "L12 get",
+    );
     assert_eq!(got["profileType"], "t0", "L12");
     let g = graph(&got, "L12 get");
-    let leaves = g["flamebearer"]["levels"][1].as_array().map(Vec::len).unwrap_or(0) / 4;
+    let leaves = g["flamebearer"]["levels"][1]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0)
+        / 4;
     assert_eq!(leaves, 60_000, "L12: the first type's tree");
     assert_eq!(g["flamebearer"]["numTicks"], 60_000, "L12");
 
     // L7: the native paths with the compat flag unset; the compat paths
     // are not mounted.
-    let (got, _) = ok_json(&post(port_b, &format!("{ADHOC}/Upload"), "t7", &upload_body("c.txt", fx::F_C, None)), "L7 upload");
+    let (got, _) = ok_json(
+        &post(
+            port_b,
+            &format!("{ADHOC}/Upload"),
+            "t7",
+            &upload_body("c.txt", fx::F_C, None),
+        ),
+        "L7 upload",
+    );
     let seven = got["id"].as_str().expect("an id").to_string();
     r.uploads.push(("L7 upload".to_string(), seven));
-    let (got, _) = ok_json(&post(port_b, &format!("{ADHOC}/List"), "t7", &json!({})), "L7 list");
+    let (got, _) = ok_json(
+        &post(port_b, &format!("{ADHOC}/List"), "t7", &json!({})),
+        "L7 list",
+    );
     assert_eq!(got["profiles"].as_array().map(Vec::len), Some(1), "L7 list");
     let res = post(port_b, &format!("{ADHOC}/Get"), "t7", &json!({"id": ZERO}));
     assert_eq!(res.status, 404, "L7 get: {}", res.text());
-    let res = post(port_b, &format!("{ADHOC}/Diff"), "t7", &json!({"leftId": ZERO, "rightId": ZERO}));
+    let res = post(
+        port_b,
+        &format!("{ADHOC}/Diff"),
+        "t7",
+        &json!({"leftId": ZERO, "rightId": ZERO}),
+    );
     assert_eq!(res.status, 404, "L7 diff: {}", res.text());
     for m in ["Upload", "Get", "List", "Diff"] {
         let res = post(port_b, &format!("{COMPAT}/{m}"), "t7", &json!({}));
@@ -723,7 +834,10 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
         )
         .await;
     assert!(refusal.is_err(), "L11: the two-day upload was accepted");
-    let (got, rid) = ok_json(&post(port_a, &format!("{ADHOC}/List"), "t1", &json!({})), "L11 list");
+    let (got, rid) = ok_json(
+        &post(port_a, &format!("{ADHOC}/List"), "t1", &json!({})),
+        "L11 list",
+    );
     r.count("L11 list", rid, 1);
     assert!(
         !got.to_string().contains(refused_id),
@@ -745,7 +859,11 @@ async fn ad_hoc_uploads_answer_in_one_statement_each() {
     for (ctx, id, want) in &r.counted {
         assert_eq!(sent[id], *want, "{ctx}: statements for {id}");
         if ctx.ends_with("upload") && *want == 1 {
-            assert_eq!(kinds(&client, id).await, ["Insert"], "{ctx}: the one statement is the insert");
+            assert_eq!(
+                kinds(&client, id).await,
+                ["Insert"],
+                "{ctx}: the one statement is the insert"
+            );
         }
     }
 }
