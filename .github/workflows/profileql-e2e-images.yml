@@ -7,8 +7,9 @@
 # Run by hand only. The job runs in the `ghcr-publish` environment, which
 # deploys from `main` only after its reviewer approves, and logs in with that
 # environment's secret; the workflow token asks for no package permission.
-# The last step prints the digest each push step returned; the e2e stack
-# pins those digests. To update: change an ARG, or package.json and its lock,
+# Each image is built for linux/amd64 only, the platform of the CI runners
+# that pull it. The step after each push prints the digest that push
+# returned; the e2e stack pins those digests. To update: change an ARG, or package.json and its lock,
 # merge, run this on `main`, and pin the printed digests.
 name: profileql-e2e-images
 
@@ -28,44 +29,44 @@ jobs:
         env:
           TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ vars.GHCR_PUBLISH_USER }}
           password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build and push the front end
         id: frontend
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
+          context: deploy/e2e/profileql
           file: deploy/e2e/profileql/frontend.Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: ghcr.io/digitalis-io/profileql-e2e-frontend:13.3.1-13.0.10-3.2.0-13.4.2
           push: true
 
+      - name: Print the digest the front end's push returned
+        run: echo "profileql-e2e-frontend ${DIGEST}"
+        env:
+          DIGEST: ${{ steps.frontend.outputs.digest }}
+
       - name: Build and push the browser
         id: browser
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
+          context: e2e/profileql
           file: deploy/e2e/profileql/browser.Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: ghcr.io/digitalis-io/profileql-e2e-browser:1.65.1
           push: true
 
-      - name: Print the digests the push steps returned
-        run: |
-          echo "profileql-e2e-frontend ${FRONTEND_DIGEST}"
-          echo "profileql-e2e-browser ${BROWSER_DIGEST}"
+      - name: Print the digest the browser's push returned
+        run: echo "profileql-e2e-browser ${DIGEST}"
         env:
-          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
-          BROWSER_DIGEST: ${{ steps.browser.outputs.digest }}
+          DIGEST: ${{ steps.browser.outputs.digest }}
