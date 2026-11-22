@@ -865,6 +865,23 @@ async fn ds_query(http: &reqwest::Client, uid: &str, query: Value, now_s: i64) -
     Ok(value["results"]["A"].clone())
 }
 
+/// [`ds_query`]'s answer, or its error as `{"error": ...}`, so one failed
+/// query is reported beside the others.
+async fn ds_result(http: &reqwest::Client, uid: &str, query: Value, now_s: i64) -> Value {
+    match ds_query(http, uid, query, now_s).await {
+        Ok(result) => result,
+        Err(e) => json!({"error": format!("{e:#}")}),
+    }
+}
+
+/// The error [`ds_result`] recorded, as a suffix for a failure line.
+fn why(result: &Value) -> String {
+    result
+        .get("error")
+        .map(|e| format!(" ({e})"))
+        .unwrap_or_default()
+}
+
 /// A data frame's field `name`: its values, and its schema entry.
 fn field<'a>(frame: &'a Value, name: &str) -> Option<(&'a Value, &'a Vec<Value>)> {
     let fields = frame["schema"]["fields"].as_array()?;
@@ -969,29 +986,32 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
         );
 
         // F3
-        let result = ds_query(
+        let result = ds_result(
             http,
             uid,
             json!({"queryType": "profile", "profileTypeId": PROCESS_CPU,
                    "labelSelector": "{}", "groupBy": []}),
             now_s,
         )
-        .await?;
+        .await;
         let root = root_of(&result);
         check(
             root == total,
-            format!("F3 {uid}: root value {root}, expected {total}"),
+            format!(
+                "F3 {uid}: root value {root}, expected {total}{}",
+                why(&result)
+            ),
         );
 
         // F4
-        let result = ds_query(
+        let result = ds_result(
             http,
             uid,
             json!({"queryType": "metrics", "profileTypeId": PROCESS_CPU,
                    "labelSelector": "{}", "groupBy": ["service_name"]}),
             now_s,
         )
-        .await?;
+        .await;
         let frames = result["frames"].as_array().cloned().unwrap_or_default();
         let labels: Vec<String> = frames
             .iter()
@@ -1009,7 +1029,10 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
         let want: BTreeSet<String> = metric_services.iter().map(|s| s.to_string()).collect();
         check(
             labels.len() == want.len() && got == want,
-            format!("F4 {uid}: frames labelled {labels:?}, expected one each of {want:?}"),
+            format!(
+                "F4 {uid}: frames labelled {labels:?}, expected one each of {want:?}{}",
+                why(&result)
+            ),
         );
 
         // F5
@@ -1024,17 +1047,20 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             if let Some(span) = span {
                 query["spanSelector"] = json!([span]);
             }
-            let result = ds_query(http, uid, query, now_s).await?;
+            let result = ds_result(http, uid, query, now_s).await;
             let root = root_of(&result);
             let want = value * otlp_scale;
             check(
                 root == want,
-                format!("F5 {uid} span {span:?}: root value {root}, expected {want}"),
+                format!(
+                    "F5 {uid} span {span:?}: root value {root}, expected {want}{}",
+                    why(&result)
+                ),
             );
         }
 
         // F6
-        let result = ds_query(
+        let result = ds_result(
             http,
             uid,
             json!({"queryType": "metrics", "profileTypeId": PROCESS_CPU,
@@ -1042,14 +1068,17 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
                    "includeHeatmap": true, "heatmapType": "individual"}),
             now_s,
         )
-        .await?;
+        .await;
         let count = heatmap_count(&result);
         check(
             count == Some(profiles),
-            format!("F6 {uid}: heatmap count {count:?}, expected {profiles}"),
+            format!(
+                "F6 {uid}: heatmap count {count:?}, expected {profiles}{}",
+                why(&result)
+            ),
         );
         if uid == DS_T1 {
-            let result = ds_query(
+            let result = ds_result(
                 http,
                 uid,
                 json!({"queryType": "metrics", "profileTypeId": PROCESS_CPU,
@@ -1057,11 +1086,14 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
                        "includeExemplars": true}),
                 now_s,
             )
-            .await?;
+            .await;
             let rows = exemplar_rows(&result);
             check(
                 rows == Some(6),
-                format!("F6 {uid}: exemplar rows {rows:?}, expected 6"),
+                format!(
+                    "F6 {uid}: exemplar rows {rows:?}, expected 6{}",
+                    why(&result)
+                ),
             );
         }
     }
