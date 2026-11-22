@@ -378,18 +378,21 @@ fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
             }
         }
         Check::FlameRoot(want) => {
-            let roots: Vec<i64> = answers(records, DS_QUERY)
+            // Every flame graph in every answer, a missing or non-numeric
+            // root included as `None`.
+            let roots: Vec<Option<i64>> = answers(records, DS_QUERY)
                 .iter()
                 .flat_map(|body| {
                     body["results"]
                         .as_object()
                         .into_iter()
                         .flatten()
-                        .filter_map(|(_, result)| flame_root(result))
+                        .flat_map(|(_, result)| flame_frames(result))
+                        .map(frame_root)
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            if roots.is_empty() || roots.iter().any(|root| root != want) {
+            if roots.is_empty() || roots.iter().any(|root| *root != Some(*want)) {
                 out.push(format!(
                     "flame graph root values {roots:?}, expected {want}"
                 ));
@@ -901,25 +904,37 @@ fn field<'a>(frame: &'a Value, name: &str) -> Option<(&'a Value, &'a Vec<Value>)
 /// `None` when there is no such frame or its root is missing or not a
 /// number.
 fn flame_root(result: &Value) -> Option<i64> {
-    let frames = result["frames"].as_array()?;
-    let frame = frames.iter().find(|f| field(f, "level").is_some())?;
-    let (_, values) = field(frame, "value")?;
-    values.first().and_then(Value::as_i64)
+    flame_frames(result)
+        .first()
+        .and_then(|frame| frame_root(frame))
 }
 
-/// The empty profile exactly: one node, `total`, at 0, every one of its
-/// four fields holding one value.
-fn is_empty_profile(result: &Value) -> bool {
-    let Some(frame) = result["frames"]
+/// A result's flame graph frames: those with a `level` field.
+fn flame_frames(result: &Value) -> Vec<&Value> {
+    result["frames"]
         .as_array()
-        .and_then(|frames| frames.iter().find(|f| field(f, "level").is_some()))
-    else {
+        .into_iter()
+        .flatten()
+        .filter(|f| field(f, "level").is_some())
+        .collect()
+}
+
+/// A flame graph frame's numeric root value.
+fn frame_root(frame: &Value) -> Option<i64> {
+    field(frame, "value")?.1.first().and_then(Value::as_i64)
+}
+
+/// The empty profile exactly: the answer's one flame graph frame, one node,
+/// `total`, at 0, every one of its four fields holding one value. A profile
+/// query answers one flame graph frame.
+fn is_empty_profile(result: &Value) -> bool {
+    let [frame] = flame_frames(result)[..] else {
         return false;
     };
     let one_each = ["level", "value", "self", "label"]
         .iter()
         .all(|name| field(frame, name).is_some_and(|(_, values)| values.len() == 1));
-    one_each && flame_root(result) == Some(0) && flame_labels(result) == ["total"]
+    one_each && frame_root(frame) == Some(0) && flame_labels(result) == ["total"]
 }
 
 /// A flame graph frame's node labels, in node order.
@@ -1612,6 +1627,28 @@ mod tests {
         let failures = p4(1_079_999_999);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("1079999999"), "{failures:?}");
+    }
+
+    /// Review r3: a flame graph whose root is missing fails the check even
+    /// when another answer has the expected root.
+    #[test]
+    fn u7b_a_flame_graph_with_no_root_fails_beside_a_good_one() {
+        let spec = page(
+            "P4",
+            "/a/x".to_string(),
+            vec![expect(DS_QUERY)],
+            Check::FlameRoot(1_080_000_000),
+        );
+        let mut broken: Value = serde_json::from_str(&flame(1_080_000_000)).unwrap();
+        broken["results"]["A"]["frames"][0]["data"]["values"][1] = json!([]);
+        let mut page = record(vec![
+            rec(200, DS_QUERY, "{}", &flame(1_080_000_000)),
+            rec(200, DS_QUERY, "{}", &broken.to_string()),
+        ]);
+        page.name = "P4".to_string();
+        let failures = page_failures(&spec, &page);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("None"), "{failures:?}");
     }
 
     #[test]
