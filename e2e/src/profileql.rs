@@ -859,10 +859,18 @@ async fn ds_query(http: &reqwest::Client, uid: &str, query: Value, now_s: i64) -
         bail!("/api/ds/query on {uid}: {status}: {text}");
     }
     let value: Value = serde_json::from_str(&text).context("/api/ds/query answer is not JSON")?;
-    if let Some(error) = value["results"]["A"].get("error") {
+    let result = &value["results"]["A"];
+    if let Some(error) = result.get("error") {
         bail!("/api/ds/query on {uid}: {error}");
     }
-    Ok(value["results"]["A"].clone())
+    // The result's own status must say success, whatever else it carries.
+    if result["status"] != 200 {
+        bail!(
+            "/api/ds/query on {uid}: result status {}: {result}",
+            result["status"]
+        );
+    }
+    Ok(result.clone())
 }
 
 /// [`ds_query`]'s answer, or its error as `{"error": ...}`, so one failed
@@ -889,13 +897,29 @@ fn field<'a>(frame: &'a Value, name: &str) -> Option<(&'a Value, &'a Vec<Value>)
     Some((&fields[i], frame["data"]["values"][i].as_array()?))
 }
 
-/// The root value of the first flame graph frame of a result, 0 when it
-/// has none.
+/// The numeric root value of the first flame graph frame of a result, or
+/// `None` when there is no such frame or its root is missing or not a
+/// number.
 fn flame_root(result: &Value) -> Option<i64> {
     let frames = result["frames"].as_array()?;
     let frame = frames.iter().find(|f| field(f, "level").is_some())?;
     let (_, values) = field(frame, "value")?;
-    Some(values.first().and_then(Value::as_i64).unwrap_or(0))
+    values.first().and_then(Value::as_i64)
+}
+
+/// The empty profile exactly: one node, `total`, at 0, every one of its
+/// four fields holding one value.
+fn is_empty_profile(result: &Value) -> bool {
+    let Some(frame) = result["frames"]
+        .as_array()
+        .and_then(|frames| frames.iter().find(|f| field(f, "level").is_some()))
+    else {
+        return false;
+    };
+    let one_each = ["level", "value", "self", "label"]
+        .iter()
+        .all(|name| field(frame, name).is_some_and(|(_, values)| values.len() == 1));
+    one_each && flame_root(result) == Some(0) && flame_labels(result) == ["total"]
 }
 
 /// A flame graph frame's node labels, in node order.
@@ -1055,7 +1079,7 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             let labels = flame_labels(&result);
             let ok = result.get("error").is_none()
                 && root == Some(want)
-                && (want != 0 || labels == ["total"]);
+                && (want != 0 || is_empty_profile(&result));
             check(
                 ok,
                 format!(
