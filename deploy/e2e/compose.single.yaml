@@ -243,8 +243,8 @@ services:
   # (`deploy/e2e/profileql/frontend.Dockerfile`, published by
   # `.github/workflows/profileql-e2e-images.yml`), so a run fetches nothing
   # from the plugin catalogue. Pinned by the digest that workflow printed.
-  # Separate from `grafana` above, whose version is below the plugins'
-  # minimum. `Admin`: the app's settings page saves under it.
+  # Separate from the existing front end above, whose version is below the
+  # plugins' minimum. `Admin`: the app's settings page saves under it.
   profileql-frontend:
     image: ghcr.io/digitalis-io/profileql-e2e-frontend@sha256:1c48fcf73e880e914d2fbea2b7b3e7a7f2bc6ba0024b730fb5e2ea5a1c0129af
     environment:

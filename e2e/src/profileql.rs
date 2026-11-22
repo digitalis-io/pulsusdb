@@ -1048,12 +1048,18 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
                 query["spanSelector"] = json!([span]);
             }
             let result = ds_result(http, uid, query, now_s).await;
-            let root = root_of(&result);
             let want = value * otlp_scale;
+            // The query must succeed; for the unprofiled span its answer is
+            // the empty profile, the root alone at 0.
+            let root = flame_root(&result);
+            let labels = flame_labels(&result);
+            let ok = result.get("error").is_none()
+                && root == Some(want)
+                && (want != 0 || labels == ["total"]);
             check(
-                root == want,
+                ok,
                 format!(
-                    "F5 {uid} span {span:?}: root value {root}, expected {want}{}",
+                    "F5 {uid} span {span:?}: root value {root:?}, labels {labels:?}, expected {want}{}",
                     why(&result)
                 ),
             );
@@ -1156,6 +1162,7 @@ const SETTINGS_GET: &str = "/settings.v1.SettingsService/Get";
 const SETTINGS_SET: &str = "/settings.v1.SettingsService/Set";
 const SERIES: &str = "/querier.v1.QuerierService/Series";
 const DS_QUERY: &str = "/api/ds/query";
+const FLAME_PANEL: &str = "flame-graph-panel";
 
 fn page(name: &str, url: String, expect: Vec<Expect>, check: Check) -> Spec {
     Spec {
@@ -1260,7 +1267,7 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
         cores("svc-t2only", "0.000667"),
     ];
 
-    let p2 = page(
+    let mut p2 = page(
         "P2 profile types",
         app_url(
             "explore?explorationType=profiles&",
@@ -1270,7 +1277,11 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
         vec![expect(STATS), expect(SERIES), expect(DS_QUERY)],
         Check::None,
     );
-    let p3 = page(
+    p2.visible = vec![text_in(
+        &panel("cpu (process_cpu)"),
+        "avg cpu = 0.0120 cores / max = 0.0120 cores",
+    )];
+    let mut p3 = page(
         "P3 labels",
         app_url(
             "explore?explorationType=labels&",
@@ -1284,7 +1295,11 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
         ],
         Check::None,
     );
-    let p4 = page(
+    p3.visible = vec![text_in(
+        "sceneBody",
+        "avg prod = 0.0120 cores / max = 0.0120 cores",
+    )];
+    let mut p4 = page(
         "P4 flame graph",
         app_url(
             "explore?explorationType=flame-graph&",
@@ -1294,7 +1309,8 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
         vec![expect(SETTINGS_GET), expect(DS_QUERY)],
         Check::FlameRoot(1_080_000_000),
     );
-    let p5 = page(
+    p4.visible = vec![text_in(FLAME_PANEL, "1.08 s | 1.08 Bil samples (Time)")];
+    let mut p5 = page(
         "P5 span heatmap",
         app_url(
             "explore?explorationType=flame-graph&showSpanHeatmap=true&",
@@ -1307,8 +1323,13 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
             exemplars: vec![(SPAN_WORK, 10_000_000), (SPAN_IO, 20_000_000)],
         },
     );
+    p5.visible = vec![
+        text_in("span-heatmap-panel", SPAN_WORK),
+        text_in("span-heatmap-panel", SPAN_IO),
+        text_in(FLAME_PANEL, "60 ms | 60 Mil samples (Time)"),
+    ];
     let (from, to) = (ms(t0 - 60), ms(t0 + 360));
-    let p6 = page(
+    let mut p6 = page(
         "P6 diff",
         app_url(
             "explore?explorationType=diff-flame-graph&",
@@ -1328,6 +1349,11 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
             right: 540_000_000,
         },
     );
+    // Both sides' totals together.
+    p6.visible = vec![text_in(
+        "diff-flame-graph-panel",
+        "1.08 s | 1.08 Bil samples (Time)",
+    )];
     let mut p8 = page(
         "P8 ad hoc",
         app_url("ad-hoc?", DS_T1, ""),
