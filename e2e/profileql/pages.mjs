@@ -35,22 +35,31 @@ async function load(browser, spec) {
   const page = await context.newPage();
   const records = [];
   const pending = [];
+  // Requests the page aborted: their responses are not answers it used.
+  const aborted = new Set();
   let last = Date.now();
+  page.on('requestfailed', (req) => aborted.add(req));
   page.on('response', (res) => {
     const url = new URL(res.url());
     if (!url.pathname.startsWith('/api/')) return;
     last = Date.now();
     pending.push((async () => {
       let body = '';
+      let bodyError = null;
       try {
         body = (await res.body()).subarray(0, BODY_LIMIT).toString('utf8');
-      } catch (e) {}
+      } catch (e) {
+        bodyError = String(e).slice(0, 300);
+      }
       records.push({
         status: res.status(),
         method: res.request().method(),
         path: url.pathname,
         request: res.request().postData() || '',
         body,
+        bodyError,
+        aborted: false,
+        req: res.request(),
       });
     })());
   });
@@ -99,6 +108,7 @@ async function load(browser, spec) {
     await Promise.all(pending);
   }
   await context.close();
+  report.records = records.map(({ req, ...r }) => ({ ...r, aborted: aborted.has(req) }));
   return report;
 }
 

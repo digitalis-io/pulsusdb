@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 use crate::harness::poll_until;
 use crate::scenarios::Ctx;
 
+mod parse;
+use parse::Parsed;
+
 /// The front end's published address (`ports` of `profileql-frontend`).
 const FRONTEND_URL: &str = "http://127.0.0.1:3002";
 /// The front end's address inside the stack's network, as the browser
@@ -149,8 +152,8 @@ pub(crate) enum Check {
     Diff { left: i64, right: i64 },
     /// The ad hoc upload's flame graph total.
     Upload(i64),
-    /// A settings `Get` answer containing this text.
-    Settings(&'static str),
+    /// Every settings `Get` answer's `maxNodes`.
+    Settings(i64),
     /// The span's two flame graphs, the inline one and the opened pane's.
     Span {
         span: &'static str,
@@ -185,15 +188,18 @@ pub(crate) struct Spec {
 
 /// One recorded `/api/` response.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Record {
     pub status: u16,
-    #[serde(default)]
     pub method: String,
     pub path: String,
-    #[serde(default)]
     pub request: String,
-    #[serde(default)]
     pub body: String,
+    /// The browser could not read the body; the page did not abort it.
+    pub body_error: Option<String>,
+    /// The page aborted the request (`requestfailed`): not an answer it
+    /// used, so it is not judged as one.
+    pub aborted: bool,
 }
 
 /// Whether a [`Text`] was visible.
@@ -236,6 +242,14 @@ pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
         .map(|e| format!("; the browser: {e}"))
         .unwrap_or_default();
 
+    // The answers the page used: the requests it aborted are not.
+    let live: Vec<Record> = page
+        .records
+        .iter()
+        .filter(|r| !r.aborted)
+        .cloned()
+        .collect();
+
     // R1: every expected request answered 200, and the wait met.
     let mut expected = spec.expect.clone();
     if spec.save.is_some() {
@@ -243,14 +257,9 @@ pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
     }
     let mut missing = false;
     for e in &expected {
-        if !page
-            .records
-            .iter()
-            .any(|r| r.status == 200 && matches(r, e))
-        {
+        if !live.iter().any(|r| r.status == 200 && matches(r, e)) {
             missing = true;
-            let answers: Vec<u16> = page
-                .records
+            let answers: Vec<u16> = live
                 .iter()
                 .filter(|r| matches(r, e))
                 .map(|r| r.status)
@@ -267,16 +276,26 @@ pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
         ));
     }
 
-    // R2: the datasource's requests, except the one accepted error.
-    for r in &page.records {
+    // R2: every datasource request answered exactly 200 with a body the
+    // browser read, except the one accepted error.
+    for r in &live {
         let judged = [DS_QUERY, "/api/datasources/proxy/", "/api/datasources/uid/"]
             .iter()
             .any(|prefix| r.path.starts_with(prefix));
-        if !judged || r.status < 400 {
+        if !judged {
             continue;
         }
-        let unimplemented = serde_json::from_str::<Value>(&r.body)
-            .is_ok_and(|body| body["code"] == "unimplemented");
+        if let Some(e) = &r.body_error {
+            out.push(format!(
+                "{name}: R2 {} {}: body not read: {e}",
+                r.method, r.path
+            ));
+            continue;
+        }
+        if r.status == 200 {
+            continue;
+        }
+        let unimplemented = parse::connect_code(&r.body).is_ok_and(|code| code == "unimplemented");
         if r.path.ends_with(RECORDING_RULES) && r.status == 501 && unimplemented {
             continue;
         }
@@ -286,25 +305,20 @@ pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
         ));
     }
 
-    // R3: an error inside a query answer.
-    for r in page.records.iter().filter(|r| r.path == DS_QUERY) {
-        let Ok(body) = serde_json::from_str::<Value>(&r.body) else {
-            continue;
-        };
-        for (ref_id, result) in body["results"].as_object().into_iter().flatten() {
-            let status = result["status"].as_u64().unwrap_or(0);
-            if result.get("error").is_some() || status >= 400 {
-                out.push(format!(
-                    "{name}: R3 /api/ds/query result {ref_id}: status {status}, error {}",
-                    result["error"]
-                ));
-            }
+    // R3: every query answer parses: each result status 200, no error,
+    // every frame well formed.
+    for r in live
+        .iter()
+        .filter(|r| r.path == DS_QUERY && r.status == 200 && r.body_error.is_none())
+    {
+        if let Err(e) = parse::answer(&r.body) {
+            out.push(format!("{name}: R3 /api/ds/query: {e}"));
         }
     }
 
     // R4
     out.extend(
-        value_failures(&spec.check, &page.records)
+        value_failures(&spec.check, &live)
             .into_iter()
             .map(|f| format!("{name}: R4 {f}")),
     );
@@ -349,88 +363,78 @@ fn matches(r: &Record, e: &Expect) -> bool {
     r.path.ends_with(&e.path) && e.req.iter().all(|s| r.request.contains(s.as_str()))
 }
 
-/// The JSON bodies of the 200 answers whose path ends in `path`.
-fn answers(records: &[Record], path: &str) -> Vec<Value> {
-    records
+/// Every 200 answer whose path ends in `path`, through `parser`: the
+/// parsed answers, and one failure for each that does not parse.
+fn parsed<T>(
+    records: &[Record],
+    path: &str,
+    parser: impl Fn(&str) -> Parsed<T>,
+    out: &mut Vec<String>,
+) -> Vec<T> {
+    let mut good = Vec::new();
+    for r in records
         .iter()
         .filter(|r| r.status == 200 && r.path.ends_with(path))
-        .filter_map(|r| serde_json::from_str(&r.body).ok())
-        .collect()
+    {
+        match parser(&r.body) {
+            Ok(v) => good.push(v),
+            Err(e) => out.push(format!("{path}: {e}")),
+        }
+    }
+    good
 }
 
-/// An int64 written as a JSON number or as a string.
-fn int(v: &Value) -> Option<i64> {
-    v.as_i64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-}
-
-/// R4: what [`Check`] asks of the answers.
+/// R4: what [`Check`] asks of the answers. Every answer the check reads is
+/// parsed strictly; one that does not parse fails the check.
 fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
     let mut out = Vec::new();
     match check {
         Check::None => {}
         Check::Services(want) => {
-            let bodies = answers(records, SERIES);
-            let got: BTreeSet<String> = bodies.iter().flat_map(series_services).collect();
+            let sets = parsed(records, SERIES, parse::series_answer, &mut out);
+            let got: BTreeSet<String> = sets
+                .iter()
+                .flatten()
+                .filter_map(|labels| labels.get("service_name").cloned())
+                .collect();
             let want: BTreeSet<String> = want.iter().map(|s| s.to_string()).collect();
-            if bodies.is_empty() || got != want {
+            if sets.is_empty() || got != want {
                 out.push(format!("Series lists {got:?}, expected {want:?}"));
             }
         }
         Check::FlameRoot(want) => {
-            // Every flame graph in every answer, a missing or non-numeric
-            // root included as `None`.
-            let roots: Vec<Option<i64>> = answers(records, DS_QUERY)
-                .iter()
-                .flat_map(|body| {
-                    body["results"]
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|(_, result)| flame_frames(result))
-                        .map(frame_root)
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            if roots.is_empty() || roots.iter().any(|root| *root != Some(*want)) {
+            let mut roots = Vec::new();
+            for results in parsed(records, DS_QUERY, parse::answer, &mut out) {
+                for (ref_id, result) in &results {
+                    for (i, frame) in result.frames.iter().enumerate() {
+                        match parse::kind(frame) {
+                            Ok(parse::Kind::Flame(g)) => roots.push(g.root()),
+                            Ok(_) => {}
+                            Err(e) => out.push(format!("result {ref_id} frame {i}: {e}")),
+                        }
+                    }
+                }
+            }
+            if roots.is_empty() || roots.iter().any(|root| root != want) {
                 out.push(format!(
                     "flame graph root values {roots:?}, expected {want}"
                 ));
             }
         }
         Check::Heatmap { count, exemplars } => {
-            let bodies = answers(records, "/querier.v1.QuerierService/SelectHeatmap");
-            if bodies.is_empty() {
+            let answers = parsed(
+                records,
+                "/querier.v1.QuerierService/SelectHeatmap",
+                parse::heatmap_answer,
+                &mut out,
+            );
+            if answers.is_empty() {
                 out.push("no SelectHeatmap answer".to_string());
             }
             let mut want: Vec<(String, i64)> =
                 exemplars.iter().map(|(s, v)| (s.to_string(), *v)).collect();
             want.sort();
-            for body in &bodies {
-                let slots: Vec<&Value> = body["series"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|series| series["slots"].as_array())
-                    .flatten()
-                    .collect();
-                let got_count: i64 = slots
-                    .iter()
-                    .filter_map(|slot| slot["counts"].as_array())
-                    .flatten()
-                    .filter_map(int)
-                    .sum();
-                let mut got: Vec<(String, i64)> = slots
-                    .iter()
-                    .filter_map(|slot| slot["exemplars"].as_array())
-                    .flatten()
-                    .map(|e| {
-                        (
-                            e["spanId"].as_str().unwrap_or("").to_string(),
-                            int(&e["value"]).unwrap_or(0),
-                        )
-                    })
-                    .collect();
+            for (got_count, mut got) in answers {
                 got.sort();
                 if got_count != *count || got != want {
                     out.push(format!(
@@ -440,13 +444,17 @@ fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
             }
         }
         Check::Diff { left, right } => {
-            let bodies = answers(records, "/pyroscope/render-diff");
-            if bodies.is_empty() {
+            let answers = parsed(
+                records,
+                "/pyroscope/render-diff",
+                parse::diff_answer,
+                &mut out,
+            );
+            if answers.is_empty() {
                 out.push("no render-diff answer".to_string());
             }
-            for body in &bodies {
-                let got = (int(&body["leftTicks"]), int(&body["rightTicks"]));
-                if got != (Some(*left), Some(*right)) {
+            for got in answers {
+                if got != (*left, *right) {
                     out.push(format!(
                         "render-diff totals {got:?}, expected {left}, {right}"
                     ));
@@ -454,25 +462,30 @@ fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
             }
         }
         Check::Upload(want) => {
-            let ticks: Vec<Option<i64>> =
-                answers(records, "/adhocprofiles.v1.AdHocProfileService/Upload")
-                    .iter()
-                    .map(|body| {
-                        let profile: Value =
-                            serde_json::from_str(body["flamebearerProfile"].as_str()?).ok()?;
-                        int(&profile["flamebearer"]["numTicks"])
-                    })
-                    .collect();
-            if ticks.is_empty() || ticks.iter().any(|t| *t != Some(*want)) {
+            let ticks = parsed(
+                records,
+                "/adhocprofiles.v1.AdHocProfileService/Upload",
+                parse::upload_answer,
+                &mut out,
+            );
+            if ticks.is_empty() || ticks.iter().any(|t| t != want) {
                 out.push(format!("upload totals {ticks:?}, expected {want}"));
             }
         }
-        Check::Settings(text) => {
-            let found = records.iter().any(|r| {
-                r.status == 200 && r.path.ends_with(SETTINGS_GET) && r.body.contains(text)
-            });
-            if !found {
-                out.push(format!("no settings Get answer contains {text}"));
+        Check::Settings(max_nodes) => {
+            let settings = parsed(records, SETTINGS_GET, parse::plugin_settings, &mut out);
+            if settings.is_empty()
+                || settings
+                    .iter()
+                    .any(|s| s["maxNodes"].as_i64() != Some(*max_nodes))
+            {
+                out.push(format!(
+                    "settings maxNodes {:?}, expected {max_nodes}",
+                    settings
+                        .iter()
+                        .map(|s| s["maxNodes"].clone())
+                        .collect::<Vec<_>>()
+                ));
             }
         }
         Check::Span {
@@ -486,32 +499,37 @@ fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
                     .iter()
                     .filter(|r| r.status == 200 && r.path == DS_QUERY)
                 {
-                    let Ok(request) = serde_json::from_str::<Value>(&r.request) else {
-                        continue;
+                    let queries = match parse::request_queries(&r.request) {
+                        Ok(q) => q,
+                        Err(e) => {
+                            out.push(format!("a /api/ds/query request: {e}"));
+                            continue;
+                        }
                     };
-                    let asked = request["queries"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|q| {
-                            q["refId"] == ref_id
-                                && q["spanSelector"] == json!([span])
-                                && q["labelSelector"] == OTLP_SELECTOR
-                                && q["profileTypeId"] == CPU
-                        });
+                    let asked = queries.iter().any(|q| {
+                        q.get("refId") == Some(&json!(ref_id))
+                            && q.get("spanSelector") == Some(&json!([span]))
+                            && q.get("labelSelector") == Some(&json!(OTLP_SELECTOR))
+                            && q.get("profileTypeId") == Some(&json!(CPU))
+                    });
                     if !asked {
                         continue;
                     }
                     seen = true;
-                    let body: Value = serde_json::from_str(&r.body).unwrap_or_default();
-                    let result = &body["results"][ref_id];
-                    let root = flame_root(result);
-                    let got = flame_labels(result);
-                    if root != Some(*value) || got != *labels {
-                        out.push(format!(
-                            "{ref_id} for span {span}: root {root:?}, labels {got:?}; \
-                             expected {value}, {labels:?}"
-                        ));
+                    let graph = parse::answer(&r.body).and_then(|results| {
+                        results
+                            .get(ref_id)
+                            .ok_or_else(|| format!("no result {ref_id}"))
+                            .and_then(parse::only_flame)
+                    });
+                    match graph {
+                        Ok(g) if g.root() == *value && g.labels == *labels => {}
+                        Ok(g) => out.push(format!(
+                            "{ref_id} for span {span}: root {}, labels {:?}; expected {value}, {labels:?}",
+                            g.root(),
+                            g.labels
+                        )),
+                        Err(e) => out.push(format!("{ref_id} for span {span}: {e}")),
                     }
                 }
                 if !seen {
@@ -581,9 +599,9 @@ async fn post(ctx: &Ctx, path: &str, tenant: &str, content_type: &str, body: Str
         .await
         .with_context(|| format!("POST {path} as {tenant}"))?;
     let status = res.status();
-    if !status.is_success() {
+    if status != 200 {
         let text = res.text().await.unwrap_or_default();
-        bail!("POST {path} as {tenant}: {status}: {text}");
+        bail!("POST {path} as {tenant}: {status}, expected 200: {text}");
     }
     Ok(())
 }
@@ -738,8 +756,18 @@ async fn wait_for_pulsusdb(ctx: &Ctx) -> Result<()> {
                 }))
                 .send()
                 .await?;
-            let body: Value = res.json().await?;
-            Ok((series_services(&body) == want).then_some(()))
+            if res.status() != 200 {
+                return Ok(None);
+            }
+            let sets = match parse::series_answer(&res.text().await?) {
+                Ok(sets) => sets,
+                Err(_) => return Ok(None),
+            };
+            let got: BTreeSet<String> = sets
+                .iter()
+                .filter_map(|labels| labels.get("service_name").cloned())
+                .collect();
+            Ok((got == want).then_some(()))
         })
         .await
         .with_context(|| format!("{tenant}'s services never listed {want:?}"))?;
@@ -751,7 +779,7 @@ async fn wait_for_pulsusdb(ctx: &Ctx) -> Result<()> {
             .header("X-Scope-OrgID", "t1")
             .send()
             .await?;
-        if !res.status().is_success() {
+        if res.status() != 200 {
             return Ok(None);
         }
         let body: Value = res.json().await?;
@@ -774,22 +802,9 @@ fn span_count(body: &Value) -> usize {
         .sum()
 }
 
-/// The `service_name` values of a `Series` answer.
-fn series_services(body: &Value) -> BTreeSet<String> {
-    body["labelsSet"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|set| set["labels"].as_array())
-        .flatten()
-        .filter(|pair| pair["name"] == "service_name")
-        .filter_map(|pair| pair["value"].as_str().map(String::from))
-        .collect()
-}
-
 // -- The front end -------------------------------------------------------
 
-async fn frontend_get(http: &reqwest::Client, path: &str) -> Result<(u16, Value)> {
+async fn frontend_get(http: &reqwest::Client, path: &str) -> Result<(u16, String)> {
     let res = http
         .get(format!("{FRONTEND_URL}{path}"))
         .timeout(QUERY_TIMEOUT)
@@ -797,11 +812,8 @@ async fn frontend_get(http: &reqwest::Client, path: &str) -> Result<(u16, Value)
         .await
         .with_context(|| format!("GET {path} on the front end"))?;
     let status = res.status().as_u16();
-    let text = res.text().await.unwrap_or_default();
-    Ok((
-        status,
-        serde_json::from_str(&text).unwrap_or(Value::String(text)),
-    ))
+    let text = res.text().await.context("reading a front end answer")?;
+    Ok((status, text))
 }
 
 /// `/api/health`, both plugins at their pinned versions with the app
@@ -809,7 +821,7 @@ async fn frontend_get(http: &reqwest::Client, path: &str) -> Result<(u16, Value)
 async fn wait_for_frontend(http: &reqwest::Client) -> Result<()> {
     let ok = |path: String| async move {
         Ok(match frontend_get(http, &path).await {
-            Ok((200, body)) => Some(body),
+            Ok((200, text)) => parse::json(&text).ok(),
             _ => None,
         })
     };
@@ -840,7 +852,14 @@ async fn wait_for_frontend(http: &reqwest::Client) -> Result<()> {
     Ok(())
 }
 
-async fn ds_query(http: &reqwest::Client, uid: &str, query: Value, now_s: i64) -> Result<Value> {
+/// One `/api/ds/query` of the profiles datasource: the answer must be
+/// exactly 200 and parse strictly, with the one result `A`.
+async fn ds_query(
+    http: &reqwest::Client,
+    uid: &str,
+    query: Value,
+    now_s: i64,
+) -> Parsed<parse::QueryResult> {
     let mut query = query;
     query["refId"] = json!("A");
     query["datasource"] = json!({"type": DS_TYPE, "uid": uid});
@@ -855,125 +874,28 @@ async fn ds_query(http: &reqwest::Client, uid: &str, query: Value, now_s: i64) -
         .json(&body)
         .send()
         .await
-        .context("POST /api/ds/query")?;
+        .map_err(|e| format!("POST /api/ds/query: {e}"))?;
     let status = res.status();
-    let text = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("/api/ds/query on {uid}: {status}: {text}");
+    let text = res
+        .text()
+        .await
+        .map_err(|e| format!("reading /api/ds/query: {e}"))?;
+    if status != 200 {
+        return Err(format!("/api/ds/query answered {status}: {text:.500}"));
     }
-    let value: Value = serde_json::from_str(&text).context("/api/ds/query answer is not JSON")?;
-    let result = &value["results"]["A"];
-    if let Some(error) = result.get("error") {
-        bail!("/api/ds/query on {uid}: {error}");
-    }
-    // The result's own status must say success, whatever else it carries.
-    if result["status"] != 200 {
-        bail!(
-            "/api/ds/query on {uid}: result status {}: {result}",
-            result["status"]
-        );
-    }
-    Ok(result.clone())
-}
-
-/// [`ds_query`]'s answer, or its error as `{"error": ...}`, so one failed
-/// query is reported beside the others.
-async fn ds_result(http: &reqwest::Client, uid: &str, query: Value, now_s: i64) -> Value {
-    match ds_query(http, uid, query, now_s).await {
-        Ok(result) => result,
-        Err(e) => json!({"error": format!("{e:#}")}),
+    let mut results = parse::answer(&text)?;
+    match (results.remove("A"), results.is_empty()) {
+        (Some(a), true) => Ok(a),
+        _ => Err(format!(
+            "/api/ds/query: results are not exactly A: {text:.500}"
+        )),
     }
 }
 
-/// The error [`ds_result`] recorded, as a suffix for a failure line.
-fn why(result: &Value) -> String {
-    result
-        .get("error")
-        .map(|e| format!(" ({e})"))
-        .unwrap_or_default()
-}
-
-/// A data frame's field `name`: its values, and its schema entry.
-fn field<'a>(frame: &'a Value, name: &str) -> Option<(&'a Value, &'a Vec<Value>)> {
-    let fields = frame["schema"]["fields"].as_array()?;
-    let i = fields.iter().position(|f| f["name"] == name)?;
-    Some((&fields[i], frame["data"]["values"][i].as_array()?))
-}
-
-/// The numeric root value of the first flame graph frame of a result, or
-/// `None` when there is no such frame or its root is missing or not a
-/// number.
-fn flame_root(result: &Value) -> Option<i64> {
-    flame_frames(result)
-        .first()
-        .and_then(|frame| frame_root(frame))
-}
-
-/// A result's flame graph frames: those with a `level` field.
-fn flame_frames(result: &Value) -> Vec<&Value> {
-    result["frames"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|f| field(f, "level").is_some())
-        .collect()
-}
-
-/// A flame graph frame's numeric root value.
-fn frame_root(frame: &Value) -> Option<i64> {
-    field(frame, "value")?.1.first().and_then(Value::as_i64)
-}
-
-/// The empty profile exactly: the answer's one flame graph frame, one node,
-/// `total`, at 0, every one of its four fields holding one value. A profile
-/// query answers one flame graph frame.
-fn is_empty_profile(result: &Value) -> bool {
-    let [frame] = flame_frames(result)[..] else {
-        return false;
-    };
-    let one_each = ["level", "value", "self", "label"]
-        .iter()
-        .all(|name| field(frame, name).is_some_and(|(_, values)| values.len() == 1));
-    one_each && frame_root(frame) == Some(0) && flame_labels(result) == ["total"]
-}
-
-/// A flame graph frame's node labels, in node order.
-fn flame_labels(result: &Value) -> Vec<String> {
-    let Some(frame) = result["frames"]
-        .as_array()
-        .and_then(|frames| frames.iter().find(|f| field(f, "level").is_some()))
-    else {
-        return Vec::new();
-    };
-    let Some((schema, values)) = field(frame, "label") else {
-        return Vec::new();
-    };
-    let names = schema["config"]["type"]["enum"]["text"].as_array();
-    values
-        .iter()
-        .map(|v| match (v.as_u64(), names) {
-            (Some(i), Some(names)) => names
-                .get(i as usize)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            _ => v.as_str().unwrap_or("").to_string(),
-        })
-        .collect()
-}
-
-fn root_of(result: &Value) -> i64 {
-    flame_root(result).unwrap_or(0)
-}
-
-/// F1–F6 (§4.3).
+/// F1–F6 (§4.3). Every answer is parsed strictly; one that does not parse
+/// fails the check that asked for it.
 async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<String>> {
     let mut failures = Vec::new();
-    let mut check = |ok: bool, what: String| {
-        if !ok {
-            failures.push(what);
-        }
-    };
     let start = (now_s - 3600) * 1000;
     let end = (now_s + 60) * 1000;
 
@@ -995,16 +917,26 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             13,
         ),
     ] {
+        let mut check = |what: String, outcome: Parsed<()>| {
+            if let Err(e) = outcome {
+                failures.push(format!("{what} {uid}: {e}"));
+            }
+        };
+
         // F1
-        let (status, body) =
+        let (status, text) =
             frontend_get(http, &format!("/api/datasources/uid/{uid}/health")).await?;
         check(
-            status == 200 && body["status"] == "OK",
-            format!("F1 {uid}: health {status} {body}"),
+            "F1".into(),
+            if status == 200 {
+                parse::health(&text)
+            } else {
+                Err(format!("health answered {status}: {text:.300}"))
+            },
         );
 
         // F2
-        let (status, body) = frontend_get(
+        let (status, text) = frontend_get(
             http,
             &format!(
                 "/api/datasources/uid/{uid}/resources/labelValues?label=service_name&query={}&start={start}&end={end}",
@@ -1012,20 +944,26 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             ),
         )
         .await?;
-        let got: BTreeSet<String> = body
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        let want: BTreeSet<String> = services.iter().map(|s| s.to_string()).collect();
+        let mut want: Vec<String> = services.iter().map(|s| s.to_string()).collect();
+        want.sort();
         check(
-            status == 200 && got == want,
-            format!("F2 {uid}: labelValues {status} {got:?}, expected {want:?}"),
+            "F2".into(),
+            if status == 200 {
+                parse::strings(&text).and_then(|mut got| {
+                    got.sort();
+                    if got == want {
+                        Ok(())
+                    } else {
+                        Err(format!("labelValues {got:?}, expected {want:?}"))
+                    }
+                })
+            } else {
+                Err(format!("labelValues answered {status}: {text:.300}"))
+            },
         );
 
         // F3
-        let result = ds_result(
+        let result = ds_query(
             http,
             uid,
             json!({"queryType": "profile", "profileTypeId": PROCESS_CPU,
@@ -1033,17 +971,19 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             now_s,
         )
         .await;
-        let root = root_of(&result);
         check(
-            root == total,
-            format!(
-                "F3 {uid}: root value {root}, expected {total}{}",
-                why(&result)
-            ),
+            "F3".into(),
+            result.and_then(|r| parse::only_flame(&r)).and_then(|g| {
+                if g.root() == total {
+                    Ok(())
+                } else {
+                    Err(format!("root value {}, expected {total}", g.root()))
+                }
+            }),
         );
 
-        // F4
-        let result = ds_result(
+        // F4: every frame a time series, one per service, each labelled.
+        let result = ds_query(
             http,
             uid,
             json!({"queryType": "metrics", "profileTypeId": PROCESS_CPU,
@@ -1051,27 +991,33 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             now_s,
         )
         .await;
-        let frames = result["frames"].as_array().cloned().unwrap_or_default();
-        let labels: Vec<String> = frames
-            .iter()
-            .map(|f| {
-                f["schema"]["fields"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find_map(|fl| fl["labels"]["service_name"].as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .collect();
-        let got: BTreeSet<String> = labels.iter().cloned().collect();
-        let want: BTreeSet<String> = metric_services.iter().map(|s| s.to_string()).collect();
         check(
-            labels.len() == want.len() && got == want,
-            format!(
-                "F4 {uid}: frames labelled {labels:?}, expected one each of {want:?}{}",
-                why(&result)
-            ),
+            "F4".into(),
+            result.and_then(|r| {
+                let mut labels = r
+                    .frames
+                    .iter()
+                    .map(|f| {
+                        let series = parse::series(f)?;
+                        if series.times.is_empty() || series.values.is_empty() {
+                            return Err(format!("an empty series: {:?}", series.labels));
+                        }
+                        series.labels.get("service_name").cloned().ok_or_else(|| {
+                            format!("a series without service_name: {:?}", series.labels)
+                        })
+                    })
+                    .collect::<Parsed<Vec<_>>>()?;
+                labels.sort();
+                let mut want: Vec<String> = metric_services.iter().map(|s| s.to_string()).collect();
+                want.sort();
+                if labels == want {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "frames labelled {labels:?}, expected one each of {want:?}"
+                    ))
+                }
+            }),
         );
 
         // F5
@@ -1086,26 +1032,26 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             if let Some(span) = span {
                 query["spanSelector"] = json!([span]);
             }
-            let result = ds_result(http, uid, query, now_s).await;
             let want = value * otlp_scale;
-            // The query must succeed; for the unprofiled span its answer is
-            // the empty profile, the root alone at 0.
-            let root = flame_root(&result);
-            let labels = flame_labels(&result);
-            let ok = result.get("error").is_none()
-                && root == Some(want)
-                && (want != 0 || is_empty_profile(&result));
+            let result = ds_query(http, uid, query, now_s).await;
+            // For the unprofiled span the answer must be exactly the empty
+            // profile, the root alone at 0.
             check(
-                ok,
-                format!(
-                    "F5 {uid} span {span:?}: root value {root:?}, labels {labels:?}, expected {want}{}",
-                    why(&result)
-                ),
+                format!("F5 span {span:?}"),
+                result.and_then(|r| parse::only_flame(&r)).and_then(|g| {
+                    if g.root() != want {
+                        Err(format!("root value {}, expected {want}", g.root()))
+                    } else if want == 0 && !g.is_empty_profile() {
+                        Err(format!("not the empty profile: {g:?}"))
+                    } else {
+                        Ok(())
+                    }
+                }),
             );
         }
 
-        // F6
-        let result = ds_result(
+        // F6: the heatmap frame's counts, then the exemplar frame's rows.
+        let result = ds_query(
             http,
             uid,
             json!({"queryType": "metrics", "profileTypeId": PROCESS_CPU,
@@ -1114,16 +1060,28 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
             now_s,
         )
         .await;
-        let count = heatmap_count(&result);
         check(
-            count == Some(profiles),
-            format!(
-                "F6 {uid}: heatmap count {count:?}, expected {profiles}{}",
-                why(&result)
-            ),
+            "F6 heatmap".into(),
+            result.and_then(|r| {
+                let counts = kinds(&r)?
+                    .into_iter()
+                    .filter_map(|k| match k {
+                        parse::Kind::Heatmap(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match &counts[..] {
+                    [c] if c.iter().sum::<i64>() == profiles => Ok(()),
+                    [c] => Err(format!(
+                        "heatmap count {}, expected {profiles}",
+                        c.iter().sum::<i64>()
+                    )),
+                    other => Err(format!("{} heatmap frames, expected one", other.len())),
+                }
+            }),
         );
         if uid == DS_T1 {
-            let result = ds_result(
+            let result = ds_query(
                 http,
                 uid,
                 json!({"queryType": "metrics", "profileTypeId": PROCESS_CPU,
@@ -1132,35 +1090,32 @@ async fn datasource_failures(http: &reqwest::Client, now_s: i64) -> Result<Vec<S
                 now_s,
             )
             .await;
-            let rows = exemplar_rows(&result);
             check(
-                rows == Some(6),
-                format!(
-                    "F6 {uid}: exemplar rows {rows:?}, expected 6{}",
-                    why(&result)
-                ),
+                "F6 exemplars".into(),
+                result.and_then(|r| {
+                    let rows = kinds(&r)?
+                        .into_iter()
+                        .filter_map(|k| match k {
+                            parse::Kind::Exemplars(n) => Some(n),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    match &rows[..] {
+                        [6] => Ok(()),
+                        other => Err(format!(
+                            "exemplar frames with rows {other:?}, expected one with 6"
+                        )),
+                    }
+                }),
             );
         }
     }
     Ok(failures)
 }
 
-/// The sum of the heatmap frame's `count` field.
-fn heatmap_count(result: &Value) -> Option<i64> {
-    let frames = result["frames"].as_array()?;
-    let frame = frames.iter().find(|f| field(f, "count").is_some())?;
-    let (_, values) = field(frame, "count")?;
-    Some(values.iter().filter_map(Value::as_i64).sum())
-}
-
-/// The exemplar frame's row count.
-fn exemplar_rows(result: &Value) -> Option<usize> {
-    let frames = result["frames"].as_array()?;
-    let frame = frames.iter().find(|f| {
-        f["schema"]["name"] == "exemplar" || f["schema"]["meta"]["dataTopic"] == "annotations"
-    })?;
-    let values = frame["data"]["values"].as_array()?;
-    Some(values.first().and_then(Value::as_array).map_or(0, Vec::len))
+/// Every frame of a result, each parsed as its kind.
+fn kinds(r: &parse::QueryResult) -> Parsed<Vec<parse::Kind>> {
+    r.frames.iter().map(parse::kind).collect()
 }
 
 // -- The pages (§4.4) --------------------------------------------------
@@ -1432,7 +1387,7 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
         "P7b settings reload",
         app_url("settings?", DS_T1, ""),
         vec![expect(SETTINGS_GET)],
-        Check::Settings(r#"\"maxNodes\":12345"#),
+        Check::Settings(12345),
     );
 
     vec![p1, p9, p2, p3, p4, p5, p6, p8, t1, t2, t3, p7, p7b]
@@ -1500,6 +1455,8 @@ mod tests {
             path: path.to_string(),
             request: request.to_string(),
             body: body.to_string(),
+            body_error: None,
+            aborted: false,
         }
     }
 
@@ -1508,12 +1465,8 @@ mod tests {
 
     /// A flame graph answer whose root value is `root`.
     fn flame(root: i64) -> String {
-        json!({"results": {"A": {"status": 200, "frames": [{
-            "schema": {"fields": [{"name": "level"}, {"name": "value"},
-                                  {"name": "self"}, {"name": "label"}]},
-            "data": {"values": [[0], [root], [0], ["total"]]},
-        }]}}})
-        .to_string()
+        json!({"results": {"A": {"status": 200, "frames": [parse::tests::flame_frame(root)]}}})
+            .to_string()
     }
 
     fn spec() -> Spec {
@@ -1647,8 +1600,16 @@ mod tests {
         ]);
         page.name = "P4".to_string();
         let failures = page_failures(&spec, &page);
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(failures[0].contains("None"), "{failures:?}");
+        // R3 refuses the answer, and so does the root check that reads it.
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].contains("R3") && failures[0].contains("column"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1].contains("R4") && failures[1].contains("column"),
+            "{failures:?}"
+        );
     }
 
     #[test]
