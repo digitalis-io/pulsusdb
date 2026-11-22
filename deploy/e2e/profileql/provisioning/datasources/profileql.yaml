@@ -1,0 +1,39 @@
+# Issue #832: the profiles datasource for each tenant, and the trace
+# datasource whose spans link to the first, for the profileql_frontend
+# scenario (e2e/src/profileql.rs). PulsusDB is the pulsusdb service's static
+# address in deploy/e2e/compose.single.yaml.
+apiVersion: 1
+datasources:
+  - name: Profiles t1
+    uid: pulsus-profileql-t1
+    type: grafana-pyroscope-datasource
+    access: proxy
+    url: http://172.29.0.11:3100/api/profiles/v1
+    isDefault: true
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: t1
+  - name: Profiles t2
+    uid: pulsus-profileql-t2
+    type: grafana-pyroscope-datasource
+    access: proxy
+    url: http://172.29.0.11:3100/api/profiles/v1
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: t2
+  - name: Traces t1
+    uid: pulsus-traceql-t1
+    type: tempo
+    access: proxy
+    url: http://172.29.0.11:3100
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+      streamingEnabled: { search: false, metrics: false }
+      tracesToProfiles:
+        datasourceUid: pulsus-profileql-t1
+        profileTypeId: cpu:cpu:nanoseconds:cpu:nanoseconds
+        tags: [ { key: service.name, value: service_name } ]
+    secureJsonData:
+      httpHeaderValue1: t1

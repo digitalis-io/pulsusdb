@@ -84,8 +84,9 @@ const DIAGNOSTIC_SERVICES: &[&str] = &["pulsusdb", "otel-collector", "prometheus
 /// Extra services dumped on the single-node leg only (issue #60):
 /// `tempo`, the traces differential's reference backend, ships only in
 /// `deploy/e2e/compose.single.yaml` (task-manager adjudication 1 —
-/// single-node differential topology).
-const SINGLE_DIAGNOSTIC_SERVICES: &[&str] = &["tempo"];
+/// single-node differential topology). Issue #832: the profiles front end
+/// and its browser, which ship only there too.
+const SINGLE_DIAGNOSTIC_SERVICES: &[&str] = &["tempo", "profileql-frontend", "profileql-browser"];
 /// Extra services dumped on the cluster leg only (issue #15): the 2-shard
 /// ClickHouse containers `ci/clickhouse-cluster/compose.yaml` defines,
 /// absent from the single-node variant.

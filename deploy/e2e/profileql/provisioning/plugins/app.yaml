@@ -1,0 +1,5 @@
+# Issue #832: the profiles exploration app, enabled.
+apiVersion: 1
+apps:
+  - type: grafana-pyroscope-app
+    disabled: false

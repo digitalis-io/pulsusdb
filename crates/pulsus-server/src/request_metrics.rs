@@ -91,6 +91,9 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/labels",
     "/api/profiles/v1/merge",
+    "/api/profiles/v1/pyroscope/label-values",
+    "/api/profiles/v1/pyroscope/render",
+    "/api/profiles/v1/pyroscope/render-diff",
     "/api/profiles/v1/querier.v1.QuerierService/AnalyzeQuery",
     "/api/profiles/v1/querier.v1.QuerierService/Diff",
     "/api/profiles/v1/querier.v1.QuerierService/GetProfileStats",
@@ -662,7 +665,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 143);
+        assert_eq!(ROUTE_TEMPLATES.len(), 146);
         assert!(
             ROUTE_TEMPLATES
                 .iter()
