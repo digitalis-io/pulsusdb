@@ -204,6 +204,14 @@ impl Frame {
         Ok(())
     }
 
+    fn numbers(&self, i: usize) -> Parsed<Vec<f64>> {
+        let f = &self.fields[i];
+        f.values
+            .iter()
+            .map(|v| number(v, &format!("{} value", f.name)))
+            .collect()
+    }
+
     fn integers(&self, i: usize) -> Parsed<Vec<i64>> {
         let f = &self.fields[i];
         f.values
@@ -323,7 +331,20 @@ pub(crate) fn heatmap(f: &Frame) -> Parsed<Vec<i64>> {
         ("yMax", "number"),
         ("count", "number"),
     ])?;
-    f.integers(3)
+    f.integers(0)?;
+    let y_min = f.numbers(1)?;
+    let y_max = f.numbers(2)?;
+    if let Some(i) = (0..f.rows).find(|&i| y_min[i] >= y_max[i]) {
+        return Err(format!(
+            "cell {i}: yMin {} is not below yMax {}",
+            y_min[i], y_max[i]
+        ));
+    }
+    let counts = f.integers(3)?;
+    if let Some(c) = counts.iter().find(|c| **c < 0) {
+        return Err(format!("a negative count {c}"));
+    }
+    Ok(counts)
 }
 
 /// An exemplar frame: its row count, its first fields `Time`, `Value`, `Id`.
@@ -339,6 +360,23 @@ pub(crate) fn exemplars(f: &Frame) -> Parsed<usize> {
         .collect();
     if head != [("Time", "time"), ("Value", "number"), ("Id", "string")] {
         return Err(format!("exemplar fields start {head:?}"));
+    }
+    f.integers(0)?;
+    f.numbers(1)?;
+    // `Id` is the profile id; the rest are the exemplar's labels.
+    for (i, field) in f.fields.iter().enumerate().skip(2) {
+        if field.kind != "string" {
+            return Err(format!(
+                "exemplar field {} is {}, not a string",
+                field.name, field.kind
+            ));
+        }
+        for v in &field.values {
+            let text = string(v, &format!("exemplar {}", field.name))?;
+            if i == 2 && text.is_empty() {
+                return Err("an exemplar with an empty profile id".to_string());
+            }
+        }
     }
     Ok(f.rows)
 }
@@ -428,30 +466,66 @@ pub(crate) fn heatmap_answer(text: &str) -> Parsed<(i64, Vec<(String, i64)>)> {
             if y.len() != counts.len() {
                 return Err(format!("{} buckets but {} counts", y.len(), counts.len()));
             }
-            for v in y {
-                number(v, "a bucket start")?;
+            let starts = y
+                .iter()
+                .map(|v| number(v, "a bucket start"))
+                .collect::<Parsed<Vec<f64>>>()?;
+            if starts.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!("bucket starts not ascending: {starts:?}"));
             }
-            let slot_count: i64 = counts
+            let counts = counts
                 .iter()
                 .map(|c| integer(c, "a count"))
-                .sum::<Parsed<i64>>()?;
+                .collect::<Parsed<Vec<i64>>>()?;
+            if counts.iter().any(|c| *c < 0) {
+                return Err(format!("a negative count in {counts:?}"));
+            }
+            let slot_count: i64 = counts.iter().sum();
             count += slot_count;
             match (o.get("exemplars"), slot_count) {
                 (None, 0) => {}
                 (None, _) => return Err("a slot with profiles has no exemplars".to_string()),
                 (Some(list), _) => {
                     for e in array(list, "exemplars")? {
-                        let e = object(e, "an exemplar")?;
-                        exemplars.push((
-                            string(get(e, "spanId", "an exemplar")?, "spanId")?.to_string(),
-                            int64_string(get(e, "value", "an exemplar")?, "an exemplar value")?,
-                        ));
+                        exemplars.push(heatmap_exemplar(e)?);
                     }
                 }
             }
         }
     }
     Ok((count, exemplars))
+}
+
+/// One heatmap exemplar: its time, its span id (16 lowercase hex digits),
+/// its value, its trace id when it has one (32), and its labels.
+fn heatmap_exemplar(v: &Value) -> Parsed<(String, i64)> {
+    let e = object(v, "an exemplar")?;
+    int64_string(get(e, "timestamp", "an exemplar")?, "an exemplar timestamp")?;
+    let span = string(get(e, "spanId", "an exemplar")?, "spanId")?;
+    hex_id(span, 16, "spanId")?;
+    let value = int64_string(get(e, "value", "an exemplar")?, "an exemplar value")?;
+    if let Some(trace) = e.get("traceId") {
+        hex_id(string(trace, "traceId")?, 32, "traceId")?;
+    }
+    if let Some(labels) = e.get("labels") {
+        for pair in array(labels, "exemplar labels")? {
+            let p = object(pair, "an exemplar label")?;
+            string(get(p, "name", "an exemplar label")?, "a label name")?;
+            string(get(p, "value", "an exemplar label")?, "a label value")?;
+        }
+    }
+    Ok((span.to_string(), value))
+}
+
+fn hex_id(s: &str, len: usize, what: &str) -> Parsed<()> {
+    if s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(())
+    } else {
+        Err(format!("{what} {s:?} is not {len} lowercase hex digits"))
+    }
 }
 
 /// `render-diff`: both sides' totals, which the flame graph's total is.
@@ -487,8 +561,21 @@ pub(crate) fn upload_answer(text: &str) -> Parsed<i64> {
     integer(get(fb, "numTicks", "flamebearer")?, "numTicks")
 }
 
+/// Settings `Get`: `pluginSettings`' `maxNodes`, an integer.
+pub(crate) fn max_nodes(text: &str) -> Parsed<i64> {
+    let settings = plugin_settings(text)?;
+    integer(
+        get(
+            object(&settings, "pluginSettings")?,
+            "maxNodes",
+            "pluginSettings",
+        )?,
+        "maxNodes",
+    )
+}
+
 /// Settings `Get`: the app's settings, `pluginSettings`, as JSON.
-pub(crate) fn plugin_settings(text: &str) -> Parsed<Value> {
+fn plugin_settings(text: &str) -> Parsed<Value> {
     let body = json(text)?;
     let all = array(
         get(object(&body, "the settings")?, "settings", "the settings")?,
@@ -520,16 +607,95 @@ pub(crate) fn connect_code(text: &str) -> Parsed<String> {
     .to_string())
 }
 
+/// One query of an `/api/ds/query` request: its `refId`, and the profile
+/// fields when it has them. A field present with the wrong type is an
+/// error; a field absent is `None`, a query of another kind.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RequestQuery {
+    pub ref_id: String,
+    pub span_selector: Option<Vec<String>>,
+    pub label_selector: Option<String>,
+    pub profile_type_id: Option<String>,
+}
+
 /// An `/api/ds/query` request's queries.
-pub(crate) fn request_queries(text: &str) -> Parsed<Vec<Map<String, Value>>> {
+pub(crate) fn request_queries(text: &str) -> Parsed<Vec<RequestQuery>> {
     let body = json(text)?;
     array(
         get(object(&body, "the request")?, "queries", "the request")?,
         "queries",
     )?
     .iter()
-    .map(|q| object(q, "a query").cloned())
+    .map(|q| {
+        let o = object(q, "a query")?;
+        let opt_string = |key: &str| -> Parsed<Option<String>> {
+            o.get(key)
+                .map(|v| string(v, key).map(String::from))
+                .transpose()
+        };
+        Ok(RequestQuery {
+            ref_id: string(get(o, "refId", "a query")?, "refId")?.to_string(),
+            span_selector: o
+                .get("spanSelector")
+                .map(|v| {
+                    array(v, "spanSelector")?
+                        .iter()
+                        .map(|s| string(s, "a span id").map(String::from))
+                        .collect::<Parsed<Vec<_>>>()
+                })
+                .transpose()?,
+            label_selector: opt_string("labelSelector")?,
+            profile_type_id: opt_string("profileTypeId")?,
+        })
+    })
     .collect()
+}
+
+/// The trace answer's span count, over every resource and scope.
+pub(crate) fn trace_span_count(text: &str) -> Parsed<usize> {
+    let body = json(text)?;
+    let o = object(&body, "the trace")?;
+    let resources = match (o.get("resourceSpans"), o.get("batches")) {
+        (Some(r), None) | (None, Some(r)) => array(r, "the resource spans")?,
+        _ => return Err("the trace has neither or both of resourceSpans and batches".to_string()),
+    };
+    let mut n = 0;
+    for r in resources {
+        for scope in array(
+            get(object(r, "a resource")?, "scopeSpans", "a resource")?,
+            "scopeSpans",
+        )? {
+            n += array(get(object(scope, "a scope")?, "spans", "a scope")?, "spans")?.len();
+        }
+    }
+    Ok(n)
+}
+
+/// A plugin's settings: its version and whether it is enabled.
+pub(crate) fn plugin_info(text: &str) -> Parsed<(String, bool)> {
+    let body = json(text)?;
+    let o = object(&body, "the plugin")?;
+    let info = object(get(o, "info", "the plugin")?, "info")?;
+    let version = string(get(info, "version", "info")?, "version")?.to_string();
+    let enabled = get(o, "enabled", "the plugin")?
+        .as_bool()
+        .ok_or("enabled is not a boolean")?;
+    Ok((version, enabled))
+}
+
+/// A datasource's `uid`.
+pub(crate) fn datasource_uid(text: &str) -> Parsed<String> {
+    let body = json(text)?;
+    Ok(string(
+        get(object(&body, "the datasource")?, "uid", "the datasource")?,
+        "uid",
+    )?
+    .to_string())
+}
+
+/// The browser script's report: its own typed shape, every field required.
+pub(crate) fn pages(text: &str) -> Parsed<Vec<super::PageRecord>> {
+    serde_json::from_str(text).map_err(|e| format!("the browser's report ({e}): {text:.500}"))
 }
 
 /// The datasource's health: exactly `OK`.
@@ -855,6 +1021,15 @@ pub(crate) mod tests {
             heatmap_of,
             &[
                 ("another name", &|v| v["schema"]["name"] = json!("series")),
+                ("xMax a string", &|v| v["data"]["values"][0][0] = json!("1")),
+                ("yMin a string", &|v| v["data"]["values"][1][0] = json!("0")),
+                ("yMax null", &|v| v["data"]["values"][2][0] = Value::Null),
+                ("yMin not below yMax", &|v| {
+                    v["data"]["values"][1][0] = json!(2.0)
+                }),
+                ("a negative count", &|v| {
+                    v["data"]["values"][3][0] = json!(-1)
+                }),
                 ("count a float", &|v| v["data"]["values"][3][0] = json!(1.5)),
                 ("count missing", &|v| {
                     v["schema"]["fields"].as_array_mut().unwrap().pop();
@@ -868,6 +1043,34 @@ pub(crate) mod tests {
             exemplars_of,
             &[
                 ("another name", &|v| v["schema"]["name"] = json!("series")),
+                ("a Time a string", &|v| {
+                    v["data"]["values"][0][0] = json!("1")
+                }),
+                ("a Value a string", &|v| {
+                    v["data"]["values"][1][1] = json!("0.5")
+                }),
+                ("an Id a number", &|v| v["data"]["values"][2][0] = json!(1)),
+                ("an Id empty", &|v| v["data"]["values"][2][0] = json!("")),
+                ("a label column a number field", &|v| {
+                    v["schema"]["fields"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"name": "env", "type": "number"}));
+                    v["data"]["values"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!([1, 2]));
+                }),
+                ("a label value a number", &|v| {
+                    v["schema"]["fields"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"name": "env", "type": "string"}));
+                    v["data"]["values"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!(["prod", 2]));
+                }),
                 ("Id not a string field", &|v| {
                     v["schema"]["fields"][2]["type"] = json!("number")
                 }),
@@ -923,7 +1126,9 @@ pub(crate) mod tests {
         );
         each_break(
             json!({"series": [{"slots": [{"timestamp": "1", "yMin": [1.0, 2.0], "counts": [1, 0],
-                "exemplars": [{"spanId": "0102030405060708", "value": "10"}]}]}]}),
+                "exemplars": [{"timestamp": "5", "spanId": "0102030405060708", "value": "10",
+                               "traceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                               "labels": [{"name": "service_name", "value": "svc-otlp"}]}]}]}]}),
             heatmap_answer,
             &[
                 ("no series", &|v| v["series"] = json!([])),
@@ -945,6 +1150,36 @@ pub(crate) mod tests {
                         .as_object_mut()
                         .unwrap()
                         .remove("exemplars");
+                }),
+                ("an exemplar value not an int64", &|v| {
+                    v["series"][0]["slots"][0]["exemplars"][0]["value"] = json!("ten")
+                }),
+                ("an exemplar timestamp missing", &|v| {
+                    v["series"][0]["slots"][0]["exemplars"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("timestamp");
+                }),
+                ("a span id of 15 digits", &|v| {
+                    v["series"][0]["slots"][0]["exemplars"][0]["spanId"] = json!("010203040506070")
+                }),
+                ("a span id in capitals", &|v| {
+                    v["series"][0]["slots"][0]["exemplars"][0]["spanId"] = json!("0A0B0C0D0E0F1011")
+                }),
+                ("a trace id too short", &|v| {
+                    v["series"][0]["slots"][0]["exemplars"][0]["traceId"] = json!("bb")
+                }),
+                ("an exemplar label value a number", &|v| {
+                    v["series"][0]["slots"][0]["exemplars"][0]["labels"][0]["value"] = json!(1)
+                }),
+                ("a bucket start a string", &|v| {
+                    v["series"][0]["slots"][0]["yMin"][0] = json!("1")
+                }),
+                ("bucket starts not ascending", &|v| {
+                    v["series"][0]["slots"][0]["yMin"] = json!([2.0, 1.0])
+                }),
+                ("a negative count", &|v| {
+                    v["series"][0]["slots"][0]["counts"][1] = json!(-1)
                 }),
                 ("an exemplar value a number", &|v| {
                     v["series"][0]["slots"][0]["exemplars"][0]["value"] = json!(10)
@@ -1033,6 +1268,89 @@ pub(crate) mod tests {
             &[
                 ("status ERROR", &|v| v["status"] = json!("ERROR")),
                 ("status missing", &|v| *v = json!({})),
+            ],
+        );
+        each_break(
+            json!({"batches": [{"scopeSpans": [{"spans": [{}, {}]}]}]}),
+            trace_span_count,
+            &[
+                ("neither key", &|v| *v = json!({})),
+                ("both keys", &|v| v["resourceSpans"] = json!([])),
+                ("scopeSpans missing", &|v| v["batches"][0] = json!({})),
+                ("spans not an array", &|v| {
+                    v["batches"][0]["scopeSpans"][0]["spans"] = json!({})
+                }),
+            ],
+        );
+        assert_eq!(
+            trace_span_count(r#"{"batches":[{"scopeSpans":[{"spans":[{},{}]}]}]}"#),
+            Ok(2)
+        );
+        each_break(
+            json!({"info": {"version": "3.2.0"}, "enabled": true}),
+            plugin_info,
+            &[
+                ("info missing", &|v| {
+                    v.as_object_mut().unwrap().remove("info");
+                }),
+                ("version a number", &|v| v["info"]["version"] = json!(3)),
+                ("enabled a string", &|v| v["enabled"] = json!("true")),
+                ("enabled missing", &|v| {
+                    v.as_object_mut().unwrap().remove("enabled");
+                }),
+            ],
+        );
+        each_break(
+            json!({"uid": "x"}),
+            datasource_uid,
+            &[
+                ("uid missing", &|v| *v = json!({})),
+                ("uid a number", &|v| v["uid"] = json!(1)),
+            ],
+        );
+        each_break(
+            json!({"queries": [{"refId": "A", "spanSelector": ["01"], "labelSelector": "{}",
+                                "profileTypeId": "cpu"}]}),
+            request_queries,
+            &[
+                ("refId missing", &|v| {
+                    v["queries"][0].as_object_mut().unwrap().remove("refId");
+                }),
+                ("spanSelector a string", &|v| {
+                    v["queries"][0]["spanSelector"] = json!("01")
+                }),
+                ("a span id a number", &|v| {
+                    v["queries"][0]["spanSelector"][0] = json!(1)
+                }),
+                ("labelSelector a number", &|v| {
+                    v["queries"][0]["labelSelector"] = json!(1)
+                }),
+                ("profileTypeId null", &|v| {
+                    v["queries"][0]["profileTypeId"] = Value::Null
+                }),
+            ],
+        );
+        each_break(
+            json!([{"name": "P1", "complete": true, "error": null, "records": [], "failed": [],
+                    "absentFound": [], "visible": [], "invisible": []}]),
+            pages,
+            &[
+                ("failed missing", &|v| {
+                    v[0].as_object_mut().unwrap().remove("failed");
+                }),
+                ("records missing", &|v| {
+                    v[0].as_object_mut().unwrap().remove("records");
+                }),
+                ("an unknown field", &|v| v[0]["extra"] = json!(1)),
+                ("a record with an unknown field", &|v| {
+                    v[0]["records"] = json!([{"status": 200,
+                    "method": "GET", "path": "/api/x", "request": "", "body": "",
+                    "bodyError": null, "failure": null, "x": 1}])
+                }),
+                ("a failure without a reason", &|v| {
+                    v[0]["failed"] = json!([{"method": "POST",
+                    "path": "/api/ds/query", "request": ""}])
+                }),
             ],
         );
         each_break(

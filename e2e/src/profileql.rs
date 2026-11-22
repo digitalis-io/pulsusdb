@@ -184,28 +184,31 @@ pub(crate) struct Spec {
     pub hide: Option<String>,
     #[serde(skip)]
     pub check: Check,
+    /// Requests the page cancels because its view replaces the panel that
+    /// sent them: an abort of one of these is excused.
+    #[serde(skip)]
+    pub cancelled: Vec<Expect>,
 }
 
 /// One recorded `/api/` response.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Record {
     pub status: u16,
     pub method: String,
     pub path: String,
     pub request: String,
     pub body: String,
-    /// The browser could not read the body; the page did not abort it.
+    /// The browser could not read the body.
     pub body_error: Option<String>,
-    /// The page aborted the request (`requestfailed`): not an answer it
-    /// used, so it is not judged as one.
-    pub aborted: bool,
+    /// The request failed after this response arrived, for this reason.
+    pub failure: Option<String>,
 }
 
 /// Whether a [`Text`] was visible.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Shown {
-    #[serde(default)]
     pub scope: Option<String>,
     pub text: String,
     pub shown: bool,
@@ -213,20 +216,32 @@ pub(crate) struct Shown {
 
 /// One page, as the browser reports it.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PageRecord {
     pub name: String,
     pub complete: bool,
-    #[serde(default)]
     pub error: Option<String>,
     pub records: Vec<Record>,
-    #[serde(default)]
+    /// Every request that failed, with the browser's reason, whether or
+    /// not a response arrived first.
+    pub failed: Vec<Failed>,
     pub absent_found: Vec<String>,
-    #[serde(default)]
     pub visible: Vec<Shown>,
-    #[serde(default)]
     pub invisible: Vec<Shown>,
 }
+
+/// One failed `/api/` request.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Failed {
+    pub method: String,
+    pub path: String,
+    pub request: String,
+    pub reason: String,
+}
+
+/// The browser's own reason for a request the page cancelled.
+const ABORTED: &str = "net::ERR_ABORTED";
 
 // ---------------------------------------------------------------------
 // The judgement
@@ -242,11 +257,42 @@ pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
         .map(|e| format!("; the browser: {e}"))
         .unwrap_or_default();
 
-    // The answers the page used: the requests it aborted are not.
+    // A failed request is excused only when the page itself cancelled it
+    // (the browser's abort reason) and no longer needs its answer: either the
+    // same request was sent again and answered 200 with its body read, or
+    // the spec names it as one this view cancels. Any other failure fails
+    // the page.
+    for f in &page.failed {
+        let superseded = page.records.iter().any(|r| {
+            r.failure.is_none()
+                && r.body_error.is_none()
+                && r.status == 200
+                && r.method == f.method
+                && r.path == f.path
+                && r.request == f.request
+        });
+        let cancelled = spec.cancelled.iter().any(|e| {
+            f.path.ends_with(&e.path) && e.req.iter().all(|s| f.request.contains(s.as_str()))
+        });
+        if f.reason != ABORTED {
+            out.push(format!(
+                "{name}: R2 {} {} failed: {}",
+                f.method, f.path, f.reason
+            ));
+        } else if !superseded && !cancelled {
+            out.push(format!(
+                "{name}: R2 {} {} failed: {} (and was not answered again): {:.200}",
+                f.method, f.path, f.reason, f.request
+            ));
+        }
+    }
+
+    // The answers the page used: a response whose request then failed is
+    // not one, and its failure is judged above.
     let live: Vec<Record> = page
         .records
         .iter()
-        .filter(|r| !r.aborted)
+        .filter(|r| r.failure.is_none())
         .cloned()
         .collect();
 
@@ -325,7 +371,10 @@ pub(crate) fn page_failures(spec: &Spec, page: &PageRecord) -> Vec<String> {
 
     // R5
     for e in &spec.absent.requests {
-        if page.records.iter().any(|r| matches(r, e)) {
+        let sent_and_failed = page.failed.iter().any(|f| {
+            f.path.ends_with(&e.path) && e.req.iter().all(|s| f.request.contains(s.as_str()))
+        });
+        if page.records.iter().any(|r| matches(r, e)) || sent_and_failed {
             out.push(format!("{name}: R5 {} {:?} was sent", e.path, e.req));
         }
     }
@@ -473,18 +522,11 @@ fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
             }
         }
         Check::Settings(max_nodes) => {
-            let settings = parsed(records, SETTINGS_GET, parse::plugin_settings, &mut out);
-            if settings.is_empty()
-                || settings
-                    .iter()
-                    .any(|s| s["maxNodes"].as_i64() != Some(*max_nodes))
-            {
+            let settings = parsed(records, SETTINGS_GET, parse::max_nodes, &mut out);
+            if settings.is_empty() || settings.iter().any(|s| s != max_nodes) {
                 out.push(format!(
                     "settings maxNodes {:?}, expected {max_nodes}",
-                    settings
-                        .iter()
-                        .map(|s| s["maxNodes"].clone())
-                        .collect::<Vec<_>>()
+                    settings.to_vec()
                 ));
             }
         }
@@ -507,10 +549,10 @@ fn value_failures(check: &Check, records: &[Record]) -> Vec<String> {
                         }
                     };
                     let asked = queries.iter().any(|q| {
-                        q.get("refId") == Some(&json!(ref_id))
-                            && q.get("spanSelector") == Some(&json!([span]))
-                            && q.get("labelSelector") == Some(&json!(OTLP_SELECTOR))
-                            && q.get("profileTypeId") == Some(&json!(CPU))
+                        q.ref_id == ref_id
+                            && q.span_selector.as_deref() == Some(&[span.to_string()][..])
+                            && q.label_selector.as_deref() == Some(OTLP_SELECTOR)
+                            && q.profile_type_id.as_deref() == Some(CPU)
                     });
                     if !asked {
                         continue;
@@ -782,24 +824,11 @@ async fn wait_for_pulsusdb(ctx: &Ctx) -> Result<()> {
         if res.status() != 200 {
             return Ok(None);
         }
-        let body: Value = res.json().await?;
-        Ok((span_count(&body) == 3).then_some(()))
+        Ok((parse::trace_span_count(&res.text().await?).ok() == Some(3)).then_some(()))
     })
     .await
     .context("the trace never had its three spans")?;
     Ok(())
-}
-
-fn span_count(body: &Value) -> usize {
-    ["resourceSpans", "batches"]
-        .into_iter()
-        .filter_map(|key| body[key].as_array())
-        .flatten()
-        .filter_map(|rs| rs["scopeSpans"].as_array())
-        .flatten()
-        .filter_map(|ss| ss["spans"].as_array())
-        .map(Vec::len)
-        .sum()
 }
 
 // -- The front end -------------------------------------------------------
@@ -819,9 +848,11 @@ async fn frontend_get(http: &reqwest::Client, path: &str) -> Result<(u16, String
 /// `/api/health`, both plugins at their pinned versions with the app
 /// enabled, then both datasources provisioned.
 async fn wait_for_frontend(http: &reqwest::Client) -> Result<()> {
+    // Each wait polls until the path answers 200; its body is then parsed
+    // strictly, once.
     let ok = |path: String| async move {
         Ok(match frontend_get(http, &path).await {
-            Ok((200, text)) => parse::json(&text).ok(),
+            Ok((200, text)) => Some(text),
             _ => None,
         })
     };
@@ -830,24 +861,26 @@ async fn wait_for_frontend(http: &reqwest::Client) -> Result<()> {
         .context("the front end's /api/health never answered 200")?;
     for (id, version) in [(DS_TYPE, DS_VERSION), (APP_ID, APP_VERSION)] {
         let path = format!("/api/plugins/{id}/settings");
-        let body = poll_until(READY_TIMEOUT, POLL_INTERVAL, || ok(path.clone()))
+        let text = poll_until(READY_TIMEOUT, POLL_INTERVAL, || ok(path.clone()))
             .await
             .with_context(|| format!("{path} never answered 200"))?;
-        if body["info"]["version"] != version {
-            bail!(
-                "plugin {id}: version {} is not {version}",
-                body["info"]["version"]
-            );
+        let (got, enabled) = parse::plugin_info(&text).map_err(anyhow::Error::msg)?;
+        if got != version {
+            bail!("plugin {id}: version {got} is not {version}");
         }
-        if id == APP_ID && body["enabled"] != true {
-            bail!("plugin {id} is not enabled: {body}");
+        if id == APP_ID && !enabled {
+            bail!("plugin {id} is not enabled");
         }
     }
     for uid in [DS_T1, DS_T2] {
         let path = format!("/api/datasources/uid/{uid}");
-        poll_until(READY_TIMEOUT, POLL_INTERVAL, || ok(path.clone()))
+        let text = poll_until(READY_TIMEOUT, POLL_INTERVAL, || ok(path.clone()))
             .await
             .with_context(|| format!("datasource {uid} was never provisioned"))?;
+        let got = parse::datasource_uid(&text).map_err(anyhow::Error::msg)?;
+        if got != uid {
+            bail!("{path} answered datasource {got}");
+        }
     }
     Ok(())
 }
@@ -1317,6 +1350,16 @@ fn page_specs(t0: i64, export: &[u8]) -> Vec<Spec> {
             exemplars: vec![(SPAN_WORK, 10_000_000), (SPAN_IO, 20_000_000)],
         },
     );
+    // The span heatmap replaces the time series panel, which cancels its
+    // query with exemplars.
+    p5.cancelled = vec![expect_req(
+        DS_QUERY,
+        &[
+            r#""includeExemplars":true"#,
+            r#""queryType":"metrics""#,
+            r#""labelSelector":"{service_name=\"svc-otlp\"}""#,
+        ],
+    )];
     p5.visible = vec![
         text_in("span-heatmap-panel", SPAN_WORK),
         text_in("span-heatmap-panel", SPAN_IO),
@@ -1405,8 +1448,7 @@ async fn run_pages(ctx: &Ctx, specs: &[Spec]) -> Result<Vec<PageRecord>> {
     .await
     .context("the browser task panicked")?
     .context("the browser script failed")?;
-    serde_json::from_str(&out)
-        .with_context(|| format!("the browser's output is not the expected JSON: {out:.2000}"))
+    parse::pages(&out).map_err(anyhow::Error::msg)
 }
 
 // -- Helpers -------------------------------------------------------------
@@ -1456,7 +1498,7 @@ mod tests {
             request: request.to_string(),
             body: body.to_string(),
             body_error: None,
-            aborted: false,
+            failure: None,
         }
     }
 
@@ -1610,6 +1652,64 @@ mod tests {
             failures[1].contains("R4") && failures[1].contains("column"),
             "{failures:?}"
         );
+    }
+
+    fn failed(reason: &str, request: &str) -> Failed {
+        Failed {
+            method: "POST".to_string(),
+            path: DS_QUERY.to_string(),
+            request: request.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Review r5: a failed request is excused only when the page aborted it
+    /// and sent it again, answered 200. A failure before any response, any
+    /// other reason, and an abort never answered again each fail the page.
+    #[test]
+    fn u10_only_an_abort_the_page_sent_again_is_excused() {
+        let judge = |failures: Vec<Failed>, records: Vec<Record>| {
+            let mut page = record(records);
+            page.failed = failures;
+            page_failures(&spec(), &page)
+        };
+        let mut r = records();
+        r[1].request = r#"{"q":1}"#.to_string();
+        let mut aborted = r[1].clone();
+        aborted.failure = Some(ABORTED.to_string());
+        aborted.body = String::new();
+        aborted.body_error = Some("no body".to_string());
+        r.push(aborted);
+        // Aborted, then the same request answered 200: excused.
+        assert_eq!(
+            judge(vec![failed(ABORTED, r#"{"q":1}"#)], r.clone()),
+            Vec::<String>::new()
+        );
+        // Aborted and never answered again: a failure.
+        let f = judge(vec![failed(ABORTED, r#"{"q":2}"#)], r.clone());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("not answered again"), "{f:?}");
+        // Another reason, after a response: a failure.
+        let f = judge(
+            vec![failed("net::ERR_CONNECTION_RESET", r#"{"q":1}"#)],
+            r.clone(),
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("ERR_CONNECTION_RESET"), "{f:?}");
+        // Aborted, never answered again, but a request this view cancels:
+        // excused.
+        let mut s = spec();
+        s.cancelled = vec![expect_req(DS_QUERY, &[r#""q":2"#])];
+        let mut page = record(r.clone());
+        page.failed = vec![failed(ABORTED, r#"{"q":2}"#)];
+        assert_eq!(page_failures(&s, &page), Vec::<String>::new());
+        // The same, failed for another reason: a failure.
+        page.failed = vec![failed("net::ERR_FAILED", r#"{"q":2}"#)];
+        assert_eq!(page_failures(&s, &page).len(), 1);
+        // A failure before any response: a failure.
+        let f = judge(vec![failed("net::ERR_FAILED", r#"{"q":3}"#)], records());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("ERR_FAILED"), "{f:?}");
     }
 
     #[test]

@@ -25,7 +25,7 @@ const recorded = (records, e) =>
   records.some((r) => r.path.endsWith(e.path) && (e.req || []).every((s) => r.request.includes(s)));
 const scoped = (page, scope) => (scope ? page.getByTestId(scope).last() : page.locator('body'));
 const shown = async (page, t) => ({
-  scope: t.scope,
+  scope: t.scope ?? null,
   text: t.text,
   shown: await scoped(page, t.scope).getByText(t.text).first().isVisible().catch(() => false),
 });
@@ -35,10 +35,21 @@ async function load(browser, spec) {
   const page = await context.newPage();
   const records = [];
   const pending = [];
-  // Requests the page aborted: their responses are not answers it used.
-  const aborted = new Set();
+  // Every failed /api/ request with the browser's reason, whether or not a
+  // response arrived first. The Rust side decides which, if any, to excuse.
+  const failures = new Map();
   let last = Date.now();
-  page.on('requestfailed', (req) => aborted.add(req));
+  page.on('requestfailed', (req) => {
+    const url = new URL(req.url());
+    if (!url.pathname.startsWith('/api/')) return;
+    const failure = req.failure();
+    failures.set(req, {
+      method: req.method(),
+      path: url.pathname,
+      request: req.postData() || '',
+      reason: failure ? failure.errorText : 'no reason given',
+    });
+  });
   page.on('response', (res) => {
     const url = new URL(res.url());
     if (!url.pathname.startsWith('/api/')) return;
@@ -58,7 +69,6 @@ async function load(browser, spec) {
         request: res.request().postData() || '',
         body,
         bodyError,
-        aborted: false,
         req: res.request(),
       });
     })());
@@ -66,7 +76,10 @@ async function load(browser, spec) {
 
   const expect = [...(spec.expect || [])];
   const absent = spec.absent || { requests: [], texts: [] };
-  const report = { name: spec.name, complete: false, records, absentFound: [], visible: [], invisible: [] };
+  const report = {
+    name: spec.name, complete: false, error: null, records, failed: [],
+    absentFound: [], visible: [], invisible: [],
+  };
   try {
     await page.goto(base + spec.url, { waitUntil: 'load', timeout: 60000 });
     if (spec.upload) {
@@ -108,7 +121,11 @@ async function load(browser, spec) {
     await Promise.all(pending);
   }
   await context.close();
-  report.records = records.map(({ req, ...r }) => ({ ...r, aborted: aborted.has(req) }));
+  report.records = records.map(({ req, ...r }) => ({
+    ...r,
+    failure: failures.has(req) ? failures.get(req).reason : null,
+  }));
+  report.failed = [...failures.values()];
   return report;
 }
 
