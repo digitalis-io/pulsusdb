@@ -135,6 +135,32 @@ pub fn push_too_many_days_message(days: u64, day_limit: u64) -> String {
     format!("push covers too many UTC dates for one block: {days} dates (limit {day_limit})")
 }
 
+/// A push the receiver stored only part of (issue #901, docs/api.md §1.4).
+///
+/// A receiver attaches it to its answer's extensions when it admitted the
+/// push but refused some of its items; the server's refused-push layer takes
+/// it off the answer and writes the log line. It never reaches the client.
+/// A push with nothing refused carries none, so that path does no work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedPush {
+    /// The signal, as the `signal` label of `pulsus_ingest_rejected_total`
+    /// has it: `logs`, `metrics` or `traces`.
+    pub signal: &'static str,
+    /// What was counted: `log records`, `streams`, `data points`, `samples`
+    /// or `spans`.
+    pub unit: &'static str,
+    /// How many of them were refused.
+    pub refused: u64,
+    /// How many of them the push carried.
+    pub total: u64,
+    /// The first refusal's message: the text the answer carries.
+    pub reason: String,
+    /// The request's `User-Agent`, when it has one.
+    pub user_agent: Option<String>,
+    /// The request's `X-Forwarded-For`, when it has one.
+    pub forwarded_for: Option<String>,
+}
+
 /// A handle a sync-mode request (`X-Pulsus-Async` absent or `0`,
 /// docs/api.md "Request headers") `.await`s until its admitted batch has
 /// been durably flushed by the writer core. A boxed, type-erased future —

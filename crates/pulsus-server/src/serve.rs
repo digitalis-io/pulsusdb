@@ -257,10 +257,13 @@ pub async fn run(config: Config) -> ExitCode {
 
     // Both arms share the identical graceful-shutdown future and ordering
     // contract; only the listener differs. The `None` arm is today's
-    // plaintext path, unchanged.
+    // plaintext path, unchanged. Both serve the router with each
+    // connection's address, which a refused push's log line names (issue
+    // #901).
+    let service = crate::refused_push::with_peer(router);
     let serve_result = match tls_config {
         Some(tls_config) => {
-            axum::serve(crate::tls::TlsListener::new(listener, tls_config), router)
+            axum::serve(crate::tls::TlsListener::new(listener, tls_config), service)
                 .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     // Break every live-tail loop first (issue #74): axum's
@@ -272,7 +275,7 @@ pub async fn run(config: Config) -> ExitCode {
                 .await
         }
         None => {
-            axum::serve(listener, router)
+            axum::serve(listener, service)
                 .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     // Break every live-tail loop first (issue #74): axum's
