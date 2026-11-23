@@ -809,6 +809,24 @@ mod tests {
         assert_eq!(log.admit("/v1/logs", "t=new", later), Some(0));
     }
 
+    /// Making room in a full table never drops a count a later line has
+    /// still to report.
+    #[test]
+    fn making_room_keeps_the_pushes_a_reason_held_back() {
+        let log = RefusalLog::new();
+        let now = Instant::now();
+        for i in 0..MAX_REASONS {
+            assert_eq!(log.admit("/v1/logs", &format!("t={i}"), now), Some(0));
+        }
+        let soon = now + Duration::from_secs(1);
+        assert_eq!(log.admit("/v1/logs", "t=0", soon), None);
+        assert_eq!(log.admit("/v1/logs", "t=0", soon), None);
+        // A minute on, a new reason makes room; `t=0` still holds two.
+        let later = now + WINDOW;
+        assert_eq!(log.admit("/v1/logs", "t=new", later), Some(0));
+        assert_eq!(log.admit("/v1/logs", "t=0", later), Some(2));
+    }
+
     #[test]
     fn the_line_says_how_many_pushes_it_stands_for() {
         let refused = RefusedPush {
