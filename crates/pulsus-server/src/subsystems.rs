@@ -21,7 +21,7 @@ use crate::app::AppState;
 /// separately by `reader_router`) because `mount_subsystems` merges
 /// distinct full paths — no nest/overlap.
 pub(crate) fn writer_router() -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
         .route("/v1/logs", post(crate::ingest::ingest_logs))
         .route("/v1/metrics", post(crate::ingest::ingest_metrics))
         .route("/v1/traces", post(crate::ingest::ingest_traces))
@@ -49,7 +49,9 @@ pub(crate) fn writer_router() -> Router<AppState> {
         .route(
             "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
             post(crate::grpc::export_profiles),
-        )
+        );
+    // Issue #901: a push with refused items is logged.
+    crate::refused_push::apply(router)
 }
 
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).

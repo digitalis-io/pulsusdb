@@ -222,8 +222,15 @@ where
     } else {
         headers.remove(header::CONTENT_ENCODING);
     }
-    let resp = handler(headers, message).await;
-    to_grpc(resp, &frame_error).await
+    let mut resp = handler(headers, message).await;
+    // Issue #901: the route's refused push, carried to the gRPC answer for
+    // the refused-push layer outside this shim.
+    let refused = resp.extensions_mut().remove::<pulsus_write::RefusedPush>();
+    let mut answer = to_grpc(resp, &frame_error).await;
+    if let Some(refused) = refused {
+        answer.extensions_mut().insert(refused);
+    }
+    answer
 }
 
 /// The handler's answer as a gRPC answer. A frame error wins over whatever

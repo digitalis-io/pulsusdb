@@ -11,11 +11,17 @@
 //! from the request's headers, read by the receiver only when it refused
 //! something.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::connect_info::{Connected, IntoMakeServiceWithConnectInfo};
+use axum::extract::connect_info::{ConnectInfo, Connected, IntoMakeServiceWithConnectInfo};
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::serve::IncomingStream;
 use pulsus_write::RefusedPush;
 use tokio::net::TcpListener;
@@ -53,25 +59,97 @@ pub(crate) fn with_peer(router: Router) -> IntoMakeServiceWithConnectInfo<Router
     router.into_make_service_with_connect_info::<PeerAddr>()
 }
 
-/// `router` with the refused-push layer on every route it holds.
+/// `router` with the refused-push layer on every route it holds, and a
+/// [`RefusalLog`] of its own.
 pub(crate) fn apply(router: Router<AppState>) -> Router<AppState> {
-    router
+    router.layer(axum::middleware::from_fn_with_state(
+        Arc::new(RefusalLog::new()),
+        log_refused,
+    ))
+}
+
+/// The layer: runs the route, and when its answer carries a [`RefusedPush`]
+/// takes it off and logs it, as [`RefusalLog`] allows. An answer without
+/// one costs a lookup in its empty extensions.
+async fn log_refused(State(log): State<Arc<RefusalLog>>, request: Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<PeerAddr>>()
+        .map(|info| info.0.0);
+    let uri = request.uri().clone();
+    let mut response = next.run(request).await;
+    if let Some(refused) = response.extensions_mut().remove::<RefusedPush>() {
+        let route = uri.path();
+        if let Some(held) = log.admit(route, &refused.reason, Instant::now()) {
+            tracing::warn!("{}", line(&refused, route, peer, held));
+        }
+    }
+    response
+}
+
+/// A route and reason, or a route alone for the reasons past
+/// [`MAX_REASONS`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Key {
+    route: String,
+    reason: Option<String>,
+}
+
+/// When a key was last logged, and how many pushes it has held back since.
+struct Entry {
+    logged_at: Instant,
+    held: u64,
 }
 
 /// The rate limit: one line a minute for each route and reason.
-pub(crate) struct RefusalLog;
+pub(crate) struct RefusalLog {
+    entries: Mutex<HashMap<Key, Entry>>,
+}
 
 impl RefusalLog {
     pub(crate) fn new() -> Self {
-        RefusalLog
+        RefusalLog {
+            entries: Mutex::new(HashMap::new()),
+        }
     }
 
     /// `Some(held)` when a push refused on `route` for `reason` at `now` is
     /// to be logged, `held` being the pushes like it that were not; `None`
     /// when it is not.
     pub(crate) fn admit(&self, route: &str, reason: &str, now: Instant) -> Option<u64> {
-        let _ = (route, reason, now);
-        None
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut key = Key {
+            route: route.to_string(),
+            reason: Some(reason.to_string()),
+        };
+        if !entries.contains_key(&key) && entries.len() >= MAX_REASONS {
+            entries.retain(|_, entry| now.duration_since(entry.logged_at) < WINDOW);
+            if entries.len() >= MAX_REASONS {
+                key.reason = None;
+            }
+        }
+        match entries.get_mut(&key) {
+            Some(entry) if now.duration_since(entry.logged_at) < WINDOW => {
+                entry.held += 1;
+                None
+            }
+            Some(entry) => {
+                let held = entry.held;
+                entry.logged_at = now;
+                entry.held = 0;
+                Some(held)
+            }
+            None => {
+                entries.insert(
+                    key,
+                    Entry {
+                        logged_at: now,
+                        held: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
     }
 }
 
@@ -83,8 +161,27 @@ pub(crate) fn line(
     peer: Option<SocketAddr>,
     held: u64,
 ) -> String {
-    let _ = (refused, route, peer, held);
-    String::new()
+    let mut out = format!(
+        "{} push on {route}: {} of {} {} rejected ({}) from ",
+        refused.signal, refused.refused, refused.total, refused.unit, refused.reason
+    );
+    // `write!` to a `String` cannot fail.
+    match peer {
+        Some(addr) => {
+            let _ = write!(out, "{addr}");
+        }
+        None => out.push_str("an unknown address"),
+    }
+    if let Some(forwarded) = &refused.forwarded_for {
+        let _ = write!(out, " (X-Forwarded-For {forwarded:?})");
+    }
+    if let Some(agent) = &refused.user_agent {
+        let _ = write!(out, ", user agent {agent:?}");
+    }
+    if held > 0 {
+        let _ = write!(out, "; {held} more pushes like it were not logged");
+    }
+    out
 }
 
 #[cfg(test)]

@@ -61,7 +61,7 @@ use crate::ingest::profiles::ProfileSink;
 use crate::ingest::traces::ParsedTraceLanding;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{
-    AdmitRefusal, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_too_large_message,
+    AdmitRefusal, KEY_REUSED_MESSAGE, LogSink, PushHeaders, RefusedPush, push_too_large_message,
     push_too_many_days_message,
 };
 use crate::protocols::otlp_logs::LogIngestSettings;
@@ -169,17 +169,36 @@ pub async fn ingest(
             group_stream_errors(stream_errors),
         );
     }
+    // Issue #901: what the answer reports refused — the streams when there
+    // are any, since the answer is then their `400`, else the records.
+    let refused = if !stream_errors.is_empty() {
+        Some(refused_streams(&headers, &stream_errors, &parsed))
+    } else if rejected > 0 {
+        Some(refused_push(
+            &headers,
+            ("logs", "log records"),
+            rejected,
+            otlp_log_record_count(&request),
+            rejected_message.as_deref(),
+        ))
+    } else {
+        None
+    };
     let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(&tenant, parsed, push) {
-            Ok(()) if stream_errors.is_empty() => {
-                export_response(StatusCode::ACCEPTED, rejected, rejected_message)
-            }
-            Ok(()) => status_response(
-                StatusCode::BAD_REQUEST,
-                3,
-                group_stream_errors(stream_errors),
+            Ok(()) if stream_errors.is_empty() => with_refused(
+                export_response(StatusCode::ACCEPTED, rejected, rejected_message),
+                refused,
+            ),
+            Ok(()) => with_refused(
+                status_response(
+                    StatusCode::BAD_REQUEST,
+                    3,
+                    group_stream_errors(stream_errors),
+                ),
+                refused,
             ),
             Err(refusal) => otlp_refusal_response(refusal),
         };
@@ -187,13 +206,17 @@ pub async fn ingest(
 
     match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
-            Ok(()) if stream_errors.is_empty() => {
-                export_response(StatusCode::OK, rejected, rejected_message)
-            }
-            Ok(()) => status_response(
-                StatusCode::BAD_REQUEST,
-                3,
-                group_stream_errors(stream_errors),
+            Ok(()) if stream_errors.is_empty() => with_refused(
+                export_response(StatusCode::OK, rejected, rejected_message),
+                refused,
+            ),
+            Ok(()) => with_refused(
+                status_response(
+                    StatusCode::BAD_REQUEST,
+                    3,
+                    group_stream_errors(stream_errors),
+                ),
+                refused,
             ),
             Err(err) => error_response(err),
         },
@@ -258,19 +281,35 @@ pub async fn ingest_metrics(
     };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
+    // Issue #901.
+    let refused = (rejected > 0).then(|| {
+        refused_push(
+            &headers,
+            ("metrics", "data points"),
+            rejected,
+            otlp_data_point_count(&request),
+            rejected_message.as_deref(),
+        )
+    });
 
     let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(&tenant, parsed, push) {
-            Ok(()) => export_metrics_response(StatusCode::ACCEPTED, rejected, rejected_message),
+            Ok(()) => with_refused(
+                export_metrics_response(StatusCode::ACCEPTED, rejected, rejected_message),
+                refused,
+            ),
             Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
     match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
-            Ok(()) => export_metrics_response(StatusCode::OK, rejected, rejected_message),
+            Ok(()) => with_refused(
+                export_metrics_response(StatusCode::OK, rejected, rejected_message),
+                refused,
+            ),
             Err(err) => error_response(err),
         },
         Err(refusal) => otlp_refusal_response(refusal),
@@ -327,18 +366,34 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
     };
     let rejected = landing.rejected;
     let rejected_message = landing.rejected_message.clone();
+    // Issue #901.
+    let refused = (rejected > 0).then(|| {
+        refused_push(
+            &headers,
+            ("traces", "spans"),
+            rejected,
+            otlp_span_count(&request),
+            rejected_message.as_deref(),
+        )
+    });
     let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(&tenant, landing, push) {
-            Ok(()) => export_traces_response(StatusCode::ACCEPTED, rejected, rejected_message),
+            Ok(()) => with_refused(
+                export_traces_response(StatusCode::ACCEPTED, rejected, rejected_message),
+                refused,
+            ),
             Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
     match sink.admit_flush(&tenant, landing, push) {
         Ok(wait) => match wait.await {
-            Ok(()) => export_traces_response(StatusCode::OK, rejected, rejected_message),
+            Ok(()) => with_refused(
+                export_traces_response(StatusCode::OK, rejected, rejected_message),
+                refused,
+            ),
             Err(err) => error_response(err),
         },
         Err(refusal) => otlp_refusal_response(refusal),
@@ -547,7 +602,8 @@ where
 ///    `204`/`202` on success (never [`export_metrics_response`]'s OTLP
 ///    partial-success message — remote-write has no partial-success
 ///    envelope, so a per-series drop only surfaces via the writer's
-///    `rejected_total` metric/log, never in the response body) and a
+///    `rejected_total` metric and the server's refused-push log line
+///    (issue #901), never in the response body) and a
 ///    plain-text `400`/`429`/`500` on error (never [`status_response`]'s
 ///    `google.rpc.Status` protobuf — a real Prometheus/collector sender
 ///    must not have to guess whether an error body is protobuf or text).
@@ -581,19 +637,30 @@ pub async fn ingest_remote_write(
         Ok(parsed) => parsed,
         Err(err) => return remote_write_error_response(&err),
     };
+    // Issue #901: the answer is empty, so the log line is the only place
+    // the reason appears.
+    let refused = (parsed.rejected > 0).then(|| {
+        refused_push(
+            &headers,
+            ("metrics", "samples"),
+            parsed.rejected,
+            remote_write_sample_count(&request),
+            parsed.rejected_message.as_deref(),
+        )
+    });
 
     let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(&tenant, parsed, push) {
-            Ok(()) => rw_success_response(StatusCode::ACCEPTED),
+            Ok(()) => with_refused(rw_success_response(StatusCode::ACCEPTED), refused),
             Err(refusal) => remote_write_refusal_response(refusal),
         };
     }
 
     match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
-            Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
+            Ok(()) => with_refused(rw_success_response(StatusCode::NO_CONTENT), refused),
             Err(err) => remote_write_error_response(&err),
         },
         Err(refusal) => remote_write_refusal_response(refusal),
@@ -669,12 +736,15 @@ pub async fn ingest_loki_push(
     if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
         return loki_stream_errors_response(stream_errors);
     }
+    // Issue #901.
+    let refused =
+        (!stream_errors.is_empty()).then(|| refused_streams(&headers, &stream_errors, &parsed));
     let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(&tenant, parsed, push) {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
-            Ok(()) => loki_stream_errors_response(stream_errors),
+            Ok(()) => with_refused(loki_stream_errors_response(stream_errors), refused),
             Err(refusal) => loki_refusal_response(refusal),
         };
     }
@@ -682,7 +752,7 @@ pub async fn ingest_loki_push(
     match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
-            Ok(()) => loki_stream_errors_response(stream_errors),
+            Ok(()) => with_refused(loki_stream_errors_response(stream_errors), refused),
             Err(err) => loki_error_response(&err),
         },
         Err(refusal) => loki_refusal_response(refusal),
@@ -945,6 +1015,111 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+}
+
+/// Issue #901: the [`RefusedPush`] for a `signal` push that refused
+/// `refused` of its `total` items, counted in `unit`, the first for
+/// `reason`. Called only when something was refused.
+fn refused_push(
+    headers: &HeaderMap,
+    (signal, unit): (&'static str, &'static str),
+    refused: u64,
+    total: u64,
+    reason: Option<&str>,
+) -> RefusedPush {
+    let value = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    RefusedPush {
+        signal,
+        unit,
+        refused,
+        total,
+        reason: reason.unwrap_or_default().to_string(),
+        user_agent: value(header::USER_AGENT),
+        forwarded_for: value(header::HeaderName::from_static("x-forwarded-for")),
+    }
+}
+
+/// Issue #901: the [`RefusedPush`] for a log push whose `stream_errors`
+/// streams were refused. The push's streams are those plus the distinct
+/// streams it stored.
+fn refused_streams(
+    headers: &HeaderMap,
+    stream_errors: &[String],
+    parsed: &otlp_logs::ParsedLogs,
+) -> RefusedPush {
+    let stored: std::collections::HashSet<_> =
+        parsed.streams.iter().map(|s| s.fingerprint).collect();
+    let refused = stream_errors.len() as u64;
+    refused_push(
+        headers,
+        ("logs", "streams"),
+        refused,
+        refused + stored.len() as u64,
+        stream_errors.first().map(String::as_str),
+    )
+}
+
+/// `response` with `refused` in its extensions, for the server's
+/// refused-push layer (issue #901). Never part of what the client receives.
+fn with_refused(mut response: Response, refused: Option<RefusedPush>) -> Response {
+    if let Some(refused) = refused {
+        response.extensions_mut().insert(refused);
+    }
+    response
+}
+
+/// The log records an OTLP logs request carries.
+fn otlp_log_record_count(request: &ExportLogsServiceRequest) -> u64 {
+    request
+        .resource_logs
+        .iter()
+        .flat_map(|r| &r.scope_logs)
+        .map(|s| s.log_records.len() as u64)
+        .sum()
+}
+
+/// The data points an OTLP metrics request carries, over every metric type.
+fn otlp_data_point_count(request: &ExportMetricsServiceRequest) -> u64 {
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+    request
+        .resource_metrics
+        .iter()
+        .flat_map(|r| &r.scope_metrics)
+        .flat_map(|s| &s.metrics)
+        .map(|m| match &m.data {
+            Some(Data::Gauge(d)) => d.data_points.len(),
+            Some(Data::Sum(d)) => d.data_points.len(),
+            Some(Data::Histogram(d)) => d.data_points.len(),
+            Some(Data::ExponentialHistogram(d)) => d.data_points.len(),
+            Some(Data::Summary(d)) => d.data_points.len(),
+            None => 0,
+        } as u64)
+        .sum()
+}
+
+/// The spans an OTLP traces request carries.
+fn otlp_span_count(request: &ExportTraceServiceRequest) -> u64 {
+    request
+        .resource_spans
+        .iter()
+        .flat_map(|r| &r.scope_spans)
+        .map(|s| s.spans.len() as u64)
+        .sum()
+}
+
+/// The samples and native histograms a remote-write request carries — the
+/// two things its `rejected` counts.
+fn remote_write_sample_count(request: &remote_write::WriteRequest) -> u64 {
+    request
+        .timeseries
+        .iter()
+        .map(|ts| (ts.samples.len() + ts.histograms.len()) as u64)
+        .sum()
 }
 
 /// Reads issue #494's two push-identity headers. Header reads only — every

@@ -434,7 +434,8 @@ pub(crate) async fn ingest_loki_push(
 /// the handler (mirroring `logs_api::compat_router`'s co-location with its
 /// query handlers).
 pub(crate) fn loki_push_compat_router() -> Router<AppState> {
-    Router::new().route("/loki/api/v1/push", post(ingest_loki_push))
+    // Issue #901: a push with refused streams is logged.
+    crate::refused_push::apply(Router::new().route("/loki/api/v1/push", post(ingest_loki_push)))
 }
 
 /// `POST /api/v2/spans` (+ `/tempo/spans`) (docs/api.md §8.2, issue #75):

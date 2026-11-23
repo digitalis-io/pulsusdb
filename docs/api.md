@@ -273,7 +273,7 @@ POST /api/v1/write
 Content-Type: application/x-protobuf, Content-Encoding: snappy
 ```
 
-`prompb.WriteRequest`. Supported as a first-class alternative for metrics because the OTel Collector's `prometheusremotewrite` exporter is a common metrics pipeline. `__name__` becomes `metric_name`; remaining labels are fingerprinted (xxhash64, sorted `k\xffv\xff` serialization). Stale markers (NaN `0x7FF0000000000002`) stored verbatim. A sample whose timestamp resolves to a UTC day outside the supported storage time range (before 1970-01-01 or after 2106-02-06, same cutoff and 32-bit-`DateTime` delete-TTL rationale as OTLP metrics above; docs/schemas.md §2.1, issue #137) is dropped and counted in `rejected_total`, not surfaced in the response body. Success: `204`.
+`prompb.WriteRequest`. Supported as a first-class alternative for metrics because the OTel Collector's `prometheusremotewrite` exporter is a common metrics pipeline. `__name__` becomes `metric_name`; remaining labels are fingerprinted (xxhash64, sorted `k\xffv\xff` serialization). Stale markers (NaN `0x7FF0000000000002`) stored verbatim. A sample whose timestamp resolves to a UTC day outside the supported storage time range (before 1970-01-01 or after 2106-02-06, same cutoff and 32-bit-`DateTime` delete-TTL rationale as OTLP metrics above; docs/schemas.md §2.1, issue #137) is dropped and counted in `rejected_total`, not surfaced in the response body; the server's log names it (§1.4). Success: `204`.
 
 **Measured `Content-Type` difference (issue #385, accepted as-is).** The reference answers **415** `expected application/x-protobuf as the first (media) part, got application/json` when a request's `Content-Type` is not protobuf (measured on `prom/prometheus:v3.13.0`); PulsusDB does not consult `Content-Type` on this endpoint at all and answers **400** once the unconditional snappy decode fails. Prometheus's own sender cannot reach that case — it always sets `Content-Type: application/x-protobuf` (`storage/remote/client.go:274` @ v3.13.0), captured on the wire on every request of a live send run. Other remote-write senders (the OTel Collector's `prometheusremotewrite` exporter, Grafana Alloy, vmagent) were not checked, so this is **not** a claim that no sender emits it.
 
@@ -417,6 +417,39 @@ Six behaviours differ from the reference on purpose: a folded line of 65,536 byt
 | each label name is 1 to 1,024 bytes and appears once; each value is at most 2,048 bytes | `profile with labels '<labels>' has label name too long: '<name>'`, `profile with labels '<labels>' has label value too long: '<value>'`, `invalid labels '<labels>' with error: invalid label name ''`, `profile with labels '<labels>' has duplicate label name: '<name>'` |
 
 `<labels>` is the series' labels, sorted, as `{name="value", …}`. Two limits cut rather than refuse: a stack deeper than 1,000 frames keeps the 1,000 nearest its root, and a string longer than 65,535 bytes keeps at most its last 65,535 bytes, starting at a character boundary.
+
+### 1.4 A push stored in part is logged (issue #901)
+
+When the server stores a push but refuses some of its items, it writes one `WARN` line to its own log. Two answers mean that:
+
+- **Items refused, the rest stored, answered as success** — on `POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces`, their three gRPC exports (§1.1) and `POST /api/v1/write`. On the OTLP routes the answer's partial success counts the refused items; on remote write the answer is empty (§1.2), so this line is the only place the reason appears.
+- **Streams refused by their label checks, the rest stored, answered `400`** — on `POST /v1/logs`, its gRPC export and the log push of §8.2. These streams are not counted in `pulsus_ingest_rejected_total`.
+
+The line is:
+
+```
+<signal> push on <route>: <refused> of <total> <unit> rejected (<reason>) from <address>[ (X-Forwarded-For "<value>")][, user agent "<value>"][; <n> more pushes like it were not logged]
+```
+
+For example:
+
+```
+WARN metrics push on /v1/metrics: 37 of 4812 data points rejected (metric http_requests: delta temporality is not ingested; send cumulative) from <address>:<port>, user agent "<sender>/1.0"
+```
+
+| part | what it is |
+|---|---|
+| `<signal>` | `logs`, `metrics` or `traces`, as the `signal` label of `pulsus_ingest_rejected_total` |
+| `<route>` | the request's path; on gRPC, the method's path, such as `/opentelemetry.proto.collector.metrics.v1.MetricsService/Export` |
+| `<unit>` | `data points` on OTLP metrics; `samples` on remote write, counting samples and native histograms; `log records`; `streams` when streams were refused, which a log push then reports instead of its records; `spans` |
+| `<total>` | how many of `<unit>` the push carried; for `streams`, the refused streams and the distinct streams stored |
+| `<reason>` | the first refusal's message: the answer's `error_message`, or the first stream's message of the `400`; on remote write, the message the empty answer leaves out |
+| `<address>` | the connection's address, as `ip:port`. Behind a proxy it is the proxy's, so the request's `X-Forwarded-For` follows it when present, as sent |
+| user agent | the request's `User-Agent` when present; on gRPC, the client library's |
+
+**At most one line a minute for each route and reason.** The first push refused on a route for a reason is logged. Pushes refused on that route for the same reason within the next 60 seconds are counted and not logged; the next line for that route and reason after the minute ends with `; <n> more pushes like it were not logged`. A count is reported only by that next line. At most 64 route and reason pairs are tracked at once for the routes of §1.1 and §1.2, and 64 for the log push of §8.2: while 64 are within their minute, a new reason shares one line a minute with every other such reason on its route, so a reason that embeds a value cannot flood the log.
+
+Nothing else is logged. A push refused whole — a `4xx` before anything is stored, a `413`, a `429` or a `5xx` — writes no line: its answer carries the reason. That covers both span routes of §8.2 and every profile route, which store all of a push or none of it, and a log push all of whose streams fail their checks, which stores nothing. The line changes neither the answer nor `pulsus_ingest_rejected_total`; a retried push the writer suppresses (§1.0) is logged like any other, though the counter does not count it again.
 
 ---
 
