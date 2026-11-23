@@ -20,6 +20,11 @@
 # means dependency compilation is cached across commits instead of being
 # redone on every image build.
 #
+# Both build stages use `lukemathwalker/cargo-chef` as their base instead
+# of `rust` + `cargo install cargo-chef` to avoid compiling cargo-chef
+# itself inside QEMU (arm64 cross-compilation), which crashes before our
+# own crates are involved — the pre-built binary in that image sidesteps it.
+#
 # `vendor/promql-parser` (issue #31, docs/decisions/0003) is a
 # `[patch.crates-io]` **path** dependency the root `Cargo.toml` redirects
 # `promql-parser` to — both stages that make Cargo actually resolve the
@@ -37,8 +42,16 @@
 #   podman build -t pulsusdb:e2e .
 #   # or: docker build -t pulsusdb:e2e .
 
-FROM docker.io/library/rust:1.93-bookworm AS planner
-RUN cargo install cargo-chef --locked --version 0.1.77
+FROM docker.io/lukemathwalker/cargo-chef:0.1.77-rust-1.93-bookworm AS planner
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang
+# aws-lc-sys 0.42.0 forbids AWS_LC_SYS_NO_ASM=1 in release builds.
+# Default to 0 (assembly enabled). Pass --build-arg AWS_LC_SYS_NO_ASM=1
+# only for debug builds when targeting QEMU-emulated arm64.
+ARG AWS_LC_SYS_NO_ASM=0
+ENV AWS_LC_SYS_NO_ASM=${AWS_LC_SYS_NO_ASM}
 WORKDIR /src
 # Copies the whole build context — including vendor/promql-parser, not
 # excluded by .dockerignore — so `cargo chef prepare` below can already
@@ -47,8 +60,13 @@ WORKDIR /src
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM docker.io/library/rust:1.93-bookworm AS build
-RUN cargo install cargo-chef --locked --version 0.1.77
+FROM docker.io/lukemathwalker/cargo-chef:0.1.77-rust-1.93-bookworm AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang cmake \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang
+ARG AWS_LC_SYS_NO_ASM=0
+ENV AWS_LC_SYS_NO_ASM=${AWS_LC_SYS_NO_ASM}
 WORKDIR /src
 COPY --from=planner /src/recipe.json recipe.json
 # rust-toolchain.toml pins an exact patch (1.93.0) that the `rust:1.93-bookworm`
@@ -82,7 +100,7 @@ ENV PULSUS_BUILD_VERSION=${PULSUS_BUILD_VERSION}
 ENV PULSUS_BUILD_REVISION=${PULSUS_BUILD_REVISION}
 RUN cargo build --release -p pulsus-server --bin pulsusdb
 
-FROM docker.io/library/debian:bookworm-slim AS runtime
+FROM docker.io/library/debian:trixie-slim AS runtime
 # `wget` backs this image's own `/ready` healthcheck (compose overrides);
 # `ca-certificates` for any outbound TLS the process makes (e.g. a
 # `CLICKHOUSE_PROTO=https` deployment); `curl` and `mawk` are what
