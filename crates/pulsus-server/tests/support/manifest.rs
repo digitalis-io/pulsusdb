@@ -59,6 +59,8 @@ impl Method {
         match ident {
             "get" => Some(Method::Get),
             "post" => Some(Method::Post),
+            // Issue #901: `POST` with a refused push logged.
+            "crate::refused_push::post" => Some(Method::Post),
             "put" => Some(Method::Put),
             "delete" => Some(Method::Delete),
             "patch" => Some(Method::Patch),

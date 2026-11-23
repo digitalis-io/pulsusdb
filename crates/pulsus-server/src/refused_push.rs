@@ -1,27 +1,34 @@
 //! A push with refused items is logged (issue #901, docs/api.md §1.4).
 //!
 //! A receiver that admits a push but refuses some of its items attaches a
-//! [`RefusedPush`] to its answer. [`apply`] puts a layer on the ingest routes
-//! that takes it off the answer and writes one `WARN` line naming the signal,
-//! the route, the count, the first reason and the sender. [`RefusalLog`]
-//! bounds how often: one line a minute for each route and reason.
+//! [`RefusedPush`] to its answer. Each ingest route is mounted with [`post`],
+//! which takes it off the answer and writes one `WARN` line naming the
+//! signal, the route, the count, the first reason and the sender.
+//! [`RefusalLog`] bounds how often: one line a minute for each route and
+//! reason.
 //!
-//! The sender's address comes from the connection ([`PeerAddr`], set by
-//! [`with_peer`] on both listeners); its user agent and `X-Forwarded-For` come
-//! from the request's headers, read by the receiver only when it refused
-//! something.
+//! A push with nothing refused does no work here beyond one check of its
+//! answer's empty extensions: the request is taken apart by move, and its
+//! path and connection address are read only once a refusal is found. The
+//! sender's address comes from the connection ([`PeerAddr`], set by
+//! [`with_peer`] on both listeners); its user agent and `X-Forwarded-For`
+//! come from the request's headers, read by the receiver only when it
+//! refused something.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::connect_info::{ConnectInfo, Connected, IntoMakeServiceWithConnectInfo};
 use axum::extract::{Request, State};
-use axum::middleware::Next;
+use axum::http::HeaderMap;
 use axum::response::Response;
+use axum::routing::MethodRouter;
 use axum::serve::IncomingStream;
 use pulsus_write::RefusedPush;
 use tokio::net::TcpListener;
@@ -59,27 +66,45 @@ pub(crate) fn with_peer(router: Router) -> IntoMakeServiceWithConnectInfo<Router
     router.into_make_service_with_connect_info::<PeerAddr>()
 }
 
-/// `router` with the refused-push layer on every route it holds, and a
-/// [`RefusalLog`] of its own.
-pub(crate) fn apply(router: Router<AppState>) -> Router<AppState> {
-    router.layer(axum::middleware::from_fn_with_state(
-        Arc::new(RefusalLog::new()),
-        log_refused,
-    ))
+/// A [`RefusalLog`] for one group of routes, kept for the life of the
+/// process: a router is built once per process, and every request of its
+/// routes reads the log without a reference count.
+pub(crate) fn leaked() -> &'static RefusalLog {
+    Box::leak(Box::new(RefusalLog::new()))
 }
 
-/// The layer: runs the route, and when its answer carries a [`RefusedPush`]
-/// takes it off and logs it, as [`RefusalLog`] allows. An answer without
-/// one costs a lookup in its empty extensions.
-async fn log_refused(State(log): State<Arc<RefusalLog>>, request: Request, next: Next) -> Response {
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<PeerAddr>>()
-        .map(|info| info.0.0);
-    let uri = request.uri().clone();
-    let mut response = next.run(request).await;
+/// `POST` to `handler`, with a refused push in its answer logged through
+/// `log`. `handler` is an ingest route's own handler, unchanged.
+pub(crate) fn post<H, Fut>(log: &'static RefusalLog, handler: H) -> MethodRouter<AppState>
+where
+    H: FnOnce(State<AppState>, HeaderMap, Body) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    axum::routing::post(move |state: State<AppState>, request: Request| {
+        let handler = handler.clone();
+        logged(log, request, move |headers, body| {
+            handler(state, headers, body)
+        })
+    })
+}
+
+/// Runs `handler` on the request's headers and body, moved out of it; when
+/// the answer carries a [`RefusedPush`], takes it off and logs it, as `log`
+/// allows. Only then are the request's path and connection address read.
+async fn logged<F, Fut>(log: &'static RefusalLog, request: Request, handler: F) -> Response
+where
+    F: FnOnce(HeaderMap, Body) -> Fut,
+    Fut: Future<Output = Response>,
+{
+    let (mut parts, body) = request.into_parts();
+    let headers = std::mem::take(&mut parts.headers);
+    let mut response = handler(headers, body).await;
     if let Some(refused) = response.extensions_mut().remove::<RefusedPush>() {
-        let route = uri.path();
+        let route = parts.uri.path();
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<PeerAddr>>()
+            .map(|info| info.0.0);
         if let Some(held) = log.admit(route, &refused.reason, Instant::now()) {
             tracing::warn!("{}", line(&refused, route, peer, held));
         }
@@ -123,7 +148,10 @@ impl RefusalLog {
             reason: Some(reason.to_string()),
         };
         if !entries.contains_key(&key) && entries.len() >= MAX_REASONS {
-            entries.retain(|_, entry| now.duration_since(entry.logged_at) < WINDOW);
+            // An entry still holding pushes back stays, so the next line for
+            // it reports them all.
+            entries
+                .retain(|_, entry| entry.held > 0 || now.duration_since(entry.logged_at) < WINDOW);
             if entries.len() >= MAX_REASONS {
                 key.reason = None;
             }

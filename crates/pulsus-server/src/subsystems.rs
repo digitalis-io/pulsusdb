@@ -21,37 +21,50 @@ use crate::app::AppState;
 /// separately by `reader_router`) because `mount_subsystems` merges
 /// distinct full paths — no nest/overlap.
 pub(crate) fn writer_router() -> Router<AppState> {
-    let router = Router::new()
-        .route("/v1/logs", post(crate::ingest::ingest_logs))
-        .route("/v1/metrics", post(crate::ingest::ingest_metrics))
-        .route("/v1/traces", post(crate::ingest::ingest_traces))
+    // Issue #901: a push with refused items is logged, on every route that
+    // can store part of a push.
+    let log = crate::refused_push::leaked();
+    Router::new()
+        .route(
+            "/v1/logs",
+            crate::refused_push::post(log, crate::ingest::ingest_logs),
+        )
+        .route(
+            "/v1/metrics",
+            crate::refused_push::post(log, crate::ingest::ingest_metrics),
+        )
+        .route(
+            "/v1/traces",
+            crate::refused_push::post(log, crate::ingest::ingest_traces),
+        )
         .route(
             "/v1development/profiles",
             post(crate::ingest::ingest_otlp_profiles),
         )
-        .route("/api/v1/write", post(crate::ingest::ingest_remote_write))
+        .route(
+            "/api/v1/write",
+            crate::refused_push::post(log, crate::ingest::ingest_remote_write),
+        )
         .route(
             "/api/profiles/v1/ingest",
             post(crate::ingest::ingest_profile_legacy),
         )
         .route(
             "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
-            post(crate::grpc::export_logs),
+            crate::refused_push::post(log, crate::grpc::export_logs),
         )
         .route(
             "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-            post(crate::grpc::export_metrics),
+            crate::refused_push::post(log, crate::grpc::export_metrics),
         )
         .route(
             "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
-            post(crate::grpc::export_traces),
+            crate::refused_push::post(log, crate::grpc::export_traces),
         )
         .route(
             "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
             post(crate::grpc::export_profiles),
-        );
-    // Issue #901: a push with refused items is logged.
-    crate::refused_push::apply(router)
+        )
 }
 
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).
