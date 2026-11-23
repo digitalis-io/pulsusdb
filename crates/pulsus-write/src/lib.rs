@@ -23,7 +23,7 @@ pub use ingest::traces::{
     ParsedTraceLanding, TagScope, TraceSink,
 };
 pub use ingest::{
-    AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders,
+    AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders, RefusedPush,
     push_too_large_message, push_too_many_days_message,
 };
 pub use protocols::log_level::LevelDiscovery;
