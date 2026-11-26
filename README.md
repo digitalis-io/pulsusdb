@@ -4,6 +4,8 @@
 
 Ship everything through the **OpenTelemetry Collector**, query with the languages you already know — no query languages to relearn, no lock-in.
 
+Website: [pulsusdb.io](https://pulsusdb.io) · Documentation: [docs.pulsusdb.io](https://docs.pulsusdb.io)
+
 * **OpenTelemetry-native** — the OTel Collector is the ingestion path: OTLP for logs, metrics, traces, and profiles (plus remote write); additional push protocols available as optional compatibility receivers
 * **Familiar** — query with **LogQL**, **PromQL**, and **TraceQL** through PulsusDB's own product-neutral HTTP API, with **full PromQL compliance** as a hard requirement
 * **Compatible when you want it** — a config flag mounts third-party-compatible API endpoints so existing datasources and dashboards keep working unmodified
@@ -48,6 +50,8 @@ Internally it is organized as:
 All state lives in ClickHouse; PulsusDB processes are stateless and scale horizontally by mode.
 
 ## Documentation
+
+User documentation is published at [docs.pulsusdb.io](https://docs.pulsusdb.io).
 
 Design documents live in [`docs/`](docs/) and are written before the code:
 
